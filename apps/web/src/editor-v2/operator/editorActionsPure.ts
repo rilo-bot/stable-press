@@ -515,13 +515,132 @@ export function measuredSentence(check: CheckLike | null | undefined, why?: stri
       : 'Measured: no problems found (see pageCheck).';
   }
   const first = errors[0]!;
-  const head = [first.label, first.detail].filter(Boolean).join(' — ');
-  return `Measured: ${errors.length} error${errors.length === 1 ? '' : 's'} on the page${head ? `, e.g. ${head}` : ''}. Fix them (magazine.askStudio naming the element id and the measured numbers, magazine.adjustPage, or magazine.undo), then magazine.checkPage again — at most 2 rounds.`;
+  // Labels of shapes / QR codes carry "#<id>"; ids never go to a person, and the model
+  // repeats what it is given.
+  const head = [first.label, first.detail].filter(Boolean).join(' — ').replace(/\s*#[\w-]{6,}/g, '');
+  return `Measured: ${errors.length} error${errors.length === 1 ? '' : 's'} on the page${head ? `, e.g. ${head}` : ''}. Fix once only what the user's change touched (magazine.askStudio naming the element in words, magazine.adjustPage, or magazine.undo); report anything else and ask before fixing it.`;
 }
 
 /** The note after a change that was applied and measured. */
 export function appliedNote(check: CheckLike | null | undefined, why?: string): string {
   return check
-    ? `Applied and measured — see pageCheck; fix any errors before reporting. ${measuredSentence(check)}`
+    ? `Applied and measured — see pageCheck. Fix (once) only an error on what THIS change touched; anything else on the page was already there: mention it and ask the user before fixing it. ${measuredSentence(check)}`
     : `Applied. ${measuredSentence(null, why)}`;
 }
+
+// ── never show an element id to a person ────────────────────────────────────
+//
+// The Design Helper chat shows The Stable Hand's request word for word, so a request
+// written with ids ("set headline f6b12855-8167-… to 97px") put raw ids in front of
+// the client (reported 2026-11-16). The studio does not need them: it reads every
+// element of the open page, and a quoted excerpt or a position identifies one exactly.
+
+/** One element in words: "the headline “Owners at the heart…”", "the picture at
+ *  x 120, y 340 (640×362)". Always starts with "the". */
+export function elementInWords(el: MagazineElement): string {
+  const at = `at x ${Math.round(el.x)}, y ${Math.round(el.y)}`;
+  const size = `${Math.round(el.w)}×${Math.round(el.h)}`;
+  if (el.type === 'text') {
+    const role = el.text?.role && el.text.role !== 'other' ? String(el.text.role) : 'text';
+    const words = plainText(el.text?.content ?? '');
+    return words ? `the ${role} “${clipText(words, 40)}”` : `the empty ${role} box ${at}`;
+  }
+  if (el.type === 'image') {
+    const alt = el.image?.alt?.trim();
+    if (!el.image?.url) return `the empty picture box ${at} (${size})`;
+    return alt ? `the picture “${clipText(alt, 40)}”` : `the picture ${at} (${size})`;
+  }
+  if (el.type === 'shape') return `the ${el.shape?.fill ?? ''} shape ${at} (${size})`.replace(/\s+/g, ' ');
+  if (el.type === 'qr') return `the QR code ${at}`;
+  return `the ${el.icon?.name ? `${el.icon.name} ` : ''}icon ${at}`;
+}
+
+const ROLE_WORDS = 'element|box|text|headline|subhead|deck|body|byline|caption|kicker|label|quote|pull ?quote|drop ?cap|cap|photo|picture|image|shape|panel|icon|qr(?: code)?|folio';
+
+/**
+ * Replace every element id in `text` — bare, or as "#id" — with the element in words,
+ * swallowing a "the" and a role word written just before it ("the drop cap <id>" →
+ * "the drop cap “D”…", not "the drop cap the text …"). Ids of other pages' elements are
+ * not known here and are left alone (the studio only edits the open page anyway).
+ */
+export function humanizeElementIds(text: string, elements: readonly MagazineElement[]): string {
+  const known = [...elements].filter((e) => typeof e.id === 'string' && e.id.length >= 6).sort((a, b) => b.id.length - a.id.length);
+  let out = String(text ?? '');
+  for (const el of known) {
+    const id = el.id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?:\\bthe\\s+)?(?:\\b(?:${ROLE_WORDS})\\s+)?(?:\\(\\s*)?#?${id}(?:\\s*\\))?`, 'gi');
+    out = out.replace(re, () => elementInWords(el));
+  }
+  return out;
+}
+
+// ── fixing problems: ask first, then one pass ───────────────────────────────
+//
+// After a build The Stable Hand used to "fix" every page it measured without asking —
+// page by page, then back to pages it had already done — for half an hour of paid AI
+// time (reported 2026-11-16). Now problems it did not cause are REPORTED with an
+// estimate and fixed only after the user says yes; and a fix is one request per page
+// carrying every problem on it, so no page is visited twice.
+
+/** About how long, and about what it costs, for the Design Helper to fix one page
+ *  (one turn on its model + apply + a re-measure). Deliberately round and labelled
+ *  "about": actual spend is on the AI Activity page. */
+export const FIX_MINUTES_PER_PAGE = 1;
+export const FIX_USD_PER_PAGE = 0.25;
+
+export interface FixEstimate {
+  pages: number;
+  minutes: number;
+  usd: number;
+  text: string;
+}
+
+export function fixEstimate(pages: number): FixEstimate {
+  const n = Math.max(0, Math.round(pages));
+  const minutes = Math.max(1, Math.round(n * FIX_MINUTES_PER_PAGE));
+  const usd = Math.round(n * FIX_USD_PER_PAGE * 100) / 100;
+  return {
+    pages: n,
+    minutes,
+    usd,
+    text: `about ${minutes} minute${minutes === 1 ? '' : 's'} and about US$${usd.toFixed(2)} of AI usage`,
+  };
+}
+
+interface IssueLike {
+  severity: string;
+  label: string;
+  detail: string;
+  fix: string;
+}
+
+/** The ONE Design Helper request that fixes every error on a page together, in words
+ *  (no ids), keeping all wording. Warnings are left out: they are judgement calls the
+ *  user did not ask for. Null when there is nothing to fix. */
+export function fixRequestText(issues: readonly IssueLike[], elements: readonly MagazineElement[]): string | null {
+  const errors = issues.filter((i) => i.severity === 'error');
+  if (errors.length === 0) return null;
+  const lines = errors.map((i, n) => `${n + 1}. ${i.label}: ${i.detail} Fix: ${i.fix}`);
+  return humanizeElementIds(
+    [
+      'Fix ALL of these problems on this page in this one request. Keep every word exactly as it is and change nothing else:',
+      ...lines,
+      'Stage every fix now, together, then stop.',
+    ].join('\n'),
+    elements,
+  );
+}
+
+/** The confirm card for magazine.fixPages. */
+export function fixPagesQuestion(pageNumbers: readonly number[] | null, totalPages: number): string {
+  if (!pageNumbers || pageNumbers.length === 0) {
+    const est = fixEstimate(totalPages);
+    return `Check all ${totalPages} pages and fix the problems found, each page once? At most ${est.text} (less if fewer pages need fixing).`;
+  }
+  const est = fixEstimate(pageNumbers.length);
+  return `Fix the problems on ${pagesPhrase(pageNumbers)}, each page once? ${est.text[0]!.toUpperCase()}${est.text.slice(1)}.`;
+}
+
+/** How many studio requests one Stable Hand run may make before it must stop and ask
+ *  the user (magazine.fixPages is ONE action and does not count against this). */
+export const MAX_STUDIO_REQUESTS_PER_RUN = 6;

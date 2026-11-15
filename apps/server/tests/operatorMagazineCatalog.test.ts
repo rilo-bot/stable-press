@@ -227,10 +227,19 @@ test('the prompt verifies magazine pages by measuring them, and routes charts an
   // picture: as the check for a page it passed clipped copy, and the model then
   // told the user it could not see the page.
   assert.doesNotMatch(prompt, /readScreen to check it is really on the page/)
-  assert.match(prompt, /NEVER BLIND/)
+  assert.match(prompt, /You CAN see pages/)
+  assert.match(prompt, /never say you can't/)
   assert.match(prompt, /magazine\.checkPage/)
-  assert.match(prompt, /at most 2 rounds/)
-  assert.match(prompt, /Never say you can't see the page/)
+  // ...but it fixes only what was asked: after a build it ran page-by-page "fixes" for
+  // half an hour of paid AI time without asking (2026-11-16). Report, ask, then ONE pass.
+  assert.match(prompt, /FIX ONLY WHAT\s+WAS ASKED/)
+  assert.match(prompt, /ASK\s+\(offer_choices: Fix all \/ Only page N \/ Not now\)/)
+  assert.match(prompt, /magazine\.fixPages \(each page once\)/)
+  assert.match(prompt, /Never loop\s+page by page with askStudio/)
+  assert.match(prompt, /never fix unasked/)
+  // ...and never puts element ids in front of the user (they showed in the Design Helper chat).
+  assert.match(prompt, /name elements in words \(the headline, the byline\), never ids/)
+  assert.doesNotMatch(prompt, /naming the element id/)
   assert.match(prompt, /CHARTS from numbers[^]*?magazine\.addChart with the EXACT numbers/)
   assert.match(prompt, /magazine\.replaceText/)
   assert.match(prompt, /photo \(the default, no words\), illustration, graphic, or\s+poster/)

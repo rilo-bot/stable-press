@@ -95,7 +95,12 @@ import {
   appliedNote,
   applyAllQuestion,
   chartSpecArgs,
+  fixEstimate,
+  fixPagesQuestion,
+  fixRequestText,
+  humanizeElementIds,
   magazineWideSwap,
+  MAX_STUDIO_REQUESTS_PER_RUN,
   measuredSentence,
   mergeChartChanges,
   pageElementList,
@@ -328,6 +333,10 @@ function within<T>(work: Promise<T>, ms: number, signal: AbortSignal, what: stri
 }
 
 const MEASURE_MS = 20_000;
+
+/** Design Helper requests made by magazine.askStudio in each Stable Hand run, keyed by
+ *  the run's abort signal (a new run gets a new signal; see uiDriver). */
+const studioRequestsPerRun = new WeakMap<AbortSignal, number>();
 
 /**
  * Measure one page in this browser. Never throws for a failed measurement (the
@@ -1630,43 +1639,64 @@ export function useMagazineEditorActions(input: EditorPerms): void {
             next: `Call magazine.replaceText { find: ${JSON.stringify(swap.find)}, replace: ${JSON.stringify(swap.replace)} } — it counts the matches on every page and asks the user before changing anything. For a swap on one page only, ask the studio without "everywhere".`,
           });
         }
-        await ready(ui);
-        // The studio works on the OPEN page: wait for the canvas to settle on it, or
-        // the scroll-settle picker can hand the turn to a neighbouring page.
-        if (page) await openPageN(ui, page);
-        if (!get().currentPageId) throw new Error('No page is open yet — wait for the first page to build.');
-        await ensureStudioComposer(ui);
-        // The studio says up front when this page cannot be changed by this user (a
-        // submitted/approved page, or a role without magazine.edit) and disables its
-        // composer. Report that reason rather than typing into a disabled box.
-        const blocked = anchor('mag.ai-send')?.getAttribute('data-studio-blocked');
-        if (blocked) throw new Error(blocked);
-        await waitUntil(() => !get().chatBusy, { signal: ui.signal, timeoutMs: 300_000, what: 'the studio to finish its previous reply' });
-
-        const before = get().chat.length;
-        ui.step('Asking the Magazine AI Studio');
-        // Watch the studio's own toasts during the turn: when an attached image
-        // can't be stored (e.g. the bucket's CORS doesn't allow this site's
-        // address) the studio only DESCRIBES it to its AI, which can't place the
-        // real file — and stages a look-alike instead (a solid-black image came
-        // back as a black shape). That must stop the job, not be applied.
-        const toasts = watchToasts();
-        let seen: SeenToast[] = [];
-        const sentAt = Date.now();
-        try {
-          await ui.type('mag.ai-input', studioPrompt(prompt), { clear: true });
-          assertEnabled('mag.ai-send', 'The studio cannot take a message right now.');
-          await ui.click('mag.ai-send', 'Send');
-          await waitForStudioTurn(ui, before, Date.now(), () => firstError(toasts.peek()));
-        } finally {
-          seen = toasts.stop();
+        // A HANDFUL PER RUN, THEN ASK. After a build, The Stable Hand once "fixed" page
+        // after page — and back again — for half an hour of paid AI time without the
+        // user asking (2026-11-16). Several pages are fixed with magazine.fixPages, ONE
+        // action the user confirms; anything past this many single requests in one run
+        // needs the user's go-ahead.
+        const used = studioRequestsPerRun.get(ui.signal) ?? 0;
+        if (used >= MAX_STUDIO_REQUESTS_PER_RUN) {
+          throw actionError(`${used} Design Helper requests were made in this run without the user's go-ahead, so no more are sent.`, {
+            next: 'Stop here. Tell the user in a short list what was changed and what still looks wrong, and ask (offer_choices) whether to carry on. To fix several pages after they agree, use magazine.fixPages — one request per page.',
+          });
         }
-        const storageProblem = seen.find((t) => /couldn.t store|could not reach storage|can.t be placed/i.test(t.text));
-        return finishStudioTurn(ui, storageProblem ? false : apply, seen, storageProblem?.text, sentAt);
+        studioRequestsPerRun.set(ui.signal, used + 1);
+        return runStudioTurn(ui, prompt, page, apply);
       },
     },
     canEdit,
   );
+
+  /** One Design Helper request on the open page (or `page`), like a person typing it:
+   *  wait for the reply, optionally apply, and return what really happened. Shared by
+   *  magazine.askStudio and magazine.fixPages (which does not count against the cap). */
+  async function runStudioTurn(ui: UiDriver, prompt: string, page: number | undefined, apply: boolean | undefined) {
+    await ready(ui);
+    // The studio works on the OPEN page: wait for the canvas to settle on it, or
+    // the scroll-settle picker can hand the turn to a neighbouring page.
+    if (page) await openPageN(ui, page);
+    if (!get().currentPageId) throw new Error('No page is open yet — wait for the first page to build.');
+    // The chat shows this request word for word: element ids become words.
+    prompt = humanizeElementIds(prompt, get().page?.elements ?? []);
+    await ensureStudioComposer(ui);
+    // The studio says up front when this page cannot be changed by this user (a
+    // submitted/approved page, or a role without magazine.edit) and disables its
+    // composer. Report that reason rather than typing into a disabled box.
+    const blocked = anchor('mag.ai-send')?.getAttribute('data-studio-blocked');
+    if (blocked) throw new Error(blocked);
+    await waitUntil(() => !get().chatBusy, { signal: ui.signal, timeoutMs: 300_000, what: 'the studio to finish its previous reply' });
+
+    const before = get().chat.length;
+    ui.step('Asking the Magazine AI Studio');
+    // Watch the studio's own toasts during the turn: when an attached image
+    // can't be stored (e.g. the bucket's CORS doesn't allow this site's
+    // address) the studio only DESCRIBES it to its AI, which can't place the
+    // real file — and stages a look-alike instead (a solid-black image came
+    // back as a black shape). That must stop the job, not be applied.
+    const toasts = watchToasts();
+    let seen: SeenToast[] = [];
+    const sentAt = Date.now();
+    try {
+      await ui.type('mag.ai-input', studioPrompt(prompt), { clear: true });
+      assertEnabled('mag.ai-send', 'The studio cannot take a message right now.');
+      await ui.click('mag.ai-send', 'Send');
+      await waitForStudioTurn(ui, before, Date.now(), () => firstError(toasts.peek()));
+    } finally {
+      seen = toasts.stop();
+    }
+    const storageProblem = seen.find((t) => /couldn.t store|could not reach storage|can.t be placed/i.test(t.text));
+    return finishStudioTurn(ui, storageProblem ? false : apply, seen, storageProblem?.text, sentAt);
+  }
 
   /**
    * The request as the studio should read it: every "page N" that means the OPEN
@@ -1805,7 +1835,7 @@ export function useMagazineEditorActions(input: EditorPerms): void {
         ? ` Also waiting for Apply, from earlier requests: ${changeCount(elsewhere.reduce((n, w) => n + w.count, 0))} on ${pagesPhrase(elsewhere.map((w) => w.page))} (pendingChanges). Apply those only if the user asks — magazine.applyStudioChanges applies every page's, after a card that lists them.`
         : '';
     const claimNote = turn?.claimedWithoutChange
-      ? " The studio's reply CLAIMS it changed things, but it staged NOTHING — nothing was changed. Do not report it as done: ask the studio again naming the element ids and the exact values, or tell the user plainly that nothing changed."
+      ? " The studio's reply CLAIMS it changed things, but it staged NOTHING — nothing was changed. Do not report it as done: ask the studio again naming the elements in words and the exact values, or tell the user plainly that nothing changed."
       : '';
     return {
       reply: reply.slice(0, 2000),
@@ -2138,6 +2168,134 @@ export function useMagazineEditorActions(input: EditorPerms): void {
     },
   });
 
+  // ── Ask first, then fix in ONE pass ──────────────────────────────────────
+  // After a build The Stable Hand used to measure a page, fix its headline, move on,
+  // come back and fix something else — half an hour of paid AI time nobody asked for
+  // (2026-11-16). Now: checkAllPages measures every page once and changes nothing;
+  // the user decides; fixPages visits each chosen page ONCE with every problem on it
+  // in one Design Helper request (one retry at most), behind a confirm card that says
+  // about how long and how much it will cost.
+  useAgentAction({
+    name: 'magazine.checkAllPages',
+    description:
+      "Measure EVERY page once in this browser (changes nothing) and return each page's errors (in words) and warning count, the pages with errors, and fixEstimate (about how long and how much AI usage fixing them takes). Then REPORT to the user and ASK (offer_choices: Fix all / only some pages / Not now) — never fix without a yes; after a yes use magazine.fixPages.",
+    args: z.object({}),
+    run: async (_a, ui) => {
+      const s = await ready(ui);
+      const pages: { page: number; errors?: string[]; moreErrors?: number; warnings?: number; notMeasured?: string }[] = [];
+      for (const p of s.pages) {
+        if (ui.signal.aborted) break;
+        const n = pageNo(p);
+        ui.step(`Measuring page ${n} of ${s.pages.length}`);
+        let data: IssuePageData;
+        try {
+          data = await pageData(p.id);
+        } catch (e) {
+          pages.push({ page: n, notMeasured: apiMessage(e, 'the page could not be read') });
+          continue;
+        }
+        const m = await measureSafely(data, ui.signal);
+        if (!m.check) {
+          pages.push({ page: n, notMeasured: m.why ?? 'it could not be measured' });
+          continue;
+        }
+        const errors = m.check.issues.filter((i) => i.severity === 'error');
+        const warnings = m.check.issues.length - errors.length;
+        pages.push({
+          page: n,
+          ...(errors.length > 0
+            ? { errors: errors.slice(0, 5).map((i) => humanizeElementIds(`${i.label}: ${i.detail}`, data.elements)), ...(errors.length > 5 ? { moreErrors: errors.length - 5 } : {}) }
+            : {}),
+          ...(warnings > 0 ? { warnings } : {}),
+        });
+      }
+      const withErrors = pages.filter((p) => p.errors).map((p) => p.page);
+      return {
+        pages,
+        pagesWithErrors: withErrors,
+        fixEstimate: withErrors.length > 0 ? fixEstimate(withErrors.length).text : undefined,
+        note:
+          withErrors.length > 0
+            ? `Nothing was changed. Tell the user in one short list which pages have problems and what, with the estimate, and ask (offer_choices: Fix all / Only page N / Not now). Fix only after a yes, with magazine.fixPages { pages: [${withErrors.join(', ')}] } (or the pages they chose).`
+            : 'Nothing was changed. No errors on any measured page.',
+      };
+    },
+  });
+
+  useAgentAction(
+    {
+      name: 'magazine.fixPages',
+      description:
+        "Fix the measured errors on the given pages (default: every page with errors) in ONE pass: each page is opened once, ALL its errors go to the Design Helper in one request, the changes are applied and the page re-measured (one retry only if errors remain). Asks the user to confirm first with about how long and how much AI usage. Use only after the user agreed (e.g. to a magazine.checkAllPages report).",
+      args: z.object({ pages: z.array(z.number().int().min(1)).max(60).optional() }),
+      confirm: ({ pages }) => fixPagesQuestion(pages && pages.length > 0 ? [...new Set(pages)] : null, get().pages.length),
+      run: async ({ pages }, ui) => {
+        const s = await ready(ui);
+        const targets = pages && pages.length > 0 ? [...new Set(pages)].sort((a, b) => a - b).map((n) => targetPage(s.pages, n)) : s.pages;
+        const report: { page: number; result: string; remaining?: string[] }[] = [];
+        for (const p of targets) {
+          if (ui.signal.aborted) break;
+          const n = pageNo(p);
+          // Earlier, unapplied Design Helper changes on this page would be applied too —
+          // that is the user's call, not this action's.
+          if (pendingFor(get().pending, p.id).length > 0) {
+            report.push({ page: n, result: 'skipped — it has changes from an earlier request waiting for Apply; apply or discard those first' });
+            continue;
+          }
+          ui.step(`Page ${n}: measuring`);
+          let data: IssuePageData;
+          try {
+            data = await pageData(p.id);
+          } catch (e) {
+            report.push({ page: n, result: `not fixed — ${apiMessage(e, 'the page could not be read')}` });
+            continue;
+          }
+          const m = await measureSafely(data, ui.signal);
+          if (!m.check) {
+            report.push({ page: n, result: `not fixed — it could not be measured (${m.why})` });
+            continue;
+          }
+          const request = fixRequestText(m.check.issues, data.elements);
+          if (!request) {
+            report.push({ page: n, result: 'no errors — left as it is' });
+            continue;
+          }
+          const before = m.check.issues.filter((i) => i.severity === 'error').length;
+          ui.step(`Page ${n}: fixing ${before} problem${before === 1 ? '' : 's'} in one request`);
+          let turn = await runStudioTurn(ui, request, n, true);
+          let left = turn.pageCheck ? turn.pageCheck.issues.filter((i) => i.severity === 'error') : null;
+          // ONE retry, only for what is still wrong — never a third visit.
+          if (turn.applied && turn.pageCheck && left && left.length > 0) {
+            const again = fixRequestText(turn.pageCheck.issues, get().page?.elements ?? []);
+            if (again) {
+              ui.step(`Page ${n}: one more try for ${left.length} problem${left.length === 1 ? '' : 's'}`);
+              turn = await runStudioTurn(ui, again, n, true);
+              left = turn.pageCheck ? turn.pageCheck.issues.filter((i) => i.severity === 'error') : left;
+            }
+          }
+          const elements = get().page?.elements ?? data.elements;
+          report.push({
+            page: n,
+            result: !turn.applied
+              ? `not changed — ${turn.note ?? 'the Design Helper staged nothing'}`
+              : left === null
+                ? `applied ${before} fix${before === 1 ? '' : 'es'}; the page could not be re-measured`
+                : left.length === 0
+                  ? `fixed all ${before} problem${before === 1 ? '' : 's'}`
+                  : `fixed ${Math.max(0, before - left.length)} of ${before}; ${left.length} still need a person`,
+            ...(left && left.length > 0 ? { remaining: left.slice(0, 5).map((i) => humanizeElementIds(`${i.label}: ${i.detail}`, elements)) } : {}),
+          });
+        }
+        return {
+          pages: report,
+          stopped: ui.signal.aborted || undefined,
+          note: 'Each page was visited once (one retry at most). Report briefly what was fixed and what still needs a person; do not run more fixes on these pages unless the user asks.',
+        };
+      },
+    },
+    canEdit,
+  );
+
   // A read too, like checkPage: the server renders the STORED page behind the same read
   // gate as GET page (canViewPage), so a view-only staff member asking "does page 3 look
   // right?" gets it as well. It changes nothing.
@@ -2180,7 +2338,7 @@ export function useMagazineEditorActions(input: EditorPerms): void {
           pageCheck: check ?? undefined,
           note: seen
             ? findings.length > 0
-              ? 'Fix what matters for the request (magazine.askStudio naming the element id and what to change), then check again — at most 2 rounds.'
+              ? 'If the user asked about this page, tell them what was found. Fix only what their request covers (magazine.askStudio naming the element in words and what to change); for anything else, ask first.'
               : 'The visual review found nothing wrong; pageCheck has the measurements.'
             : `No picture could be reviewed this time (${reason || 'unavailable'}) — pageCheck is measured from the page itself and still applies.`,
         };
@@ -2436,11 +2594,12 @@ export function useMagazineEditorActions(input: EditorPerms): void {
           notChangedBecauseEditedMeanwhile: conflicts.length > 0 ? conflicts : undefined,
           waitingChangesUpdated: res.waitingUpdated || undefined,
           pageChecks,
+          fixEstimate: withErrors.length > 0 ? fixEstimate(withErrors.length).text : undefined,
           undo: `Not on the undo stack — to reverse it, call magazine.replaceText with find ${JSON.stringify(replace)} and replace ${JSON.stringify(find)}.`,
           note:
-            `Applied and measured — see pageChecks; fix any errors before reporting.${short}${leftAloneNote}${waitingNote}` +
+            `Applied and measured — see pageChecks.${short}${leftAloneNote}${waitingNote}` +
             (withErrors.length > 0
-              ? ` Errors on ${pageListLabel(withErrors)}: fix them (magazine.askStudio on that page naming the element id and the measured numbers, or magazine.adjustPage) and check again.`
+              ? ` Problems measured on ${pageListLabel(withErrors)}. Do NOT fix them unasked: tell the user in one short list, with fixEstimate's time and cost for those pages, and ask (offer_choices: Fix them / Not now). If they agree, call magazine.fixPages with those pages.`
               : ' No errors on the measured pages.') +
             (unmeasured.length > 0 ? ` Not measured: ${pageListLabel(unmeasured)} — call magazine.checkPage on them.` : ''),
         };

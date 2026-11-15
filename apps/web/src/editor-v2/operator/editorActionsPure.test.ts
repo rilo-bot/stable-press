@@ -329,9 +329,79 @@ test('a long page list is shortened', () => {
 
 test('the note after a change reports the measured page, never "check with readScreen"', () => {
   const clean = { ok: true, issues: [] };
-  assert.equal(appliedNote(clean), 'Applied and measured — see pageCheck; fix any errors before reporting. Measured: no problems found (see pageCheck).');
+  // Only what THIS change touched is fixed unasked; problems that were already on the
+  // page are reported and asked about (the 2026-11-16 runaway fixing).
+  assert.equal(appliedNote(clean), 'Applied and measured — see pageCheck. Fix (once) only an error on what THIS change touched; anything else on the page was already there: mention it and ask the user before fixing it. Measured: no problems found (see pageCheck).');
   const bad = { ok: false, issues: [{ severity: 'error' as const, label: 'body “The New…”', detail: 'needs 412px, box is 260px' }, { severity: 'warning' as const }] };
-  assert.match(measuredSentence(bad), /^Measured: 1 error on the page, e\.g\. body “The New…” — needs 412px, box is 260px\. Fix them/);
+  assert.match(measuredSentence(bad), /^Measured: 1 error on the page, e\.g\. body “The New…” — needs 412px, box is 260px\. Fix once only what the user's change touched/);
+  assert.match(measuredSentence(bad), /report anything else and ask before fixing it\.$/);
+  assert.doesNotMatch(measuredSentence(bad), /at most 2 rounds|element id/);
   assert.match(appliedNote(null, 'timed out'), /^Applied\. The page could not be measured just now \(timed out\) — call magazine\.checkPage/);
   assert.doesNotMatch(appliedNote(bad), /readScreen/);
+});
+
+// ── ask first, one pass, never an id (reported 2026-11-16) ──────────────────
+import {
+  elementInWords,
+  fixEstimate,
+  fixPagesQuestion,
+  fixRequestText,
+  humanizeElementIds,
+  MAX_STUDIO_REQUESTS_PER_RUN,
+} from './editorActionsPure';
+
+const HEAD = {
+  id: 'f6b12855-8167-4b18-8f3b-5312fc029f68', type: 'text', x: 60, y: 40, w: 900, h: 120, rotation: 0, zIndex: 3, locked: false, source: 'ai-agent',
+  text: { content: 'Owners at the <b>heart</b> of racing', role: 'headline', fontFamily: 'Playfair Display', fontSize: 80, fontWeight: 800, color: '#111111', align: 'left', lineHeight: 1.1, autoFit: 'shrink' },
+} as unknown as MagazineElement;
+const CAP = {
+  id: 'dropcap-1f71c429-2cc3-4e43-cap', type: 'text', x: 60, y: 300, w: 90, h: 100, rotation: 0, zIndex: 3, locked: false, source: 'ai-agent',
+  text: { content: 'D', role: 'body', fontFamily: 'Playfair Display', fontSize: 96, fontWeight: 700, color: '#111111', align: 'left', lineHeight: 1, autoFit: 'shrink' },
+} as unknown as MagazineElement;
+const SHAPE = {
+  id: '02988880-45d3-4945-a33e-449cfff50582', type: 'shape', x: 0, y: 900, w: 1240, h: 40, rotation: 0, zIndex: 1, locked: false, source: 'ai-agent',
+  shape: { fill: '#1f5c3d' },
+} as unknown as MagazineElement;
+
+test('the reported request is shown with no ids — elements named in words', () => {
+  const sent = 'Fix clipped text: set headline f6b12855-8167-4b18-8f3b-5312fc029f68 to 97px; make the drop cap dropcap-1f71c429-2cc3-4e43-cap 120px tall; recolour #02988880-45d3-4945-a33e-449cfff50582.';
+  const out = humanizeElementIds(sent, [HEAD, CAP, SHAPE]);
+  assert.doesNotMatch(out, /f6b12855|dropcap-1f71c429|02988880/);
+  assert.match(out, /set the headline “Owners at the heart of racing” to 97px/);
+  assert.match(out, /make the body “D” 120px tall/);
+  assert.match(out, /recolour the #1f5c3d shape at x 0, y 900 \(1240×40\)/);
+});
+
+test('text without an element id is left exactly as it was', () => {
+  assert.equal(humanizeElementIds('Make the headline bigger.', [HEAD]), 'Make the headline bigger.');
+});
+
+test('elements in words never contain an id', () => {
+  for (const el of [HEAD, CAP, SHAPE]) assert.doesNotMatch(elementInWords(el), new RegExp(el.id.slice(0, 8)));
+});
+
+test('one fix request per page carries every error, in words, and leaves warnings out', () => {
+  const issues = [
+    { severity: 'error', label: `headline “Owners at…”`, detail: 'needs 160px, the box is 120px.', fix: 'set fontSize 64px, or make the box 160px tall.' },
+    { severity: 'error', label: `shape #${SHAPE.id}`, detail: 'hides the caption.', fix: 'set zIndex 0 on it.' },
+    { severity: 'warning', label: 'body “x”', detail: 'uneven gap.', fix: 'move it up 20px.' },
+  ];
+  const msg = fixRequestText(issues, [HEAD, SHAPE])!;
+  assert.match(msg, /^Fix ALL of these problems on this page in this one request/);
+  assert.match(msg, /1\. headline “Owners at…”: needs 160px/);
+  assert.match(msg, /2\. the #1f5c3d shape at x 0, y 900/);
+  assert.doesNotMatch(msg, /uneven gap/);
+  assert.doesNotMatch(msg, /02988880/);
+  assert.equal(fixRequestText([issues[2]!], [HEAD]), null);
+});
+
+test('the estimate is per page fixed, and says "about"', () => {
+  assert.deepEqual(fixEstimate(3), { pages: 3, minutes: 3, usd: 0.75, text: 'about 3 minutes and about US$0.75 of AI usage' });
+  assert.equal(fixEstimate(0).minutes, 1);
+  assert.match(fixPagesQuestion([3, 5, 9], 12), /^Fix the problems on pages 3, 5, 9, each page once\? About 3 minutes and about US\$0\.75/);
+  assert.match(fixPagesQuestion(null, 12), /Check all 12 pages .* each page once\? At most about 12 minutes/);
+});
+
+test('a run may make only a handful of studio requests before it asks', () => {
+  assert.ok(MAX_STUDIO_REQUESTS_PER_RUN >= 3 && MAX_STUDIO_REQUESTS_PER_RUN <= 8);
 });

@@ -189,8 +189,20 @@ export const SURFACES: CatalogSurface[] = [
       {
         name: 'magazine.checkPage',
         description:
-          'Measure a page as drawn in the browser (default: the open page): pageCheck { ok, issues, each with element id, measured px and a fix } plus its elements (id, label, box). Use after every page change.',
+          'Measure a page as drawn in the browser (default: the open page): pageCheck { ok, issues with measured px and a fix } plus its elements. Use after a change the user asked for.',
         args: '{ page?: number }',
+      },
+      {
+        name: 'magazine.checkAllPages',
+        description:
+          'Measure EVERY page once (changes nothing): errors per page in words, pagesWithErrors, fixEstimate (time and AI cost). Report and ASK before fixing.',
+        args: '{}',
+      },
+      {
+        name: 'magazine.fixPages',
+        description:
+          'After the user agrees: fix the errors on these pages in ONE pass, each page once, all its problems in one request (asks to confirm, with time and cost).',
+        args: '{ pages?: number[] }',
       },
       {
         name: 'magazine.lookAtPage',
