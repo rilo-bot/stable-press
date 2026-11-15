@@ -193,6 +193,17 @@
     transition: none;
   }
 }
+/* Dragging the panel's edge (StablehandShell.tsx): the page must track the
+   pointer, not ease after it. A dragged width is written inline on <html> as
+   --stablehand-panel-w, which beats the presets above. */
+:root[data-stablehand-resizing] {
+  transition: none;
+}
+:root[data-stablehand-resizing],
+:root[data-stablehand-resizing] * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
 #root {
   padding-right: var(--stablehand-w);
 }

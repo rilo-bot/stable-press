@@ -15,11 +15,12 @@
 //     from some clients and every client ignores flex/grid; Outlook on Windows
 //     renders with Word, which understands tables, bgcolor and borders, and
 //     little else.
-//   - ONE IMAGE, and nothing depends on it: a horse-in-a-paddock photograph
-//     behind the whole masthead (user request 2026-11-12). It is a BACKGROUND
-//     (CSS for most clients, a VML frame for Outlook on Windows) under live type,
-//     so a client that blocks remote images still shows the forest band with the
-//     name on it. It is served from the live site by absolute URL
+//   - ONE IMAGE, and nothing depends on it: a horse-in-a-paddock photograph at
+//     the top of the masthead (user request 2026-11-12). It is a plain <img>, NOT
+//     a background: phone mail apps (Gmail's app on some accounts, Outlook mobile)
+//     drop CSS background images, which left the header empty on mobile. The name
+//     is live type on the forest band below it, so a client that blocks remote
+//     images still shows the band with the name. It is served from the live site by absolute URL
 //     (MASTHEAD_IMAGE_URL): an email is opened long after it is sent, so the image
 //     must come from the host that is always up, never localhost or a preview deploy.
 //   - THE BUTTON IS "BULLETPROOF": a padded <a> inside a coloured cell, plus a
@@ -242,8 +243,8 @@ function layout(o: LayoutOpts): string {
     .sp-card{width:100% !important;}
     .sp-outer{padding:16px 10px !important;}
     .sp-pad{padding:30px 22px 26px !important;}
-    .sp-mast-bg,.sp-mast{height:200px !important;}
-    .sp-mast{padding:0 18px 18px !important;}
+    .sp-photo{width:100% !important;height:auto !important;}
+    .sp-mast{padding:16px 18px 18px !important;}
     .sp-h1{font-size:25px !important;line-height:1.25 !important;}
     .sp-name{font-size:19px !important;letter-spacing:5px !important;}
     .sp-code{font-size:30px !important;letter-spacing:8px !important;padding-left:8px !important;}
@@ -256,38 +257,33 @@ function layout(o: LayoutOpts): string {
   <tr>
     <td class="sp-outer" align="center" style="padding:36px 16px;">
       <!--[if mso]><table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0"><tr><td><![endif]-->
-      <table role="presentation" class="sp-card" width="560" cellpadding="0" cellspacing="0" border="0" style="width:560px;max-width:560px;">
+      <table role="presentation" class="sp-card" width="560" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:560px;">
 
         <!-- Plate: an outer edge, a cream mat, an inner edge — a framed print. -->
         <tr>
           <td style="background-color:${PAPER};border:1px solid ${FRAME};padding:7px;">
             <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid ${FRAME_IN};">
 
-              <!-- Masthead: the photo fills the whole band (CSS background for most clients,
-                   a VML frame for Outlook on Windows), the name sits on its darkened foot.
-                   No image → the forest green underneath, and the type still reads. -->
+              <!-- Masthead photo: a real <img>, the one image every client renders
+                   (phone apps drop CSS background images). Fluid: 542px in the card,
+                   full width on a phone. Decorative, so alt="" — the name follows as text. -->
               <tr>
-                <td class="sp-mast-bg" align="center" valign="bottom" height="238" background="${MASTHEAD_IMAGE_URL}" bgcolor="${FOREST}" style="background-color:${FOREST};background-image:url('${MASTHEAD_IMAGE_URL}');background-size:cover;background-position:30% 50%;background-repeat:no-repeat;height:238px;padding:0;vertical-align:bottom;">
-                  <!--[if gte mso 9]>
-                  <v:rect xmlns:v="urn:schemas-microsoft-com:vml" fill="true" stroke="false" style="width:544px;height:238px;">
-                    <v:fill type="frame" src="${MASTHEAD_IMAGE_URL}" color="${FOREST}" />
-                    <v:textbox inset="0,0,0,0">
-                  <![endif]-->
-                  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <td bgcolor="${FOREST}" style="background-color:${FOREST};padding:0;font-size:0;line-height:0;">
+                  <img src="${MASTHEAD_IMAGE_URL}" width="542" alt="" class="sp-photo" style="display:block;width:100%;max-width:542px;height:auto;border:0;outline:none;text-decoration:none;" />
+                </td>
+              </tr>
+              <!-- Name band: forest green under the photo's darkened foot. Live type,
+                   so it reads with images blocked too. -->
+              <tr>
+                <td class="sp-mast" align="center" bgcolor="${FOREST}" style="background-color:${FOREST};padding:20px 24px 22px;">
+                  <div class="sp-name sp-serif" style="font-family:${SERIF};font-size:24px;font-weight:700;line-height:1.2;letter-spacing:7px;text-transform:uppercase;color:${PARCHMENT};">Stable&nbsp;Press</div>
+                  <table role="presentation" align="center" cellpadding="0" cellspacing="0" border="0" style="margin:12px auto 0;">
                     <tr>
-                      <td class="sp-mast" align="center" valign="bottom" height="238" style="height:238px;padding:0 24px 22px;vertical-align:bottom;">
-                        <div class="sp-name sp-serif" style="font-family:${SERIF};font-size:24px;font-weight:700;line-height:1.2;letter-spacing:7px;text-transform:uppercase;color:${PARCHMENT};text-shadow:0 1px 3px rgba(0,0,0,0.55);">Stable&nbsp;Press</div>
-                        <table role="presentation" align="center" cellpadding="0" cellspacing="0" border="0" style="margin:12px auto 0;">
-                          <tr>
-                            <td width="34" style="border-top:1px solid ${GOLD};font-size:0;line-height:0;">&nbsp;</td>
-                            <td style="padding:0 10px;font-family:${SANS};font-size:10px;font-weight:bold;letter-spacing:3px;text-transform:uppercase;color:${GOLD};white-space:nowrap;text-shadow:0 1px 2px rgba(0,0,0,0.5);">The Newsroom</td>
-                            <td width="34" style="border-top:1px solid ${GOLD};font-size:0;line-height:0;">&nbsp;</td>
-                          </tr>
-                        </table>
-                      </td>
+                      <td width="34" style="border-top:1px solid ${GOLD};font-size:0;line-height:0;">&nbsp;</td>
+                      <td style="padding:0 10px;font-family:${SANS};font-size:10px;font-weight:bold;letter-spacing:3px;text-transform:uppercase;color:${GOLD};white-space:nowrap;">The Newsroom</td>
+                      <td width="34" style="border-top:1px solid ${GOLD};font-size:0;line-height:0;">&nbsp;</td>
                     </tr>
                   </table>
-                  <!--[if gte mso 9]></v:textbox></v:rect><![endif]-->
                 </td>
               </tr>
               <!-- Double rule under the masthead: gold, a sliver of green, gold. -->

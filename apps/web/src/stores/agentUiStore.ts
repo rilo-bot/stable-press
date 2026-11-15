@@ -13,8 +13,11 @@
 //                                gets its space back); smaller screens: the
 //                                launcher, as if closed
 //   wide                         the docked panel's wider size
+//   width                        a width the user dragged the docked panel to
+//                                (px; null = the preset from `wide`). Widen /
+//                                Narrow clears it back to a preset.
 //
-// `collapsed` and `wide` are the user's preference, remembered in localStorage.
+// `collapsed`, `wide` and `width` are the user's preference, remembered in localStorage.
 // Opening from a launcher / inline "Ask" button always opens the full panel; the
 // once-per-session greeting (StablehandGreeting.tsx) opens in the remembered
 // state, so someone who keeps it on the rail is greeted by the rail.
@@ -27,15 +30,17 @@ const PREFS_KEY = 'sp-stablehand-dock';
 interface DockPrefs {
   collapsed: boolean;
   wide: boolean;
+  width: number | null;
 }
 
 function readPrefs(): DockPrefs {
   try {
     const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(PREFS_KEY) : null;
     const p = raw ? (JSON.parse(raw) as Partial<DockPrefs>) : {};
-    return { collapsed: p.collapsed === true, wide: p.wide === true };
+    const width = typeof p.width === 'number' && Number.isFinite(p.width) && p.width > 0 ? Math.round(p.width) : null;
+    return { collapsed: p.collapsed === true, wide: p.wide === true, width };
   } catch {
-    return { collapsed: false, wide: false };
+    return { collapsed: false, wide: false, width: null };
   }
 }
 
@@ -54,6 +59,8 @@ interface AgentUiState {
   collapsed: boolean;
   /** The docked panel's wider size (remembered). */
   wide: boolean;
+  /** The docked panel's dragged width in px, or null for the `wide` preset (remembered). */
+  width: number | null;
   /** Phones / tablets: the "What can I do for you?" bubble over the launcher. */
   greetingBubble: boolean;
   /** A question queued by an inline trigger, sent once then cleared. */
@@ -67,7 +74,10 @@ interface AgentUiState {
   collapse: () => void;
   /** Rail → full panel. */
   expand: () => void;
+  /** Pick a preset size — also drops any dragged width. */
   setWide: (wide: boolean) => void;
+  /** The drag handle's result; null returns to the preset. */
+  setWidth: (width: number | null) => void;
   setGreetingBubble: (show: boolean) => void;
   /** Open the full panel and queue a question to send. */
   ask: (prompt: string) => void;
@@ -77,11 +87,12 @@ interface AgentUiState {
 const initial = readPrefs();
 
 export const useAgentUi = create<AgentUiState>((set, get) => {
-  const savePrefs = () => writePrefs({ collapsed: get().collapsed, wide: get().wide });
+  const savePrefs = () => writePrefs({ collapsed: get().collapsed, wide: get().wide, width: get().width });
   return {
     open: false,
     collapsed: initial.collapsed,
     wide: initial.wide,
+    width: initial.width,
     greetingBubble: false,
     pendingPrompt: null,
     setOpen: (open) => {
@@ -97,7 +108,11 @@ export const useAgentUi = create<AgentUiState>((set, get) => {
     },
     expand: () => get().setOpen(true),
     setWide: (wide) => {
-      set({ wide });
+      set({ wide, width: null });
+      savePrefs();
+    },
+    setWidth: (width) => {
+      set({ width: width == null ? null : Math.round(width) });
       savePrefs();
     },
     setGreetingBubble: (greetingBubble) => set({ greetingBubble }),
