@@ -128,6 +128,36 @@ export function repairToolNames(tools: ToolSet): ToolCallRepairFunction<ToolSet>
   return async ({ toolCall, error }) => {
     if (!NoSuchToolError.isInstance(error)) return null
     const hits = byKey.get(toolKey(toolCall.toolName)) ?? []
-    return hits.length === 1 && hits[0] !== toolCall.toolName ? { ...toolCall, toolName: hits[0]! } : null
+    if (hits.length === 1 && hits[0] !== toolCall.toolName) return { ...toolCall, toolName: hits[0]! }
+    // A SCREEN ACTION CALLED AS IF IT WERE A TOOL. The Stable Hand's catalog names
+    // actions like "magazine.checkAllPages"; they run through runAction, but the model
+    // sometimes calls the dotted name directly. That was a NoSuchToolError, the stream
+    // died and the user saw "Sorry — I hit a snag" (2026-11-16, on the first try of a
+    // new action). The call meant exactly runAction { name, args }, so it becomes that.
+    const asAction = actionAsRunAction(toolCall.toolName, toolCall.input, tools)
+    return asAction ? { ...toolCall, toolName: 'runAction', input: asAction } : null
   }
+}
+
+/** A dotted screen-action name ("magazine.checkAllPages", "team.inviteMember"). */
+const ACTION_NAME = /^[a-z][a-zA-Z0-9]*(\.[a-zA-Z][a-zA-Z0-9-]*)+$/
+
+/**
+ * The runAction input for a screen action called directly as a tool, or null when
+ * this is not that (no runAction tool, not a dotted name, or input that is not a
+ * JSON object). Exported for tests.
+ */
+export function actionAsRunAction(toolName: string, input: unknown, tools: ToolSet): string | null {
+  if (!('runAction' in tools) || !ACTION_NAME.test(toolName)) return null
+  let args: unknown = {}
+  try {
+    args = typeof input === 'string' ? (input.trim() ? JSON.parse(input) : {}) : (input ?? {})
+  } catch {
+    return null
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return null
+  // The model sometimes wraps it already: { name, args } — keep its args.
+  const a = args as Record<string, unknown>
+  const inner = a.name === toolName && a.args && typeof a.args === 'object' ? a.args : a
+  return JSON.stringify(Object.keys(inner as object).length ? { name: toolName, args: inner } : { name: toolName })
 }

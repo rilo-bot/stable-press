@@ -405,3 +405,8 @@ test('the estimate is per page fixed, and says "about"', () => {
 test('a run may make only a handful of studio requests before it asks', () => {
   assert.ok(MAX_STUDIO_REQUESTS_PER_RUN >= 3 && MAX_STUDIO_REQUESTS_PER_RUN <= 8);
 });
+
+test('an id after an adjective does not leave a doubled "the"', () => {
+  const out = humanizeElementIds(`100% of it is covered by the 88%-opaque shape #${SHAPE.id} drawn above it`, [SHAPE]);
+  assert.equal(out, '100% of it is covered by the 88%-opaque #1f5c3d shape at x 0, y 900 (1240×40) drawn above it');
+});

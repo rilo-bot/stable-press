@@ -571,7 +571,8 @@ export function humanizeElementIds(text: string, elements: readonly MagazineElem
     const re = new RegExp(`(?:\\bthe\\s+)?(?:\\b(?:${ROLE_WORDS})\\s+)?(?:\\(\\s*)?#?${id}(?:\\s*\\))?`, 'gi');
     out = out.replace(re, () => elementInWords(el));
   }
-  return out;
+  // "the 88%-opaque shape #id" became "the 88%-opaque the … shape": one "the" is enough.
+  return out.replace(/\bthe (\S+) the\b/gi, 'the $1');
 }
 
 // ── fixing problems: ask first, then one pass ───────────────────────────────

@@ -15,7 +15,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { hasToolCall, stepCountIs, NoSuchToolError, InvalidToolInputError } from 'ai'
-import { repairToolNames } from '../src/lib/agent/repairMessages.js'
+import { actionAsRunAction, repairToolNames } from '../src/lib/agent/repairMessages.js'
 import {
   OFFER_CHOICES_TOOL,
   offerChoicesInputSchema,
@@ -268,4 +268,30 @@ test('a misspelt tool NAME is renamed, so a misspelt offer_choices still ends th
   // anything that is not a near miss stays invalid, exactly as before
   assert.equal(await run('deleteEverything'), null)
   assert.equal(await run('offer_choices', new InvalidToolInputError({ toolName: 'offer_choices', toolInput: '{}', cause: new Error('x') })), null)
+})
+
+test('a screen action called directly as a tool runs through runAction instead of crashing the turn', async () => {
+  // 2026-11-16: the model called "magazine.checkAllPages" as a tool; that was a
+  // NoSuchToolError and the user saw "Sorry — I hit a snag just then".
+  const tools = { offer_choices: {}, readScreen: {}, runAction: {} } as never
+  const repair = repairToolNames(tools)
+  const run = async (toolName: string, input: string) =>
+    repair({
+      toolCall: { type: 'tool-call', toolCallId: 'c1', toolName, input } as never,
+      error: new NoSuchToolError({ toolName, availableTools: ['offer_choices', 'readScreen', 'runAction'] }),
+      tools, messages: [], system: undefined, instructions: undefined, inputSchema: async () => ({}),
+    } as never) as Promise<{ toolName: string; input: string } | null>
+  const a = await run('magazine.checkAllPages', '{}')
+  assert.equal(a?.toolName, 'runAction')
+  assert.deepEqual(JSON.parse(a!.input), { name: 'magazine.checkAllPages' })
+  const b = await run('magazine.fixPages', '{"pages":[3,5]}')
+  assert.deepEqual(JSON.parse(b!.input), { name: 'magazine.fixPages', args: { pages: [3, 5] } })
+  // already wrapped as { name, args }: its args are kept, not nested twice
+  const c = await run('team.inviteMember', '{"name":"team.inviteMember","args":{"email":"a@b.co"}}')
+  assert.deepEqual(JSON.parse(c!.input), { name: 'team.inviteMember', args: { email: 'a@b.co' } })
+  // not a dotted action name, or unreadable input: still invalid, as before
+  assert.equal(await run('deleteEverything', '{}'), null)
+  assert.equal(await run('magazine.fixPages', 'not json'), null)
+  // a route without runAction (the site chat) never invents one
+  assert.equal(actionAsRunAction('magazine.fixPages', '{}', { offer_choices: {} } as never), null)
 })
