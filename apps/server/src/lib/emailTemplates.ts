@@ -15,14 +15,16 @@
 //     from some clients and every client ignores flex/grid; Outlook on Windows
 //     renders with Word, which understands tables, bgcolor and borders, and
 //     little else.
-//   - ONE IMAGE, and nothing depends on it: a horse-in-a-paddock photograph at
-//     the top of the masthead (user request 2026-11-12). It is a plain <img>, NOT
-//     a background: phone mail apps (Gmail's app on some accounts, Outlook mobile)
-//     drop CSS background images, which left the header empty on mobile. The name
-//     is live type on the forest band below it, so a client that blocks remote
-//     images still shows the band with the name. It is served from the live site by absolute URL
-//     (MASTHEAD_IMAGE_URL): an email is opened long after it is sent, so the image
-//     must come from the host that is always up, never localhost or a preview deploy.
+//   - ONE IMAGE: the masthead — a horse-in-a-paddock photograph with the
+//     "STABLE PRESS / THE NEWSROOM" name set ON it (user request 2026-11-12,
+//     2026-11-15). The name is BAKED INTO the image rather than live type over a
+//     CSS background, because phone mail apps (Gmail's app on some accounts,
+//     Outlook mobile) drop CSS background images — the photo vanished on mobile.
+//     A plain <img> is the one thing every client renders. With images blocked,
+//     the forest cell shows the alt text, styled as the name. It is served from
+//     the live site by absolute URL (MASTHEAD_IMAGE_URL): an email is opened long
+//     after it is sent, so the image must come from the host that is always up,
+//     never localhost or a preview deploy.
 //   - THE BUTTON IS "BULLETPROOF": a padded <a> inside a coloured cell, plus a
 //     VML roundrect for Outlook, which ignores padding on links.
 //   - Web fonts are a bonus, never a dependency: Playfair Display loads in Apple
@@ -56,11 +58,14 @@ const INK_SOFT = '#4a5a50' // supporting text
 const INK_FAINT = '#7d7a6e' // footnotes
 const RULE = '#e4d9c0' // ledger hairlines
 
-/** The masthead photograph — a thoroughbred grazing a green paddock at golden
- *  hour, darkened to forest at its foot so the name reads on it
- *  (apps/web/public/images/email-header.jpg, 1120×476 for 2× screens). Served by
- *  the live site; see the header note. */
-const MASTHEAD_IMAGE_URL = 'https://stablepress.nz/images/email-header.jpg'
+/** The masthead — a thoroughbred grazing a green paddock at golden hour, the
+ *  name set in the open field on the right over a forest-darkened foot
+ *  (apps/web/public/images/email-masthead.jpg, 1084×420 = 542×210 at 2×, made
+ *  from email-header.jpg). Served by the live site; see the header note.
+ *  email-header.jpg stays published: emails already sent point at it. */
+const MASTHEAD_IMAGE_URL = 'https://stablepress.nz/images/email-masthead.jpg'
+const MASTHEAD_W = 542
+const MASTHEAD_H = 210
 
 const SERIF = "'Playfair Display', Georgia, 'Times New Roman', serif"
 const BODY = "Georgia, 'Times New Roman', serif"
@@ -244,9 +249,7 @@ function layout(o: LayoutOpts): string {
     .sp-outer{padding:16px 10px !important;}
     .sp-pad{padding:30px 22px 26px !important;}
     .sp-photo{width:100% !important;height:auto !important;}
-    .sp-mast{padding:16px 18px 18px !important;}
     .sp-h1{font-size:25px !important;line-height:1.25 !important;}
-    .sp-name{font-size:19px !important;letter-spacing:5px !important;}
     .sp-code{font-size:30px !important;letter-spacing:8px !important;padding-left:8px !important;}
   }
 </style>
@@ -264,26 +267,14 @@ function layout(o: LayoutOpts): string {
           <td style="background-color:${PAPER};border:1px solid ${FRAME};padding:7px;">
             <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid ${FRAME_IN};">
 
-              <!-- Masthead photo: a real <img>, the one image every client renders
-                   (phone apps drop CSS background images). Fluid: 542px in the card,
-                   full width on a phone. Decorative, so alt="" — the name follows as text. -->
+              <!-- Masthead: ONE image, photo and name together (the name is baked in —
+                   phone apps drop CSS background images). Fluid: 542px in the card,
+                   full width on a phone. The width/height attributes size it in Outlook;
+                   everyone else follows height:auto. Images blocked → the forest cell
+                   and the alt text, styled as the name. -->
               <tr>
-                <td bgcolor="${FOREST}" style="background-color:${FOREST};padding:0;font-size:0;line-height:0;">
-                  <img src="${MASTHEAD_IMAGE_URL}" width="542" alt="" class="sp-photo" style="display:block;width:100%;max-width:542px;height:auto;border:0;outline:none;text-decoration:none;" />
-                </td>
-              </tr>
-              <!-- Name band: forest green under the photo's darkened foot. Live type,
-                   so it reads with images blocked too. -->
-              <tr>
-                <td class="sp-mast" align="center" bgcolor="${FOREST}" style="background-color:${FOREST};padding:20px 24px 22px;">
-                  <div class="sp-name sp-serif" style="font-family:${SERIF};font-size:24px;font-weight:700;line-height:1.2;letter-spacing:7px;text-transform:uppercase;color:${PARCHMENT};">Stable&nbsp;Press</div>
-                  <table role="presentation" align="center" cellpadding="0" cellspacing="0" border="0" style="margin:12px auto 0;">
-                    <tr>
-                      <td width="34" style="border-top:1px solid ${GOLD};font-size:0;line-height:0;">&nbsp;</td>
-                      <td style="padding:0 10px;font-family:${SANS};font-size:10px;font-weight:bold;letter-spacing:3px;text-transform:uppercase;color:${GOLD};white-space:nowrap;">The Newsroom</td>
-                      <td width="34" style="border-top:1px solid ${GOLD};font-size:0;line-height:0;">&nbsp;</td>
-                    </tr>
-                  </table>
+                <td align="center" bgcolor="${FOREST}" style="background-color:${FOREST};padding:0;">
+                  <img src="${MASTHEAD_IMAGE_URL}" width="${MASTHEAD_W}" height="${MASTHEAD_H}" alt="Stable Press &middot; The Newsroom" class="sp-photo" style="display:block;width:100%;max-width:${MASTHEAD_W}px;height:auto;border:0;outline:none;text-decoration:none;background-color:${FOREST};font-family:Georgia,serif;font-size:18px;font-weight:bold;letter-spacing:3px;color:${PARCHMENT};text-align:center;" />
                 </td>
               </tr>
               <!-- Double rule under the masthead: gold, a sliver of green, gold. -->
