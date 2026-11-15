@@ -9,6 +9,15 @@
 // still goes out. With neither configured we DON'T send: the payload is logged and
 // the caller surfaces the reason.
 //
+// MASTER SWITCH — EMAIL_ENABLED. Unset or "true": normal delivery as above.
+// "false": NOTHING is emailed, by any provider. Instead the server LOG gets each
+// message — the OTP code with its address, and every other email's subject and
+// plain text (invite links included) — so a team can sign in and follow invites
+// from the Render logs while email is off. Codes stay random and are never put in
+// an API response (that only happens with no provider at all, outside PROD — see
+// routes/auth). isEmailConfigured() deliberately ignores the switch: it answers
+// "could we send?", and the sign-in route refuses to run in PROD when it is false.
+//
 // Every template is built by ./emailTemplates.ts and goes through its one
 // `layout()`, so a second email can never drift from the first; every send
 // returns { delivered } rather than throwing on a non-configured provider —
@@ -42,6 +51,15 @@ const SMTP_FROM = (process.env.SMTP_FROM ?? RESEND_FROM).trim()
 
 const hasResend = !!RESEND_API_KEY && !!RESEND_FROM
 const hasSmtp = !!SMTP_HOST && !!SMTP_FROM
+
+/** EMAIL_ENABLED=false (or 0/no/off) turns every send into a log line. Unset = on. */
+const EMAIL_ENABLED = !/^(0|false|no|off)$/i.test((process.env.EMAIL_ENABLED ?? '').trim())
+if (!EMAIL_ENABLED) {
+  console.warn('[email] ⚠ EMAIL_ENABLED=false — no email will be sent. OTP codes and email contents are written to this log instead.')
+}
+
+/** One log line per message, so it reads as one entry in the Render log. */
+const oneLine = (s: string) => s.replace(/\s*\n+\s*/g, ' | ').trim()
 
 /** True when at least one provider (Resend or SMTP) can actually send. */
 export function isEmailConfigured(): boolean {
@@ -98,6 +116,11 @@ function headerSafe(subject: string): string {
  */
 async function send({ to, subject: rawSubject, text, html, kind }: Message): Promise<{ delivered: boolean }> {
   const subject = headerSafe(rawSubject)
+  // Switched off: log what would have gone out, send nothing.
+  if (!EMAIL_ENABLED) {
+    console.info(`[email] EMAIL_ENABLED=false — ${kind} to ${to} NOT sent. Subject: ${subject} | ${oneLine(text)}`)
+    return { delivered: false }
+  }
   // Primary: Resend.
   if (hasResend) {
     try {
@@ -137,6 +160,10 @@ export type { InviteEmail }
 // ── OTP ─────────────────────────────────────────────────────────────────────
 
 export async function sendOtpEmail(to: string, code: string): Promise<{ delivered: boolean }> {
+  if (!EMAIL_ENABLED) {
+    console.info(`[email] EMAIL_ENABLED=false — OTP for ${to}: ${code} (not emailed)`)
+    return { delivered: false }
+  }
   if (!isEmailConfigured()) {
     console.info(`[email] (dev) OTP for ${to}: ${code} — no provider configured, not emailing`)
     return { delivered: false }
