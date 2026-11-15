@@ -12,7 +12,7 @@
 
 import { db } from '../db.js';
 import { COL } from './collections.js';
-import { jobIsPresumedDead, silentForMs, type JobLiveness } from './jobHealth.js';
+import { API_NO_BEAT_MS, issueStatusAfterDeadJob, jobIsPresumedDead, silentForMs, type JobLiveness } from './jobHealth.js';
 
 export type MagazineJobType =
   | 'processIssue'
@@ -21,7 +21,8 @@ export type MagazineJobType =
   | 'generateIssue'
   | 'generatePages'
   | 'readSourceDoc'
-  | 'renderIssuePdf';
+  | 'renderIssuePdf'
+  | 'extractDocumentImages';
 
 export interface JobPayloads {
   /** Digitize a freshly-uploaded PDF into pages + elements (the whole issue). */
@@ -64,8 +65,24 @@ export interface JobPayloads {
     sourceText?: string;
     threadId?: string;
   };
-  /** Design + insert N on-theme pages into an existing issue ("add pages"). */
-  generatePages: { issueId: string; count: number; topic?: string; atIndex: number; prevStatus: string };
+  /**
+   * Design + insert N on-theme pages into an existing issue ("add pages").
+   *
+   * `docIds` are the magazine's documents the user asked these pages to be built from
+   * ("add 2 pages from this PDF"), already checked against this magazine by the route;
+   * `sourceText` is the stored text of chat-attached documents, used only when there
+   * are no docIds. Both used to stop at the route: the payload had no field for them,
+   * so the new pages were written from the title instead (C19/C28).
+   */
+  generatePages: {
+    issueId: string;
+    count: number;
+    topic?: string;
+    atIndex: number;
+    prevStatus: string;
+    docIds?: string[];
+    sourceText?: string;
+  };
   /**
    * Read one uploaded document into the source store (chunks + coverage).
    *
@@ -116,6 +133,20 @@ export interface JobPayloads {
    * PDF is stamped with.
    */
   renderIssuePdf: { publishedIssueId: string };
+  /**
+   * Lift the pictures inside one of the magazine's PDFs into its media library, so
+   * "use the photo from page 2 of the PDF" can place the client's own picture
+   * (finding C45; apps/worker/src/jobs/extractDocumentImages.ts). Never touches a page.
+   *
+   * `magazineId`, deliberately NOT `issueId`, for the reason readSourceDoc documents
+   * above: both watchdogs treat a job naming an `issueId` as part of building that
+   * magazine, so a dead extraction could fail a magazine that is generating, and a
+   * queued one would keep a stalled build looking alive.
+   *
+   * `fromPage` (0-based) is where a continuation starts: one run reads a batch of
+   * pages and queues the rest, so a page copy started meanwhile is not held up.
+   */
+  extractDocumentImages: { magazineId: string; docId: string; fromPage?: number };
 }
 
 /** How many times a failing job is retried before it's marked `failed`. */
@@ -146,13 +177,27 @@ const STUCK_JOB_MS = Math.max(10 * 60_000, Number(process.env.MAGAZINE_V2_STUCK_
  *  practice; 20s is generous). */
 const STUCK_GRACE_MS = 20_000;
 
-async function markIssueFailed(issueId: string, message: string): Promise<boolean> {
+/**
+ * Take a 'processing' issue out of 'processing' once its job is known dead.
+ *
+ * `job` is the dead job when there is one. An "add pages" job carries the status
+ * the magazine had before it started, and the magazine goes back to that — a
+ * published magazine stays published, with a note the studio shows — instead of
+ * being failed for an interruption that changed none of its pages (the new pages
+ * are only inserted at the end of a run). See jobHealth.ts issueStatusAfterDeadJob.
+ */
+async function settleStuckIssue(
+  issueId: string,
+  message: string,
+  job?: Record<string, unknown> | null,
+): Promise<boolean> {
+  const fields = issueStatusAfterDeadJob(job, message);
   const healed = await db.collection(COL.magazines).updateOneIf(
     issueId,
     { status: 'processing' },
-    { status: 'failed', stage: '', processingError: message, updatedAt: new Date().toISOString() },
+    { ...fields, updatedAt: new Date().toISOString() },
   );
-  if (healed) console.error(`[magazineV2] healed stuck issue ${issueId}: ${message}`);
+  if (healed) console.error(`[magazineV2] healed stuck issue ${issueId} -> ${fields.status}: ${fields.processingError}`);
   return !!healed;
 }
 
@@ -176,7 +221,8 @@ export async function healStuckIssue(issue: { _id: string; status?: string; upda
   if (live.length === 0) {
     const stamped = Date.parse(String(issue.updatedAt ?? ''));
     if (Number.isFinite(stamped) && now - stamped < STUCK_GRACE_MS) return false; // enqueue may still be landing
-    return markIssueFailed(String(issue._id), 'Generation was interrupted before it could finish. Please try again.');
+    // No job to read a previous status from, so this stays 'failed'.
+    return settleStuckIssue(String(issue._id), 'Generation was interrupted before it could finish. Please try again.');
   }
 
   // A job exists — is it alive?
@@ -192,7 +238,11 @@ export async function healStuckIssue(issue: { _id: string; status?: string; upda
   // Now it asks "has it stopped reporting?" — see jobHealth.ts. A job that beats
   // is alive however long it runs; one that stops beating is caught in minutes.
   // The worker's own sweep imports the same decision, so the two cannot disagree.
-  const stuck = live.find((j) => jobIsPresumedDead(j as JobLiveness, now, { graceMs: STUCK_JOB_MS }));
+  //
+  // A beating job gets API_NO_BEAT_MS here, twice the worker's NO_BEAT_MS: a worker
+  // that restarted mid-job requeues it at NO_BEAT_MS (a retry, the better outcome),
+  // and this watchdog is the backstop for a worker that is down altogether.
+  const stuck = live.find((j) => jobIsPresumedDead(j as JobLiveness, now, { graceMs: STUCK_JOB_MS, noBeatMs: API_NO_BEAT_MS }));
   if (!stuck) return false;
   const silent = silentForMs(stuck as JobLiveness, now);
 
@@ -211,7 +261,11 @@ export async function healStuckIssue(issue: { _id: string; status?: string; upda
     },
   );
   if (!retired) return false; // someone else just touched it — believe them
-  return markIssueFailed(String(issue._id), 'Generation stalled and could not recover (the background worker stopped responding). Please try again.');
+  return settleStuckIssue(
+    String(issue._id),
+    'Generation stalled and could not recover (the background worker stopped responding). Please try again.',
+    stuck,
+  );
 }
 
 /** Enqueue a background job for the worker to claim. Returns the new job id. */

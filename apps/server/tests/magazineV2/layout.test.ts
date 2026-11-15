@@ -10,7 +10,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { fitFontSize, estimateTextHeight, contrastRatio, readableColor, refitText } from '../../src/lib/magazineV2/layout.js';
+import {
+  fitFontSize,
+  estimateTextHeight,
+  contrastRatio,
+  readableColor,
+  refitText,
+  plainTextForMeasure,
+  widestLineWidthPx,
+  measureElementText,
+} from '../../src/lib/magazineV2/layout.js';
 import type { MagazineElement } from '../../src/lib/magazineV2/model.js';
 
 const FONT = { fontFamily: 'Inter, Arial, sans-serif', fontWeight: 400 };
@@ -126,4 +135,162 @@ test('refitText only touches shrink-to-fit text that declares a ceiling', () => 
   assert.ok(out[0]!.text!.fontSize < 96, 'generated text should have been shrunk to fit');
   assert.equal(out[1]!.text!.fontSize, 33, 'extracted text must keep its measured size');
   assert.equal(out[2]!.text!.fontSize, 80, 'clip text must not be refitted');
+});
+
+// ── Reading copy the way the browser draws it (<br> breaks, bold runs) ──────────
+//
+// Both AI writers are told to use light inline HTML (<b> <i> <u> <br>). The estimator
+// used to drop <br> without a break and measure bold at the regular weight, so a
+// results list or a bold lead-in was "fitted" at a size whose last line was cut off.
+
+const LIST = [
+  '1st Desert Sky — J. Smith',
+  '2nd Prince of Waikato — A. Brown',
+  '3rd Ocean Belle — K. Lee',
+  '4th Mighty Ruler — S. Ng',
+  '5th Silver Comet — R. Patel',
+];
+const GEORGIA = "Georgia, 'Times New Roman', serif";
+const PARA =
+  'The New Owners Group is embarking on one of the most significant owner-focused initiatives undertaken in New Zealand racing for many years.';
+
+test('a <br> is a line break: <br>-separated lines measure exactly like newline-separated ones', () => {
+  const args = { fontSize: 20, boxWidthPx: 500, lineHeight: 1.5, ...FONT };
+  assert.equal(estimateTextHeight({ ...args, text: 'a<br>b<br>c' }), estimateTextHeight({ ...args, text: 'a\nb\nc' }));
+  assert.equal(estimateTextHeight({ ...args, text: 'a<br/>b<br />c' }), estimateTextHeight({ ...args, text: 'a\nb\nc' }));
+});
+
+test('five <br>-separated lines in a 600×200 box fit at 33px, not the 40px that cut the last line off', () => {
+  const box = { boxW: 600, boxH: 200, maxFontSize: 40, minFontSize: 10, lineHeight: 1.2, ...FONT };
+  const withBr = fitFontSize({ text: LIST.join('<br>'), ...box });
+  assert.equal(withBr, fitFontSize({ text: LIST.join('\n'), ...box }));
+  assert.equal(withBr, 33);
+  const h = estimateTextHeight({ text: LIST.join('<br>'), fontSize: withBr, boxWidthPx: 600, lineHeight: 1.2, ...FONT });
+  assert.ok(h <= 200, `fitted to ${withBr}px but needs ${h}px of a 200px box`);
+});
+
+test('a break that ends the copy opens no new line, as in the browser; two show a blank line', () => {
+  const args = { fontSize: 20, boxWidthPx: 500, lineHeight: 1, fontFamily: GEORGIA, fontWeight: 400 };
+  assert.equal(estimateTextHeight({ ...args, text: 'a<br>' }), 20);
+  assert.equal(estimateTextHeight({ ...args, text: 'a\n' }), 20);
+  assert.equal(estimateTextHeight({ ...args, text: 'a<br><br>' }), 40);
+});
+
+test('bold copy is measured at the bold weight: it wraps where the browser wraps it', () => {
+  const args = { fontSize: 24, boxWidthPx: 380, lineHeight: 1, fontFamily: GEORGIA, fontWeight: 400 };
+  const regular = estimateTextHeight({ ...args, text: PARA });
+  const bold = estimateTextHeight({ ...args, text: `<b>${PARA}</b>` });
+  assert.equal(bold, estimateTextHeight({ ...args, text: PARA, fontWeight: 700 }));
+  assert.ok(bold > regular, `bold Georgia is ~15% wider, so it must take more lines (${bold} vs ${regular})`);
+  assert.equal(estimateTextHeight({ ...args, text: `<strong>${PARA}</strong>` }), bold);
+  assert.equal(estimateTextHeight({ ...args, text: `<span style="font-weight: 700">${PARA}</span>` }), bold);
+});
+
+test('an inline font-weight beats the tag, and a closing tag restores the weight it replaced', () => {
+  const args = { fontSize: 24, boxWidthPx: 380, lineHeight: 1, fontFamily: GEORGIA, fontWeight: 400 };
+  const regular = estimateTextHeight({ ...args, text: PARA });
+  assert.equal(estimateTextHeight({ ...args, text: `<b style="font-weight:400">${PARA}</b>` }), regular);
+  assert.equal(estimateTextHeight({ ...args, text: `<b>x</b> ${PARA}` }), estimateTextHeight({ ...args, text: `x ${PARA}` }));
+});
+
+test('fully bold Georgia copy refit to its box still fits when measured at weight 700', () => {
+  for (const [w, h] of [[400, 200], [500, 160], [600, 120]] as const) {
+    const [el] = refitText([
+      { id: 'b', type: 'text', x: 0, y: 0, w, h, rotation: 0, zIndex: 0, locked: false, source: 'ai-agent',
+        text: { content: `<b>${PARA}</b>`, role: 'body', fontFamily: GEORGIA, fontSize: 40, maxFontSize: 40, minFontSize: 8, fontWeight: 400, color: '#111111', align: 'left', lineHeight: 1.3, autoFit: 'shrink' } },
+    ] as unknown as MagazineElement[]);
+    const size = el!.text!.fontSize;
+    const atBold = estimateTextHeight({ text: PARA, fontSize: size, boxWidthPx: w, lineHeight: 1.3, fontFamily: GEORGIA, fontWeight: 700 });
+    assert.ok(atBold <= h, `${w}×${h}: refit to ${size}px, which needs ${atBold}px in bold`);
+    // ...and the regular-weight answer it used to give would not have fitted.
+    const regularSize = fitFontSize({ text: PARA, boxW: w, boxH: h, maxFontSize: 40, minFontSize: 8, lineHeight: 1.3, fontFamily: GEORGIA, fontWeight: 400 });
+    assert.ok(regularSize > size, `${w}×${h}: bold must fit smaller than regular (${size} vs ${regularSize})`);
+  }
+});
+
+test('plainTextForMeasure: tags gone, <br> a newline, entities one character each', () => {
+  assert.equal(plainTextForMeasure('<b>A</b> &amp; B<br/>C&#8217;s &lt;x&gt;'), 'A & B\nC’s <x>');
+  assert.equal(plainTextForMeasure('one<br>two'), 'one\ntwo');
+  assert.equal(plainTextForMeasure('&mdash; &#x2014; &unknown;'), '— — &unknown;');
+  assert.equal(plainTextForMeasure(''), '');
+});
+
+test('widestLineWidthPx measures the widest hard line, unwrapped', () => {
+  const style = { fontSize: 20, fontFamily: GEORGIA, fontWeight: 400 };
+  const long = 'a much longer second line';
+  assert.equal(widestLineWidthPx({ ...style, text: `short<br>${long}` }), widestLineWidthPx({ ...style, text: long }));
+  assert.ok(widestLineWidthPx({ ...style, text: `<b>${long}</b>` }) > widestLineWidthPx({ ...style, text: long }));
+  assert.ok(widestLineWidthPx({ ...style, text: long, textTransform: 'uppercase' }) > widestLineWidthPx({ ...style, text: long }));
+});
+
+// ── measureElementText: the numbers the page check and the edit tools report ──
+
+type TextData = NonNullable<MagazineElement['text']>;
+
+function textEl(over: Omit<Partial<MagazineElement>, 'text'> & { text?: Partial<TextData> } = {}): MagazineElement {
+  const { text, ...rest } = over;
+  return {
+    id: 't', type: 'text', x: 0, y: 0, w: 500, h: 160, rotation: 0, zIndex: 0, locked: false, source: 'manual',
+    ...rest,
+    text: { content: `${PARA} ${PARA}`, role: 'body', fontFamily: GEORGIA, fontSize: 28, maxFontSize: 28, fontWeight: 400, color: '#111111', align: 'left', lineHeight: 1.3, autoFit: 'shrink', ...text },
+  } as MagazineElement;
+}
+
+test('measureElementText reports need, have, overflow and the size it fits at', () => {
+  const m = measureElementText(textEl())!;
+  assert.equal(m.fontSize, 28);
+  assert.equal(m.havePx, 160);
+  assert.equal(m.needPx, estimateTextHeight({ text: `${PARA} ${PARA}`, fontSize: 28, boxWidthPx: 500, lineHeight: 1.3, fontFamily: GEORGIA, fontWeight: 400 }));
+  assert.equal(m.overflowPx, m.needPx - 160);
+  assert.equal(m.fits, false);
+  assert.equal(m.ceiling, 28);
+  assert.equal(m.fitsAtPx, fitFontSize({ text: `${PARA} ${PARA}`, boxW: 500, boxH: 160, maxFontSize: 28, minFontSize: 6, lineHeight: 1.3, fontFamily: GEORGIA, fontWeight: 400 }));
+  const at = measureElementText(textEl({ text: { fontSize: m.fitsAtPx! } }))!;
+  assert.equal(at.fits, true, 'the size it says fits does fit');
+  assert.equal(at.overflowPx, 0);
+});
+
+test('measureElementText answers "at size S in width W" without changing the element', () => {
+  const el = textEl();
+  const wide = measureElementText(el, { fontSize: 20, width: 900 })!;
+  assert.equal(wide.fontSize, 20);
+  assert.equal(wide.width, 900);
+  assert.equal(wide.needPx, estimateTextHeight({ text: el.text!.content, fontSize: 20, boxWidthPx: 900, lineHeight: 1.3, fontFamily: GEORGIA, fontWeight: 400 }));
+  assert.equal(el.text!.fontSize, 28);
+  const taller = measureElementText(el, { height: 2000 })!;
+  assert.equal(taller.fits, true);
+  assert.equal(taller.fitsAtPx, 28);
+});
+
+test('measureElementText: copy that cannot fit even at 6px says so (null); refit text fits', () => {
+  assert.equal(measureElementText(textEl({ w: 60, h: 10 }))!.fitsAtPx, null);
+  const [refit] = refitText([textEl()]);
+  assert.equal(measureElementText(refit!)!.fits, true);
+  assert.equal(measureElementText({ ...textEl(), type: 'image', text: undefined } as MagazineElement), null);
+});
+
+test('measureElementText: text still set as its PDF set it never wraps; its lines run on', () => {
+  const pdf = textEl({
+    source: 'extracted',
+    w: 880,
+    h: 140,
+    text: {
+      content: [
+        'The New Zealand Thoroughbred Racing Owners Federation (NZTROF) is',
+        'embarking on one of the most significant owner-focused initiatives',
+        'undertaken in New Zealand racing for many years, and owners are at',
+        'the heart of it.',
+      ].join('\n'),
+      fontSize: 29,
+      maxFontSize: undefined,
+      lineHeight: 1.2,
+      fontFamily: 'Times New Roman, serif',
+    },
+  });
+  const m = measureElementText(pdf)!;
+  assert.equal(m.noWrap, true);
+  assert.equal(m.lines, 4);
+  assert.ok(Math.abs(m.needPx - 4 * 29 * 1.2) < 1e-9);
+  // Asked about another width, it is judged as the flowing text that edit turns it into.
+  assert.equal(measureElementText(pdf, { width: 500 })!.noWrap, false);
 });

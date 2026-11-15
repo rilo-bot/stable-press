@@ -28,50 +28,19 @@ import { CommentsSection } from '@/components/comments/CommentsSection';
 import { ArrowLeft, BookOpen, Download, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { bulletinPageId, useBulletinReaderOperatorActions } from '@/pages/operator-site/useBulletinOperatorActions';
-
-/**
- * Fallback page dims when an issue somehow carries none — the canonical generated
- * page (**A4 portrait at 150 DPI**), matching PAGE_W/PAGE_H in the server's
- * magazineV2 config. Uploaded pages, and pages generated before the switch to A4,
- * carry whatever size they were made at, so NOTHING here may assume a fixed sheet:
- * every page is measured from its own box (see pageBox / pageInches).
- */
-const FALLBACK_W = 1240;
-const FALLBACK_H = 1754;
-
-/**
- * DPI the page pixels are measured at. Generated pages are A4 at 150 DPI
- * (1240×1754), and the PDF extractor rasterises uploads at the same 150
- * (`RENDER_DPI` in apps/worker/src/lib/pdf.ts), so one constant converts either
- * kind of page to a physical size — including older Letter-sized pages, which is
- * why this is a DPI and not a sheet.
- *
- * This matters because a browser treats a bare `px` as a CSS pixel — 1/96 inch —
- * so printing a 1240px-wide box lands on a 12.9-inch sheet. Divide by 150 instead
- * and it lands on the 8.27 inches the page was designed as.
- */
-const RASTER_DPI = 150;
-
-/** A page's own pixel box, defaulting only if the snapshot is missing dims. */
-function pageBox(page: IssuePageData | undefined): { w: number; h: number } {
-  return {
-    w: Number(page?.width) > 0 ? Number(page!.width) : FALLBACK_W,
-    h: Number(page?.height) > 0 ? Number(page!.height) : FALLBACK_H,
-  };
-}
-
-/** The page's PHYSICAL size, for `@page` and the print box. */
-function pageInches(page: IssuePageData | undefined): { w: string; h: string } {
-  const box = pageBox(page);
-  return { w: `${(box.w / RASTER_DPI).toFixed(4)}in`, h: `${(box.h / RASTER_DPI).toFixed(4)}in` };
-}
+import { proxiedAssetUrl } from '@/lib/assetUrl';
+// Page sizing (FALLBACK_W/H, RASTER_DPI, pageBox, pageInches), the named @page
+// rules and the print-readiness wait live in ./bulletinPrint — pure, so the rules
+// that decide whether the downloaded PDF is right are unit-tested. NOTHING here may
+// assume a fixed sheet: every page is measured from its own box.
+import { FALLBACK_W, pageBox, pageInches, printPageRules, sheetName, waitForImagesSettled } from './bulletinPrint';
 
 // Pages are free-form: absolutely-positioned elements in the page's own canonical
 // dims. The canvas is width-responsive via container queries, so on screen the
 // wrapper only needs a width and its height resolves from the page's aspect.
 //
 // In PRINT it needs both, from THIS page — see the @media print block below for
-// why a shared constant was wrong.
+// why a shared constant was wrong — and it names the sheet it prints on.
 function ReadonlyPage({ page, maxWidth, agentId }: { page: IssuePageData; maxWidth: number; agentId?: string }) {
   const inches = pageInches(page);
   return (
@@ -83,7 +52,14 @@ function ReadonlyPage({ page, maxWidth, agentId }: { page: IssuePageData; maxWid
       data-agent-id={agentId}
       // `--page-w/h` are consumed only inside @media print; on screen the explicit
       // width governs and the canvas resolves its own height from the page aspect.
-      style={{ width: maxWidth, ['--page-w' as string]: inches.w, ['--page-h' as string]: inches.h }}
+      // `page` names the @page rule (printPageRules) this page prints on, so a page
+      // of another shape gets a sheet of its own shape. It has no effect on screen.
+      style={{
+        width: maxWidth,
+        page: sheetName(page),
+        ['--page-w' as string]: inches.w,
+        ['--page-h' as string]: inches.h,
+      }}
     >
       <IssuePageCanvas page={page} />
     </div>
@@ -230,7 +206,16 @@ export default function BulletinViewer() {
   }, [status, issue?.pages]);
 
   // Signal print-readiness for the server-side renderer: wait for the issue to
-  // be rendered, web fonts to load, and every page image to finish.
+  // be rendered, web fonts to load, and every page image to reach its FINAL state.
+  //
+  // "Final" is the fix. This used to wait for each image's first load OR error —
+  // but a direct S3 URL that fails is retried through the API proxy (the app-wide
+  // fallback in lib/assetUrl.ts, and ResilientImg), and that first error is
+  // exactly when the retry STARTS. The marker went up, the worker printed, and the
+  // proxied photos were still downloading: blank boxes in the stored PDF that every
+  // later reader downloads. waitForImagesSettled waits for loaded, or broken with
+  // no fallback left, and also covers images that were already broken (they used
+  // to hang the wait until the renderer's own timeout).
   useEffect(() => {
     if (status !== 'ready') return;
     let cancelled = false;
@@ -242,18 +227,12 @@ export default function BulletinViewer() {
       }
       const el = containerRef.current;
       if (el) {
-        const imgs = Array.from(el.querySelectorAll('img'));
-        await Promise.all(
-          imgs
-            .filter((img) => !img.complete || img.naturalWidth === 0)
-            .map(
-              (img) =>
-                new Promise<void>((resolve) => {
-                  img.addEventListener('load', () => resolve(), { once: true });
-                  img.addEventListener('error', () => resolve(), { once: true });
-                }),
-            ),
-        );
+        // 30s: inside lib/pdf.ts's 45s wait for the marker, so a pathological image
+        // costs that image, not the whole render.
+        await waitForImagesSettled(() => el.querySelectorAll('img'), {
+          canFallback: (url) => proxiedAssetUrl(url) !== null,
+          timeoutMs: 30_000,
+        });
       }
       if (!cancelled) setPrintReady(true);
     })();
@@ -298,15 +277,17 @@ export default function BulletinViewer() {
           Unpublished — this edition is off Bulletins. Only staff can see this preview; readers get “not found”.
         </div>
       )}
-      {/* Print rules: render each page at natural A4 size, one per sheet, with the
-          screen chrome and scaling removed. These are what the "Download PDF" button
-          uses — the server prints this exact route in headless Chromium — and they
-          also apply to native browser print (Ctrl+P). */}
+      {/* Print rules: render each page at its natural size, one per sheet of THAT
+          size, with the screen chrome and scaling removed. These are what the
+          "Download PDF" button uses — the server prints this exact route in
+          headless Chromium — and they also apply to native browser print (Ctrl+P). */}
       {/*
         Print sizing comes from EACH PAGE's own box, in INCHES (the `--page-w/h`
-        custom properties set by ReadonlyPage), with `@page` sized to match.
+        custom properties set by ReadonlyPage), and each page prints on a NAMED
+        @page rule of exactly that size (`page: sz…` on ReadonlyPage, rules from
+        printPageRules in ./bulletinPrint).
 
-        Two bugs were fixed here, and they compounded:
+        Three bugs were fixed here, and they compounded:
 
         1. WRONG ASPECT. This was a pair of hard-coded constants — 794×1123, the v1
            template builder's A4-at-96dpi page — applied to every page of every
@@ -321,31 +302,38 @@ export default function BulletinViewer() {
            13.3-inch sheet — right shape, unusable paper. Dividing by the 150 DPI
            the pixels were measured at gives the 8.5×11in the page was designed as.
 
+        3. ONE SHEET FOR ALL PAGES. The sheet was the FIRST page's box for every
+           page, on the belief that an issue's pages are uniform. They are not:
+           "copy a page" keeps the source PDF's shape (Letter inside A4, A4 plus
+           bleed, a landscape spread), and pages added to an imported Letter
+           magazine are A4. A larger page lost its right and bottom edges or
+           spilled onto an extra sheet; a smaller one got white bands. Named pages
+           give every distinct size its own sheet, and lib/pdf.ts passes
+           preferCSSPageSize so the PDF export honours them.
+
         The element positions inside the canvas are percentages and its font sizes
         are `cqw`, so both scale with the container — sizing it in inches rescales
         the whole page cleanly rather than reflowing it.
       */}
       <style>{`
         @media print {
-          /* THE SHEET THE DOCUMENT IS LAID OUT ON. Written here from the FIRST
-             page's box rather than read from a custom property, because @page
-             resolves variables against the ROOT element only — and --page-w/h are
-             set by ReadonlyPage on each .bulletin-print-page, which is a
-             descendant. So this rule used to see nothing and silently take its
+          /* THE SHEETS THE DOCUMENT IS LAID OUT ON. Written here as literal sizes
+             rather than read from a custom property, because @page resolves
+             variables against the ROOT element only — and --page-w/h are set by
+             ReadonlyPage on each .bulletin-print-page, which is a descendant. So a
+             variable-sized rule used to see nothing and silently take its
              fallback, US Letter.
 
              That is not a cosmetic mismatch, it DOUBLED every export. Chromium
              paginated an 11.6933in page box onto an 11in sheet, so each magazine
              page spilled its bottom 66px — the page number and the foot of the
              artwork — onto a sheet of its own: a 5-page issue downloaded as 10.
-             The sheet CAME OUT A4 regardless, because page.pdf() is passed
-             explicit dims, which is exactly why the bug was invisible in the
-             output's page size and survived the earlier px→in fix.
 
-             First page, to match lib/pdf.ts: page.pdf() takes ONE size for the
-             whole document, so the sheet is the first page's box there too. The
-             two must agree or the pagination splits again. */
-          @page { size: ${pageInches(issue.pages[0]).w} ${pageInches(issue.pages[0]).h}; margin: 0; }
+             An unnamed default from the FIRST page (matching lib/pdf.ts's fallback
+             width/height), then one named rule per distinct page size; each page
+             names its own (sheetName) from the SAME inch strings as its box, so a
+             box can never be a fraction taller than its sheet and split again. */
+          ${printPageRules(issue.pages)}
           html, body { background: #fff !important; }
           .bulletin-print-container { max-width: none !important; margin: 0 !important; padding: 0 !important; gap: 0 !important; display: block !important; }
           .bulletin-print-page { width: var(--page-w) !important; height: var(--page-h) !important; box-shadow: none !important; overflow: hidden !important; }

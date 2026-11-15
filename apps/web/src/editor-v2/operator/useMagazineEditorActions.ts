@@ -23,6 +23,37 @@
 //     deletePage (the tile's 🗑 asks window.confirm) → store.deletePage
 //     movePage over more than one slot (drag-and-drop) → store.reorder
 //
+// SEEING THE PAGE. readScreen collects text whether or not it is cut off and never
+// sees a picture, so "check the page with readScreen" passed pages with clipped
+// copy and the Stable Hand ended up telling users it could not see the page. Now:
+//   magazine.checkPage    measures a page as it renders in THIS browser
+//                         (editor-v2/pageCheck.measurePage: an off-screen copy at
+//                         the page's own width, real fonts and images) and returns
+//                         the issues with element ids, numbers and a fix each;
+//   magazine.lookAtPage   adds a visual review of the STORED page, rendered on the
+//                         server (POST …/look), alongside that measurement;
+//   and every action that changes a page (askStudio / applyStudioChanges /
+//   waitForStudio with apply, fillPage, adjustPage, addChart, editChart,
+//   replaceText) measures it afterwards and returns `pageCheck` itself.
+//
+// CHARTS (magazine.addChart / editChart) are drawn by the server from the exact
+// numbers (POST …/chart — never an image model) and placed through the store's own
+// addElement / commit inside one batchEdits, so the chart is one Ctrl+Z like any
+// other edit, rev-guarded like any other write.
+//
+// STAGED STUDIO CHANGES WAIT PER PAGE until applied or discarded (store `pending`;
+// they used to be one tray that each new request replaced, so asking twice lost the
+// first set). askStudio reports what its turn REALLY staged — proposalCount and the
+// deterministic stagedLine, built from the proposals, never the reply's own claim —
+// plus every page's waiting changes (pendingChanges); apply:true applies that page's.
+// applyStudioChanges presses the "Apply all" bar: every page, in page order, with a
+// per-page report. magazine.status lists them too, so none is ever forgotten.
+//
+// WORD SWAPS (magazine.replaceText) go through POST …/replace-text: a dry run
+// counts the matches on every page this user can edit, the user OKs a card with
+// the count per page, then only the matching words change. askStudio refuses a
+// magazine-wide swap and points here — the studio edits only the open page.
+//
 // Reads (status, listStaff) come from the editor store and the Share dialog's
 // own GET. Server RBAC applies to every write exactly as it does for a click;
 // the `enabled` flags below keep out of the model's list what the server would
@@ -36,13 +67,45 @@ import { useRef } from 'react';
 import { z } from 'zod';
 import { useAgentAction } from '@/agent/operator/runtime/registry';
 import type { UiDriver } from '@/agent/operator/contracts';
+import { presence } from '@/agent/operator/presence';
 import { useEditorStore } from '../store';
 import { buildStatus } from '../buildStatus';
 import { columnOf, COLUMN_LABEL, COLUMN_ORDER, publishBlockedReason, readOnlyReason, submittablePages, type ReviewColumn } from '../review';
 import { useOperatorJobs } from '@/agent/operator/runtime/jobs';
 import { JOB_STARTED_NOTE, magazineBuildJobId, settlePreviousBuildJob, startMagazineBuildJob } from './magazineJobs';
-import type { PageSummary, V2Collaborator } from '../api';
-import { personDisplay } from '@/agent/operator/runtime/humanRef';
+import {
+  ApiError,
+  createChart,
+  getPage,
+  listMedia,
+  listSources,
+  listUploads,
+  lookAtPage as requestPageLook,
+  replaceText as requestReplaceText,
+  type ChartResult,
+  type PageSummary,
+  type V2Collaborator,
+} from '../api';
+import type { AgentProposal, IssuePageData, MagazineElement, PageCheck } from '../model';
+import { measurePage } from '../pageCheck';
+import { copyNoticeText } from '../pageCopy';
+import { applyOutcome, applyReportLine, changeCount, pagesPhrase, pendingFor, waitingPages, type PageApplyReport } from '../pendingChanges';
+import { actionError, personDisplay } from '@/agent/operator/runtime/humanRef';
+import {
+  appliedNote,
+  applyAllQuestion,
+  chartSpecArgs,
+  magazineWideSwap,
+  measuredSentence,
+  mergeChartChanges,
+  pageElementList,
+  pickDocument,
+  replaceLeftAlone,
+  replaceQuestion,
+  studioPrompt as rewriteStudioPrompt,
+  type DocChoice,
+  type WebChartSpec,
+} from './editorActionsPure';
 import {
   anchor,
   assertEnabled,
@@ -222,6 +285,301 @@ function publishRefusal(pages?: number[]): string {
   return why ? `${why} Approve them on the review board first, or leave them out.` : '';
 }
 
+// ── Seeing the page ──────────────────────────────────────────────────────────
+
+const stopped = () => new DOMException('The Stable Hand was stopped.', 'AbortError');
+
+/**
+ * `work`, unless it takes longer than `ms` or the run is stopped. measurePage waits
+ * for fonts and every picture on the page; a picture whose host never answers must
+ * not hold a whole action hostage — the action then says the page could not be
+ * measured and the model calls magazine.checkPage again.
+ */
+function within<T>(work: Promise<T>, ms: number, signal: AbortSignal, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(stopped());
+      return;
+    }
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(stopped());
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`${what} took longer than ${Math.round(ms / 1000)}s`));
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(
+      (v) => {
+        cleanup();
+        resolve(v);
+      },
+      (e) => {
+        cleanup();
+        reject(e);
+      },
+    );
+  });
+}
+
+const MEASURE_MS = 20_000;
+
+/**
+ * Measure one page in this browser. Never throws for a failed measurement (the
+ * reason comes back instead, so a change that DID land is not reported as failed
+ * because its check could not run) — only a Stop stops it.
+ */
+async function measureSafely(page: IssuePageData | null | undefined, signal: AbortSignal): Promise<{ check: PageCheck | null; why?: string }> {
+  if (!page) return { check: null, why: 'the page is not loaded' };
+  try {
+    return { check: await within(measurePage(page), MEASURE_MS, signal, 'measuring the page') };
+  } catch (e) {
+    if (signal.aborted) throw e;
+    return { check: null, why: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** Measure the OPEN page (optionally only if it is `pageId`) — the page every
+ *  apply, Fill/Adjust and chart lands on. */
+async function measureOpenPage(signal: AbortSignal, pageId?: string): Promise<{ check: PageCheck | null; why?: string }> {
+  const p = get().page;
+  if (!p || (pageId && p.id !== pageId)) return { check: null, why: 'that page is no longer the open one' };
+  return measureSafely(p, signal);
+}
+
+/** A page's full data: the open page from the store (it holds every write made
+ *  this session), any other page fresh from the server — without navigating. */
+async function pageData(pageId: string): Promise<IssuePageData> {
+  const s = get();
+  if (s.page && s.page.id === pageId) return s.page;
+  return getPage(s.issueId!, pageId);
+}
+
+/** Measure the page with this id, open or not (a staged layout rebuild or PDF copy
+ *  can land on a page other than the one on screen). */
+async function measurePageId(pageId: string | null | undefined, signal: AbortSignal): Promise<{ check: PageCheck | null; why?: string }> {
+  // No page named, or the change deleted it: the open page is what the user sees now.
+  if (!pageId || !get().pages.some((p) => p.id === pageId)) return measureOpenPage(signal);
+  let data: IssuePageData | null = null;
+  try {
+    data = await pageData(pageId);
+  } catch (e) {
+    return { check: null, why: apiMessage(e, 'the page could not be read') };
+  }
+  return measureSafely(data, signal);
+}
+
+/** The page an action is about: the one named, else the open one. */
+function targetPage(pages: PageSummary[], n: number | undefined): PageSummary {
+  if (n !== undefined) return pageAt(pages, n);
+  const s = get();
+  const open = s.pages.find((p) => p.id === s.currentPageId);
+  if (!open) throw new Error('No page is open yet — wait for the first page to build, or pass page.');
+  return open;
+}
+
+/** Gold flash on one element of the page on the canvas (IssuePageCanvas marks each
+ *  element with data-el-id). Scoped to the canvas's own page wrapper, so the
+ *  off-screen copy measurePage mounts is never the one flashed. */
+async function flashElement(pageId: string, elementId: string, signal: AbortSignal) {
+  await sleep(150, signal); // let React draw the new element first
+  const el = document.querySelector(`[data-page="${CSS.escape(pageId)}"] [data-el-id="${CSS.escape(elementId)}"]`);
+  if (!el) return;
+  try {
+    presence.flash(el);
+  } catch {
+    /* visual only */
+  }
+}
+
+/** A server refusal in the server's own words (they are written for a person),
+ *  never "HTTP 400". */
+function apiMessage(e: unknown, fallback: string): string {
+  if (e instanceof ApiError) {
+    if (e.status === 429) return 'Too many of those in the last minute — wait a moment, then try again.';
+    return e.message && !/^HTTP \d+$/.test(e.message) ? e.message : fallback;
+  }
+  return e instanceof Error && e.message ? e.message : fallback;
+}
+
+/**
+ * One staged / applied studio change as a result reports it. A picture's alt says
+ * WHAT was placed — for a chart it lists every number (the server's chartAlt), so
+ * the Stable Hand can tell the user exactly what went on the page rather than
+ * "applied". `warning` is a problem the server found with the change (e.g. text
+ * that will not fit its box).
+ */
+const proposalOut = (p: AgentProposal) => {
+  const alt = p.element?.image?.alt || p.patch?.image?.alt;
+  return { kind: p.kind, summary: p.summary, ...(alt ? { alt } : {}), ...(p.warning ? { warning: p.warning } : {}) };
+};
+
+/** At most this many changes are listed per page in a result (the count is exact). */
+const LISTED_PER_PAGE = 12;
+
+/**
+ * EVERY page's changes waiting for Apply, in page order — what the studio has staged
+ * and nobody has applied or discarded yet. Staged changes are kept per page now (they
+ * used to be one tray that each new request replaced), so a result must say what
+ * waits on OTHER pages too, or the Stable Hand loses track of them exactly as the old
+ * tray did. `scopePageId` narrows it to one page.
+ */
+function pendingOut(scopePageId?: string | null) {
+  const s = get();
+  return waitingPages(s.pending, s.pages)
+    .filter((w) => !scopePageId || w.pageId === scopePageId)
+    .map((w) => ({
+      page: w.page,
+      count: w.proposals.length,
+      changes: w.proposals.slice(0, LISTED_PER_PAGE).map(proposalOut),
+      ...(w.proposals.length > LISTED_PER_PAGE ? { more: w.proposals.length - LISTED_PER_PAGE } : {}),
+    }));
+}
+
+/** One page's apply as a result reports it. */
+const reportOut = (r: PageApplyReport) => ({
+  page: r.page || null,
+  applied: r.applied,
+  ...(r.refused ? { refused: r.refused } : {}),
+  ...(r.waiting ? { stillWaiting: r.waiting } : {}),
+  ...(r.declined ? { declined: true } : {}),
+  ...(r.stale ? { heldBecauseEditedSinceStaged: r.stale } : {}),
+  ...(r.started ? { started: r.started === 'layout' ? 'layout rebuild' : 'PDF page copy' } : {}),
+  ...(r.gone ? { pageGone: true } : {}),
+  ...(r.notOpened ? { couldNotOpen: true } : {}),
+});
+
+// ── Charts ───────────────────────────────────────────────────────────────────
+
+/**
+ * The numbers behind the charts drawn in this session, by media asset id. The media
+ * list does not (yet) return a chart's stored spec, so this is the first place
+ * editChart looks; it survives the editor re-rendering, not a reload.
+ */
+const chartSpecs = new Map<string, WebChartSpec>();
+
+/** The stored numbers behind a chart picture: this session's, else the media row's
+ *  `chart` field when the server returns it. */
+async function storedChartSpec(issueId: string, assetId: string): Promise<WebChartSpec | null> {
+  const mine = chartSpecs.get(assetId);
+  if (mine) return mine;
+  const assets = await listMedia(issueId).catch(() => []);
+  const row = assets.find((a) => a.id === assetId) as ({ chart?: unknown } & object) | undefined;
+  const parsed = row && 'chart' in row ? chartSpecArgs.safeParse(row.chart) : null;
+  return parsed?.success ? parsed.data : null;
+}
+
+/**
+ * Put a drawn chart on its page as ONE undo entry: a new picture element on top, or
+ * — with `replaceId` — in place of an element. A picture being replaced is PATCHED
+ * (same id, so editChart can find it again and nothing that names it breaks); any
+ * other element is swapped for the new picture (added first, so a refused add never
+ * leaves a hole). Returns the chart element's id.
+ */
+async function placeChart(ui: UiDriver, target: PageSummary, result: ChartResult, replaceId?: string): Promise<string> {
+  const pageId = target.id;
+  // The store writes to the OPEN page; drawing can take seconds, and the canvas may
+  // have scrolled meanwhile.
+  if (get().currentPageId !== pageId || get().page?.id !== pageId) await openPageN(ui, pageNo(target));
+  const old = replaceId ? get().page?.elements.find((e) => e.id === replaceId) : undefined;
+  if (replaceId && !old) throw new Error('The element to replace is no longer on the page — call magazine.checkPage for the current ids.');
+  const el = result.element;
+  const toasts = watchToasts();
+  let placed: { id: string | null; leftOld: boolean };
+  try {
+    placed = await get().batchEdits('the chart', async () => {
+      if (old && old.type === 'image') {
+        const patch: Partial<MagazineElement> = {
+          ...(typeof el.x === 'number' ? { x: el.x } : {}),
+          ...(typeof el.y === 'number' ? { y: el.y } : {}),
+          ...(typeof el.w === 'number' ? { w: el.w } : {}),
+          ...(typeof el.h === 'number' ? { h: el.h } : {}),
+          ...(typeof el.rotation === 'number' ? { rotation: el.rotation } : {}),
+          ...(typeof el.zIndex === 'number' ? { zIndex: el.zIndex } : {}),
+          ...(el.image && old.image ? { image: { ...old.image, ...el.image } } : el.image ? { image: el.image } : {}),
+        };
+        return { id: (await get().commit(old.id, patch)) ? old.id : null, leftOld: false };
+      }
+      const id = await get().addElement(el);
+      return { id, leftOld: !!id && !!old && !(await get().deleteElement(old.id)) };
+    });
+  } finally {
+    toasts.stop();
+  }
+  if (!placed.id) throw new Error(firstError(toasts.peek()) || 'The page did not accept the chart — see the message on screen.');
+  if (placed.leftOld) {
+    throw new Error(`The chart was added, but the element it should replace could not be removed: ${firstError(toasts.peek()) || 'see the message on screen'}.`);
+  }
+  await flashElement(pageId, placed.id, ui.signal);
+  return placed.id;
+}
+
+// ── Documents to build pages from (C19/C28) ─────────────────────────────────
+
+/** Every document the magazine has, from both stores, with whether it can be read. */
+async function documentChoices(issueId: string): Promise<DocChoice[]> {
+  const [uploads, sources] = await Promise.allSettled([listUploads(issueId), listSources(issueId)]);
+  if (uploads.status === 'rejected' && sources.status === 'rejected') {
+    throw new Error("Couldn't read the magazine's attached documents just now — try again.");
+  }
+  const out: DocChoice[] = [];
+  if (sources.status === 'fulfilled') {
+    for (const d of sources.value) {
+      const readable = d.status === 'ready' || d.status === 'partial';
+      out.push({
+        id: d.id,
+        name: d.originalName,
+        kind: 'source',
+        readable,
+        why: readable
+          ? undefined
+          : d.status === 'failed'
+            ? d.error || 'it could not be read'
+            : 'it is still being read — try again in a minute',
+      });
+    }
+  }
+  if (uploads.status === 'fulfilled') {
+    for (const u of uploads.value) {
+      // `readable` covers a SCANNED PDF attached in chat: it has no browser text, but
+      // its linked page-by-page read makes it usable (POST /pages/generate follows the
+      // link). Judging it by hasText alone told The Stable Hand it could not be read.
+      const readable = u.readable ?? u.hasText;
+      out.push({
+        id: u.id,
+        name: u.originalName,
+        kind: 'upload',
+        readable,
+        why: readable
+          ? undefined
+          : u.reading
+            ? 'it is still being read — try again in a minute'
+            : 'no text could be read from it (a scanned PDF? attach its pages as pictures instead)',
+      });
+    }
+  }
+  return out;
+}
+
+/** "the brochure" → the one document to write new pages from, or an error the model
+ *  can act on (attach it first / which one / not readable yet). */
+async function resolveBuildDocument(query: string): Promise<DocChoice> {
+  const r = pickDocument(query, await documentChoices(get().issueId!));
+  if (r.ok) return r.doc;
+  if (r.noDocs) {
+    throw actionError('This magazine has no document attached yet — attach it first, then add the pages from it.', {
+      next:
+        'Open the AI Studio Uploads tab (click mag.ai-tab-uploads), store the user\'s file with upload { agentId: "mag.ai-uploads-add", attachment } — it is saved at once — then call this action again with doc.',
+    });
+  }
+  throw new Error(r.error);
+}
+
 /** The page builder's count picker offers 1, 2, 3, 4 or 6 pages per build. */
 const BUILD_BATCHES = [6, 4, 3, 2, 1] as const;
 
@@ -241,37 +599,42 @@ const aiPagesCount = z.number().int().min(1).max(12);
  * Module-level so it survives the editor re-rendering; one magazine at a time,
  * and it expires so a stale approval can never cover a new request.
  */
-let approvedRest: { issueId: string; count: number; topic: string; until: number } | null = null;
+let approvedRest: { issueId: string; count: number; topic: string; doc: string; until: number } | null = null;
 const topicKey = (t: string | undefined) => (t ?? '').trim().toLowerCase();
 
-function restAlreadyApproved(count: number, topic: string | undefined): boolean {
+function restAlreadyApproved(count: number, topic: string | undefined, doc: string | undefined): boolean {
   const a = approvedRest;
   if (!a || Date.now() > a.until) return false;
-  return a.issueId === get().issueId && count <= a.count && a.topic === topicKey(topic);
+  return a.issueId === get().issueId && count <= a.count && a.topic === topicKey(topic) && a.doc === topicKey(doc);
 }
 
-function aiPagesConfirm(count: number, topic: string | undefined): string | null {
+function aiPagesConfirm(count: number, topic: string | undefined, doc?: string): string | null {
   if (isBuilding()) return null; // run() refuses before touching anything
-  if (restAlreadyApproved(count, topic)) return null;
+  if (restAlreadyApproved(count, topic, doc)) return null;
   const batch = firstBuildBatch(count);
   const rest = count - batch;
   const about = topic ? ` about “${topic.slice(0, 120)}”` : '';
+  // The model passes part of the file name; the card says it as given (run()
+  // resolves it, and refuses before touching anything when it matches nothing).
+  const from = doc?.trim() ? `, written from the attached document “${doc.trim().slice(0, 80)}”,` : '';
   return rest > 0
-    ? `Add ${count} new AI-designed pages${about} to this magazine? The builder makes up to 6 at a time: ${batch} now, the other ${rest} once those are done.`
-    : `Add ${count} new AI-designed page${count === 1 ? '' : 's'}${about} to this magazine?`;
+    ? `Add ${count} new AI-designed pages${about}${from} to this magazine? The builder makes up to 6 at a time: ${batch} now, the other ${rest} once those are done.`
+    : `Add ${count} new AI-designed page${count === 1 ? '' : 's'}${about}${from} to this magazine?`;
 }
 
-/** Start a build of `count` pages: the first batch now, and tell the model how many remain. */
-async function startAiPagesBuild(ui: UiDriver, count: number, topic: string | undefined) {
+/** Start a build of `count` pages: the first batch now, and tell the model how many
+ *  remain. `source` = a resolved document to write the pages from (C19/C28). */
+async function startAiPagesBuild(ui: UiDriver, count: number, topic: string | undefined, source: DocChoice | null, docArg?: string) {
   const batch = firstBuildBatch(count);
   const remaining = count - batch;
   const issueId = get().issueId;
   // The last build's background watch may not have noticed it ended yet; a new
   // build started now would be adopted by it (and lose its [job-update]).
   if (issueId) await settlePreviousBuildJob(issueId, ui.signal);
-  const started = await submitAiPagesForm(ui, batch, topic);
+  const started = source ? await submitDocPagesBuild(ui, batch, topic, source) : await submitAiPagesForm(ui, batch, topic);
   // The user approved the whole request: the rest is pre-approved for the follow-up call.
-  approvedRest = remaining > 0 && issueId ? { issueId, count: remaining, topic: topicKey(topic), until: Date.now() + 2 * 60 * 60_000 } : null;
+  approvedRest =
+    remaining > 0 && issueId ? { issueId, count: remaining, topic: topicKey(topic), doc: topicKey(docArg), until: Date.now() + 2 * 60 * 60_000 } : null;
   return remaining > 0
     ? {
         ...started,
@@ -279,9 +642,60 @@ async function startAiPagesBuild(ui: UiDriver, count: number, topic: string | un
         remaining,
         note:
           `${started.note} The builder adds 1, 2, 3, 4 or 6 pages at a time, so ${batch} of the ${count} requested were started. ` +
-          `When the [job-update] for this build arrives, call this action again with count ${remaining} and the same topic (the user already approved them — no second question).`,
+          `When the [job-update] for this build arrives, call this action again with count ${remaining} and the same topic${source ? ' and doc' : ''} (the user already approved them — no second question).`,
       }
     : started;
+}
+
+/**
+ * Start a build whose pages are written FROM a document already in the magazine
+ * (C19/C28). "Add 2 pages from this PDF" used to start a build from the theme and a
+ * 300-character topic only, so the new pages read as invented content while the
+ * user was told they came from the PDF.
+ *
+ * The rail's Add-pages popover has no document picker, so its Generate button can
+ * only start a theme-and-topic build. This calls the store handler that button
+ * calls — store.generatePages, which takes the documents — with the cursor on the
+ * rail's AI button first, so the user sees where the pages come from.
+ */
+async function submitDocPagesBuild(ui: UiDriver, count: number, topic: string | undefined, source: DocChoice) {
+  await ensureRail(ui);
+  if (anchor('mag.add-ai-pages')) await ui.point('mag.add-ai-pages', `Add pages from “${source.name}”`);
+  ui.step(`Starting ${count} new page${count === 1 ? '' : 's'} written from “${source.name}”`);
+  const pageCountBefore = get().pages.length;
+  const toasts = watchToasts();
+  let ok = false;
+  try {
+    ok = await get().generatePages(count, topic?.trim() || undefined, undefined, [source.id]);
+  } finally {
+    toasts.stop();
+  }
+  if (!ok) throw new Error(problemToasts(toasts.peek())[0]?.text || 'The build did not start — see the message on screen.');
+  const s = get();
+  const job = s.issueId
+    ? startMagazineBuildJob({ magazineId: s.issueId, title: s.issue?.title, mode: 'add', pageCountBefore, requested: count })
+    : null;
+  // The server echoes which documents it really took. A build it started WITHOUT this
+  // one (no readable text stored for it) must not be reported as written from it.
+  const sources = s.lastBuildSources;
+  const used = !!sources && sources.used > 0 && !(sources.skipped ?? []).includes(source.name);
+  return {
+    started: true,
+    jobId: job?.id,
+    count,
+    topic: topic?.trim() || undefined,
+    fromDocument: used ? source.name : undefined,
+    documentLeftOut: sources && !used ? source.name : undefined,
+    pageCountBefore,
+    note: used
+      ? `${JOB_STARTED_NOTE} The server confirmed it is writing these pages from “${source.name}”. ` +
+        'When they are done, glance at one (magazine.checkPage lists its text) before telling the user they came from it.'
+      : sources
+        ? `${JOB_STARTED_NOTE} “${source.name}” had no readable text stored, so the server left it out — do NOT tell the user these pages come from it. ` +
+          'Once they are done, fill them from the document with magazine.askStudio (attach it) if the user wants its content.'
+        : `${JOB_STARTED_NOTE} The builder was given “${source.name}” to write these pages from. ` +
+          'When they are done, glance at one (magazine.checkPage lists its text); if its words do not come from that document, fill each new page from it with magazine.askStudio (attach the document) before telling the user they came from it.',
+  };
 }
 
 /** The page rail's AI popover is open: choose count/topic and press Generate.
@@ -356,19 +770,71 @@ const toastLines = (ts: SeenToast[]) => ts.map((t) => `${t.type}: ${t.text}`);
  * window.confirm with no OK behind it (auto-declined) while the action still
  * reported "applied", and a staged page build ran unasked.
  */
-function stagedRiskQuestion(): string | null {
+function stagedRiskQuestion(scopePageId?: string | null): string | null {
+  const { parts, scope } = stagedRiskParts(scopePageId);
+  if (parts.length === 0) return null;
+  const where = scope.length > 1 ? ` on ${pagesPhrase(scope.map((w) => w.page))}` : '';
+  return `Apply the studio's changes${where}, including ${parts.join('; ')}?`;
+}
+
+/** The risky parts of the waiting changes in scope, each in a few words (see
+ *  stagedRiskQuestion), and the pages in that scope. */
+function stagedRiskParts(scopePageId?: string | null) {
   const s = get();
   const parts: string[] = [];
-  const removes = s.proposals.filter((p) => p.kind === 'remove-page').length;
+  // Every page's waiting changes (Apply all), or one page's.
+  const scope = waitingPages(s.pending, s.pages).filter((w) => !scopePageId || w.pageId === scopePageId);
+  const all = scope.flatMap((w) => w.proposals.map((p) => ({ p, ownerId: w.pageId })));
+  const removes = all.filter((x) => x.p.kind === 'remove-page').length;
   if (removes > 0) parts.push(`deleting ${removes} page${removes === 1 ? '' : 's'} (cannot be undone)`);
-  const layout = s.proposals.find((p) => p.kind === 'apply-layout');
-  if (layout) {
-    const n = pageNoOf(s.pages, layout.pageId || s.proposalsPageId);
-    parts.push(`rebuilding ${n ? `page ${n}` : 'the page'} in a new layout — everything on it is replaced (cannot be undone)`);
+  for (const x of all.filter((y) => y.p.kind === 'apply-layout')) {
+    const n = pageNoOf(s.pages, x.p.pageId || x.ownerId);
+    // Said as it really happens (C09/C31): the rebuild does not move the page's own
+    // words into the new layout — the AI writes fresh copy for it. This card is the
+    // only confirm the user sees on this path, so it must not promise more.
+    parts.push(
+      `rebuilding ${n ? `page ${n}` : 'the page'} in a new layout — everything on it is replaced and its text is rewritten by the AI with fresh copy; its photos are reused (cannot be undone)`,
+    );
   }
-  const gen = s.proposals.find((p) => p.kind === 'generate-pages');
+  // A staged PDF page copy replaces the whole page too, exactly like the page
+  // panel's "Copy a page exactly" (which magazine.copyPdfPage confirms).
+  for (const x of all.filter((y) => y.p.kind === 'copy-document-page')) {
+    const n = pageNoOf(s.pages, x.p.pageId || x.ownerId);
+    const which = x.p.sourcePage ? `page ${x.p.sourcePage} of a PDF` : 'a PDF page';
+    parts.push(`copying ${which} onto ${n ? `page ${n}` : 'the page'} — everything on it is replaced (cannot be undone)`);
+  }
+  const gen = all.find((x) => x.p.kind === 'generate-pages')?.p;
   if (gen) parts.push(`having the AI design ${gen.count ? `${gen.count} new page${gen.count === 1 ? '' : 's'}` : 'new pages'}`);
-  return parts.length ? `Apply the studio's changes, including ${parts.join('; ')}?` : null;
+  return { parts, scope };
+}
+
+/**
+ * The card before magazine.applyStudioChanges (every page's waiting changes): the
+ * risky kinds as always, and — whenever anything waits on a page other than the one
+ * the latest Design Helper request was about — every page and its count, so changes
+ * staged by earlier requests (kept for up to 30 days) are never applied unseen.
+ */
+function applyAllConfirm(): string | null {
+  const s = get();
+  const { parts, scope } = stagedRiskParts(null);
+  const turnPage = s.lastTurn ? pageNoOf(s.pages, s.lastTurn.pageId) : null;
+  return applyAllQuestion(
+    scope.map((w) => ({ page: w.page, count: w.proposals.length })),
+    turnPage,
+    parts,
+  );
+}
+
+/**
+ * The confirm for applying ONE named page's waiting changes: only its risky kinds
+ * (stagedRiskQuestion). A page number that does not exist asks nothing — run() then
+ * refuses with the reason — rather than falling back to every page's risks.
+ */
+function onePageApplyConfirm(page: number): string | null {
+  // By the number as printed (pageNo), as targetPage resolves it: a page-scoped
+  // collaborator's list is not every page, so an index would name the wrong one.
+  const id = get().pages.find((p) => pageNo(p) === page)?.id;
+  return id ? stagedRiskQuestion(id) : null;
 }
 
 /** The open page's elements as the facts a Fill / Adjust pass can change —
@@ -457,6 +923,10 @@ async function runPageFormat(ui: UiDriver, mode: 'fill' | 'adjust', n: number) {
   if (!anyChange && errs.length > 0) throw new Error(errs.map((t) => t.text).join(' '));
   if (!started && seen.length === 0 && !anyChange) throw new Error(`The ${name} pass on page ${n} did not start — see the screen.`);
   if (anyChange) ui.flash(btn);
+  // The page as it renders NOW — whether the pass left text cut off or a box over
+  // another is exactly what the model must know before it reports.
+  ui.step(`Measuring page ${n}`);
+  const measured = await measureOpenPage(ui.signal, target.id);
   const newTop = top(get().undoStack);
   return {
     page: n,
@@ -471,7 +941,10 @@ async function runPageFormat(ui: UiDriver, mode: 'fill' | 'adjust', n: number) {
     moreChanges: changes.length > 12 ? changes.length - 12 : undefined,
     undo: newTop && newTop !== undoTop ? `One magazine.undo (Ctrl+Z) takes back ${newTop.label}.` : undefined,
     messages: toastLines(seen),
-    note: anyChange ? undefined : 'Nothing on the page changed.',
+    pageCheck: measured.check ?? undefined,
+    note: anyChange
+      ? appliedNote(measured.check, measured.why)
+      : `Nothing on the page changed. ${measuredSentence(measured.check, measured.why)}`,
   };
 }
 
@@ -596,7 +1069,22 @@ export function useMagazineEditorActions(input: EditorPerms): void {
     description: 'What is open: title, id, your role, every page (number, id, review state), collaborators, publish state, build progress, and the AI Studio state.',
     args: z.object({}),
     run: async (_a, ui) => {
-      const s = await ready(ui);
+      let s = await ready(ui);
+      // A page being copied or extracted changes on the SERVER, and nothing here would
+      // notice: the summaries stayed 'pending' and the open page kept showing the old
+      // elements until a reload, so "is the copy done?" was answered from stale data
+      // (C23). While any page is pending, read the magazine again first; if the open
+      // page's summary moved past what is on screen, reload that page too.
+      if (s.pages.some((p) => p.status === 'pending')) {
+        await get().refreshIssue().catch(() => false);
+        const now = get();
+        const open = now.page;
+        const sum = open ? now.pages.find((p) => p.id === open.id) : undefined;
+        if (open && sum && now.currentPageId === open.id && (sum.rev !== open.rev || sum.status !== open.status)) {
+          await now.openPage(open.id, true).catch(() => undefined);
+        }
+        s = get();
+      }
       const issue = s.issue!;
       const b = buildStatus(issue, s.adding);
       const curIdx = s.pages.findIndex((p) => p.id === s.currentPageId);
@@ -627,6 +1115,10 @@ export function useMagazineEditorActions(input: EditorPerms): void {
           // change looked like "still 11 elements").
           elements: s.page && s.page.id === p.id ? s.page.elements.length : p.elementCount,
           build: p.status,
+          // Why the last copy or extraction failed, in the server's words.
+          error: p.status === 'failed' && p.error ? p.error : undefined,
+          // The page is one picture of a PDF page: its words cannot be edited.
+          notice: p.notice ? copyNoticeText(p.notice) : undefined,
           review: p.review ?? 'in_progress',
           approvalStale: !!p.approvalStale,
           selectedForPublish: p.selectedForPublish,
@@ -641,8 +1133,15 @@ export function useMagazineEditorActions(input: EditorPerms): void {
           : { building: false, error: issue.processingError || undefined },
         studio: {
           replying: s.chatBusy,
-          pendingChanges: s.proposals.map((p) => ({ kind: p.kind, summary: p.summary })),
-          pendingChangesOnPage: pageNoOf(s.pages, s.proposalsPageId),
+          applying: s.applyingProposals,
+          // Every page's waiting changes (they are kept per page until applied or
+          // discarded) — magazine.applyStudioChanges applies them, all or one page.
+          pendingChanges: pendingOut(),
+          pendingTotal: Object.values(s.pending).reduce((n, l) => n + l.length, 0),
+          // What the last studio turn REALLY staged, from its proposals.
+          lastTurn: s.lastTurn
+            ? { page: pageNoOf(s.pages, s.lastTurn.pageId), proposalCount: s.lastTurn.added, stagedLine: s.lastTurn.line }
+            : null,
         },
       };
     },
@@ -717,27 +1216,31 @@ export function useMagazineEditorActions(input: EditorPerms): void {
     {
       name: 'magazine.addAiPages',
       description:
-        'Have the AI design and add on-theme pages (count 1–12; optional topic). The builder adds 1, 2, 3, 4 or 6 per build, so a larger or odd count starts the biggest batch that fits and the result says how many remain. Starts the build and returns at once with a jobId — a [job-update] message arrives when the pages are done (no need to wait).',
+        'Have the AI design and add on-theme pages (count 1–12; optional topic, at most 300 characters). doc = part of the file name of a document already attached to the magazine to write the pages FROM (pass it instead of pasting the document into topic). The builder adds 1, 2, 3, 4 or 6 per build, so a larger or odd count starts the biggest batch that fits and the result says how many remain. Starts the build and returns at once with a jobId — a [job-update] message arrives when the pages are done (no need to wait).',
       args: z.object({
         count: aiPagesCount,
         topic: z.string().max(300).optional(),
+        doc: z.string().min(1).max(200).optional(),
       }),
       // Generating pages writes new content into the magazine and spends AI
       // budget — the user approves it first (reported: pages were added from a
       // PDF instruction without asking).
       // No card while a build runs (run() refuses that before touching anything),
       // nor for the rest of a larger request the user already approved.
-      confirm: ({ count, topic }) => aiPagesConfirm(count, topic),
-      run: async ({ count, topic }, ui) => {
+      confirm: ({ count, topic, doc }) => aiPagesConfirm(count, topic, doc),
+      run: async ({ count, topic, doc }, ui) => {
         await ready(ui);
         if (isBuilding()) throw new Error('A build is already running — a [job-update] message will arrive when it finishes; add more pages after that.');
+        // Which document, BEFORE anything is pressed: a name that matches nothing
+        // (or a file still being read) is refused with nothing changed.
+        const source = doc ? await resolveBuildDocument(doc) : null;
         await ensureRail(ui);
-        if (!anchor('mag.ai-pages-generate')) {
+        if (!source && !anchor('mag.ai-pages-generate')) {
           assertEnabled('mag.add-ai-pages', 'Adding AI pages is not available right now.');
           await ui.click('mag.add-ai-pages', 'Add pages with AI');
           await ui.waitFor('mag.ai-pages-generate', 4000);
         }
-        return startAiPagesBuild(ui, count, topic);
+        return startAiPagesBuild(ui, count, topic, source, doc);
       },
     },
     isOwner,
@@ -747,16 +1250,20 @@ export function useMagazineEditorActions(input: EditorPerms): void {
     {
       name: 'magazine.addMorePages',
       description:
-        'Press "Add more pages" (the gold banner after a first build; falls back to the page rail\'s AI button) to open the add-AI-pages popover. With count (1–12; the builder adds 1, 2, 3, 4 or 6 per build, so a larger or odd count starts the biggest batch that fits and the result says how many remain) and optional topic it also starts the build and returns at once with a jobId — a [job-update] message arrives when the pages are done.',
+        'Press "Add more pages" (the gold banner after a first build; falls back to the page rail\'s AI button) to open the add-AI-pages popover. With count (1–12; the builder adds 1, 2, 3, 4 or 6 per build, so a larger or odd count starts the biggest batch that fits and the result says how many remain), optional topic (at most 300 characters) and optional doc (part of the file name of an attached document to write the pages from) it also starts the build and returns at once with a jobId — a [job-update] message arrives when the pages are done.',
       args: z.object({
         count: aiPagesCount.optional(),
         topic: z.string().max(300).optional(),
+        doc: z.string().min(1).max(200).optional(),
       }),
       // Only a build (count given) creates content; just opening the popover is safe.
-      confirm: ({ count, topic }) => (count ? aiPagesConfirm(count, topic) : null),
-      run: async ({ count, topic }, ui) => {
+      confirm: ({ count, topic, doc }) => (count ? aiPagesConfirm(count, topic, doc) : null),
+      run: async ({ count, topic, doc }, ui) => {
         await ready(ui);
         if (isBuilding()) throw new Error('A build is already running — a [job-update] message will arrive when it finishes; add more pages after that.');
+        // A build from a document starts from the store handler (the popover has no
+        // document picker) — resolve the document before touching anything.
+        if (count && doc) return startAiPagesBuild(ui, count, topic, await resolveBuildDocument(doc), doc);
         if (!anchor('mag.ai-pages-generate')) {
           if (anchor('mag.add-more-pages')) {
             await ui.click('mag.add-more-pages', 'Add more pages');
@@ -771,10 +1278,12 @@ export function useMagazineEditorActions(input: EditorPerms): void {
           return {
             opened: true,
             started: false,
-            note: 'The "Add pages with AI" popover is open. Call magazine.addMorePages (or magazine.addAiPages) with count 1 to 12 to start the build.',
+            note:
+              'The "Add pages with AI" popover is open. Call magazine.addMorePages (or magazine.addAiPages) with count 1 to 12 to start the build' +
+              (doc ? ' — and doc again, to write the pages from that document.' : '.'),
           };
         }
-        return startAiPagesBuild(ui, count, topic);
+        return startAiPagesBuild(ui, count, topic, null);
       },
     },
     isOwner,
@@ -1104,13 +1613,23 @@ export function useMagazineEditorActions(input: EditorPerms): void {
     {
       name: 'magazine.askStudio',
       description:
-        "Type a request into the Magazine AI Studio chat (optionally after opening a page) and send it, like a person; waits for the reply. The studio STAGES changes — pass apply:true (or call magazine.applyStudioChanges) to use them.",
+        "Type a request into the Magazine AI Studio chat (optionally after opening a page) and send it, like a person; waits for the reply. The studio STAGES changes, kept per page until applied: proposalCount and stagedLine say what this turn REALLY staged (trust them over the reply's wording), pendingChanges lists every page's waiting changes. Pass apply:true to apply this page's (or call magazine.applyStudioChanges); an apply returns a measured pageCheck. A word or name swap across pages is magazine.replaceText, and a chart from numbers is magazine.addChart — not this.",
       args: z.object({
         prompt: z.string().min(1).max(4000),
         page: z.number().int().min(1).optional(),
         apply: z.boolean().optional(),
       }),
       run: async ({ prompt, page, apply }, ui) => {
+        // "Replace NZTROF with NOG everywhere" is not a studio job: the studio edits
+        // only the open page, and before replace_text it could only do it by retyping
+        // whole paragraphs it saw a preview of (C17). Refused before anything is
+        // touched, with the exact call to make instead.
+        const swap = magazineWideSwap(prompt);
+        if (swap) {
+          throw actionError('Swapping a word or name across the magazine is done with Replace text, not the studio — the studio only changes the open page.', {
+            next: `Call magazine.replaceText { find: ${JSON.stringify(swap.find)}, replace: ${JSON.stringify(swap.replace)} } — it counts the matches on every page and asks the user before changing anything. For a swap on one page only, ask the studio without "everywhere".`,
+          });
+        }
         await ready(ui);
         // The studio works on the OPEN page: wait for the canvas to settle on it, or
         // the scroll-settle picker can hand the turn to a neighbouring page.
@@ -1133,6 +1652,7 @@ export function useMagazineEditorActions(input: EditorPerms): void {
         // back as a black shape). That must stop the job, not be applied.
         const toasts = watchToasts();
         let seen: SeenToast[] = [];
+        const sentAt = Date.now();
         try {
           await ui.type('mag.ai-input', studioPrompt(prompt), { clear: true });
           assertEnabled('mag.ai-send', 'The studio cannot take a message right now.');
@@ -1142,29 +1662,21 @@ export function useMagazineEditorActions(input: EditorPerms): void {
           seen = toasts.stop();
         }
         const storageProblem = seen.find((t) => /couldn.t store|could not reach storage|can.t be placed/i.test(t.text));
-        return finishStudioTurn(ui, storageProblem ? false : apply, seen, storageProblem?.text);
+        return finishStudioTurn(ui, storageProblem ? false : apply, seen, storageProblem?.text, sentAt);
       },
     },
     canEdit,
   );
 
   /**
-   * The studio works on the OPEN page (its composer tags the turn "PAGE n") and
-   * reads any "page N" in the text as an absolute page of the magazine. A
-   * page-scoped collaborator can't open other pages, so "set it as page 1's
-   * background" got "I can't access page 1 from here". Any mention of the open
-   * page — by its real number or its rail position — becomes "this page".
+   * The request as the studio should read it: every "page N" that means the OPEN
+   * page becomes "this page", while a page of a document ("page 3 of the attached
+   * PDF") is left word for word — rewriting those sent a layout-from-PDF request to
+   * the wrong PDF page (C21). The rule and its tests: editorActionsPure.studioPrompt.
    */
   function studioPrompt(prompt: string): string {
     const s = get();
-    const idx = s.pages.findIndex((p) => p.id === s.currentPageId);
-    if (idx < 0) return prompt;
-    const same = new Set([pageNo(s.pages[idx]), idx + 1]);
-    return prompt
-      .replace(/\b(?:the\s+)?page\s*(?:no\.?\s*|number\s*|#\s*)?(\d+)(['’]s)?\b/gi, (m, num: string, poss?: string) =>
-        same.has(Number(num)) ? (poss ? "this page's" : 'this page') : m,
-      )
-      .replace(/\bthis page['’]s\b/g, "this page's");
+    return rewriteStudioPrompt(prompt, s.pages, s.currentPageId);
   }
 
   /** What the studio composer is doing right now, read off its Send button
@@ -1234,50 +1746,104 @@ export function useMagazineEditorActions(input: EditorPerms): void {
     );
   }
 
-  /** Read the finished turn; optionally press "Use these changes" and verify. */
-  async function finishStudioTurn(ui: UiDriver, apply: boolean | undefined, toasts: SeenToast[] = [], storageProblem?: string) {
+  /**
+   * Read the finished turn; optionally apply its page's waiting changes and verify.
+   *
+   * What the turn DID comes from the store's record of it (lastTurn: the proposals
+   * themselves), never from the model's reply. The reply once said "All six paragraphs
+   * are 20px and 220px tall" after calling no tool at all, and both the user and the
+   * Stable Hand believed it. `sentAt` keeps an older turn's record from being read as
+   * this one's.
+   */
+  async function finishStudioTurn(ui: UiDriver, apply: boolean | undefined, toasts: SeenToast[] = [], storageProblem?: string, sentAt?: number) {
     const after = get();
     const reply = [...after.chat].reverse().find((m) => m.role === 'assistant')?.content ?? '';
-    const onPage = pageNoOf(after.pages, after.proposalsPageId);
-    const staged = after.proposals.map((p) => ({ kind: p.kind, summary: p.summary }));
+    const turn = after.lastTurn && (!sentAt || after.lastTurn.at >= sentAt) ? after.lastTurn : null;
+    // The page the turn was about: its record's, else the open one.
+    const turnPageId = turn?.pageId ?? after.currentPageId;
+    const onPage = pageNoOf(after.pages, turnPageId);
+    const staged = pendingFor(after.pending, turnPageId).map(proposalOut);
+    // The studio's own check of what its staged changes would leave wrong (only NEW
+    // errors), when it sent one for this page.
+    const predicted = after.lastCheck && after.lastCheckPageId === turnPageId ? after.lastCheck : null;
     // The turn itself failed (server error, refusal): the store posts an apology and
     // raises an error toast — say so instead of "the studio staged no changes".
-    const turnError = staged.length === 0 ? firstError(toasts) : undefined;
+    const turnError = !turn ? firstError(toasts) : undefined;
     let outcome: Awaited<ReturnType<typeof applyStaged>> | null = null;
-    if (apply && staged.length > 0) {
-      // Same question as magazine.applyStudioChanges (deletions, a layout
-      // rebuild, an AI page build). An OK here also pre-approves the app's own
+    if (apply && staged.length > 0 && turnPageId) {
+      // Same question as magazine.applyStudioChanges (deletions, a layout rebuild, a
+      // PDF page copy, an AI page build). An OK here also pre-approves the app's own
       // window.confirm for the rebuild / a submitted page's deletion.
-      const risky = stagedRiskQuestion();
+      const risky = stagedRiskQuestion(turnPageId);
       if (risky && !(await ui.confirm(risky))) {
-        return { reply: reply.slice(0, 2000), stagedChanges: staged, stagedOnPage: onPage, applied: false, declined: true };
+        return {
+          reply: reply.slice(0, 2000),
+          proposalCount: turn?.added ?? 0,
+          stagedLine: turn?.line,
+          stagedChanges: staged,
+          stagedOnPage: onPage,
+          pendingChanges: pendingOut(),
+          applied: false,
+          declined: true,
+        };
       }
-      outcome = await applyStaged(ui);
+      outcome = await applyStaged(ui, turnPageId);
     }
     const applied = !!outcome;
+    // Applied: measure the page as it renders now, and hand the model the numbers.
+    const measuredId = outcome?.pageIds[0] ?? null;
+    const measured = outcome ? await measurePageId(measuredId, ui.signal) : null;
+    const measuredPage = outcome ? pageNoOf(get().pages, measuredId) : null;
+    const buildNote = outcome?.buildJobId ? ' It also started an AI page build: a [job-update] message arrives when it finishes.' : '';
+    const waitingNote = outcome?.buildWaiting ? ` ${outcome.buildWaiting}` : '';
+    // Waiting on OTHER pages (earlier requests) — reported every time, so nothing staged
+    // is forgotten between calls the way the single tray forgot it.
+    const pendingChanges = pendingOut();
+    const elsewhere = pendingChanges.filter((w) => !turnPageId || w.page !== onPage);
+    const elsewhereNote =
+      elsewhere.length > 0
+        ? ` Also waiting for Apply, from earlier requests: ${changeCount(elsewhere.reduce((n, w) => n + w.count, 0))} on ${pagesPhrase(elsewhere.map((w) => w.page))} (pendingChanges). Apply those only if the user asks — magazine.applyStudioChanges applies every page's, after a card that lists them.`
+        : '';
+    const claimNote = turn?.claimedWithoutChange
+      ? " The studio's reply CLAIMS it changed things, but it staged NOTHING — nothing was changed. Do not report it as done: ask the studio again naming the element ids and the exact values, or tell the user plainly that nothing changed."
+      : '';
     return {
       reply: reply.slice(0, 2000),
+      // What this turn REALLY staged — counted from its proposals. Trust these over
+      // the reply's own account of itself.
+      proposalCount: turn?.added ?? 0,
+      stagedLine: turn?.line,
       stagedChanges: applied ? [] : staged,
       appliedChanges: applied ? staged : undefined,
       stagedOnPage: onPage,
+      pendingChanges,
       applied,
       partial: outcome?.partial || undefined,
+      perPage: outcome ? outcome.reports.map(reportOut) : undefined,
       buildJobId: outcome?.buildJobId,
+      pageCheck: measured?.check ?? undefined,
+      measuredPage: measuredPage ?? undefined,
+      // Not applied yet: what the studio itself measured its changes would leave.
+      predictedProblems: !applied && predicted && predicted.issues.length > 0 ? predicted : undefined,
       appMessages: [...toasts, ...(outcome?.messages ?? [])].map((t) => t.text).filter((t, i, all) => all.indexOf(t) === i).slice(0, 8),
       storageProblem: storageProblem
         ? `${storageProblem} — the attached file never reached storage, so the studio could NOT place the real image; anything it staged is only a look-alike. Do NOT apply it. Tell the user the upload failed and why (usually the S3 bucket's CORS rule doesn't allow this site's address), and suggest discarding the staged changes.`
         : undefined,
-      note: storageProblem
-        ? 'NOT applied: the image upload failed (see storageProblem).'
-        : turnError
-          ? `The studio's turn FAILED: ${turnError} Nothing was staged or changed.`
-          : outcome?.partial
-            ? 'PARTLY applied — some changes were refused (see appMessages). Check the page with readScreen before reporting.'
-            : applied
-              ? `Applied — the changes are on the page now (undo with Ctrl+Z).${outcome?.buildJobId ? ' It also started an AI page build: a [job-update] message arrives when it finishes.' : ''} Check the page with readScreen before reporting.`
-              : staged.length > 0
-                ? 'Changes are STAGED, not on the page yet. If the user asked for this change, call magazine.applyStudioChanges now.'
-                : 'The studio staged no changes — read its reply; it may need more detail.',
+      note:
+        (storageProblem
+          ? 'NOT applied: the image upload failed (see storageProblem).'
+          : turnError
+            ? `The studio's turn FAILED: ${turnError} Nothing was staged or changed.`
+            : outcome?.partial
+              ? `PARTLY applied: ${applyReportLine(outcome.reports)}${waitingNote} ${measuredSentence(measured?.check, measured?.why)}`
+              : applied
+                ? `${appliedNote(measured?.check, measured?.why)} (Undo with magazine.undo.)${buildNote}${waitingNote}`
+                : staged.length > 0
+                  ? `Changes are STAGED (waiting for Apply), not on the page yet: ${turn?.line ?? `${changeCount(staged.length)} on page ${onPage}.`} If the user asked for this change, call magazine.waitForStudio with apply: true now — it applies this page's changes only (magazine.applyStudioChanges would apply every page's, including older requests').` +
+                    (predicted && predicted.issues.length > 0 ? ' The studio measured problems these changes would leave (predictedProblems) — ask it to fix them first.' : '')
+                  : 'The studio staged no changes — nothing was changed. Read its reply; it may need more detail.') +
+        claimNote +
+        elsewhereNote,
       pageCount: get().pages.length,
     };
   }
@@ -1289,11 +1855,12 @@ export function useMagazineEditorActions(input: EditorPerms): void {
     {
       name: 'magazine.waitForStudio',
       description:
-        'Wait (up to 10 minutes) for the Magazine AI Studio to finish what it is doing — reading an attachment, then replying — and return its reply and staged changes. With apply:true, then press "Use these changes" and confirm they are on the page. Use whenever the studio is still working on something you asked for.',
+        'Wait (up to 10 minutes) for the Magazine AI Studio to finish what it is doing — reading an attachment, then replying — and return its reply, what it really staged (proposalCount, stagedLine) and every page\'s waiting changes. With apply:true, then apply that page\'s waiting changes, confirm they are on the page and return the page measured (pageCheck). Use whenever the studio is still working on something you asked for.',
       args: z.object({ apply: z.boolean().optional() }),
       run: async ({ apply }, ui) => {
         await ready(ui);
-        // The panel, NOT a fresh chat: a new chat would throw the staged changes away.
+        // The panel, NOT a fresh chat (staged changes now survive one, but the reply
+        // being waited for lives in this one).
         await ensureStudioPanel(ui);
         const st = get();
         const phase = studioPhase();
@@ -1309,85 +1876,193 @@ export function useMagazineEditorActions(input: EditorPerms): void {
   );
 
   /**
-   * Press "Use these changes" (on the page they belong to) and follow it to the
-   * end. The apply reports only through a toast — all applied, some refused
-   * (warning) or none (error) — and used to be called "applied" whatever it said.
+   * Apply waiting changes and follow the apply to the end — one page's (its tray's
+   * "Use these changes") or every page's (the bar's "Apply all", `scopePageId` null).
+   *
+   * The store records what happened on each page (lastApplyReport): applied, refused,
+   * still waiting, declined at a confirm, a rebuild or copy started. That record is
+   * the result — the toasts are kept only as the user's own words for it. An apply
+   * that changed nothing is an error, never "applied".
    */
-  async function applyStaged(ui: UiDriver): Promise<{ partial: boolean; messages: SeenToast[]; buildJobId?: string }> {
+  async function applyStaged(
+    ui: UiDriver,
+    scopePageId: string | null,
+  ): Promise<{ partial: boolean; messages: SeenToast[]; buildJobId?: string; buildWaiting?: string; pageIds: string[]; reports: PageApplyReport[] }> {
     const s = get();
-    if (s.proposals.length === 0) throw new Error('The studio has no changes waiting.');
-    const forPageId = s.proposalsPageId;
-    if (forPageId && forPageId !== s.currentPageId) {
-      const n = pageNoOf(s.pages, forPageId) ?? 0;
-      if (n <= 0) throw new Error('The page those changes were for no longer exists.');
-      await openPageN(ui, n);
-    }
-    // The tray lives on the Chat tab of the open studio pane.
-    await ensureStudioPanel(ui);
-    await ui.waitFor('mag.ai-apply', 4000);
-    const layout = s.proposals.some((p) => p.kind === 'apply-layout');
-    const gen = s.proposals.some((p) => p.kind === 'generate-pages');
+    const scope = waitingPages(s.pending, s.pages).filter((w) => !scopePageId || w.pageId === scopePageId);
+    if (scope.length === 0) throw new Error(scopePageId ? 'The studio has no changes waiting on that page.' : 'The studio has no changes waiting.');
+    const all = scope.flatMap((w) => w.proposals.map((p) => ({ p, ownerId: w.pageId })));
+    const layoutAt = all.find((x) => x.p.kind === 'apply-layout');
+    const copyAt = all.find((x) => x.p.kind === 'copy-document-page');
+    const copyPageId = copyAt ? copyAt.p.pageId || copyAt.ownerId : null;
+    const gen = all.some((x) => x.p.kind === 'generate-pages');
     const pageCountBefore = get().pages.length;
     // A staged page build starts a NEW build — let the last one's watch finish first.
     if (gen && get().issueId) await settlePreviousBuildJob(get().issueId!, ui.signal);
-    ui.step('Applying the studio’s changes');
+
+    let button: string;
+    let label: string;
+    if (scopePageId) {
+      // One page: its own tray, on the Chat tab of the open studio pane.
+      if (scopePageId !== get().currentPageId) {
+        const n = pageNoOf(get().pages, scopePageId) ?? 0;
+        if (n <= 0) throw new Error('The page those changes were for no longer exists.');
+        await openPageN(ui, n);
+      }
+      await ensureStudioPanel(ui);
+      await ui.waitFor('mag.ai-apply', 4000);
+      button = 'mag.ai-apply';
+      label = 'Use these changes';
+      ui.step('Applying the studio’s changes');
+    } else {
+      // Every page: the waiting-changes bar at the top of the studio pane.
+      await ensureStudioPanel(ui);
+      await ui.waitFor('mag.waiting-apply-all', 4000);
+      button = 'mag.waiting-apply-all';
+      label = 'Apply all';
+      ui.step(`Applying the changes waiting on ${pagesPhrase(scope.map((w) => w.page))}`);
+    }
+
+    // The store sets lastApplyReport when an apply ENDS (a new array every time), so a
+    // different one than before the click is the definitive "it ran and finished".
+    const reportBefore = get().lastApplyReport;
+    // Watched by subscription: a quick apply can raise and drop the flag between polls.
+    let sawApplying = get().applyingProposals;
+    const unwatch = useEditorStore.subscribe((st, prev) => {
+      if (st.applyingProposals && !prev.applyingProposals) sawApplying = true;
+    });
     const toasts = watchToasts();
     let seen: SeenToast[] = [];
     try {
-      await ui.click('mag.ai-apply', 'Use these changes');
-      // The store applies only the set staged for the OPEN page; if the canvas
-      // moved to another page meanwhile, the click does nothing at all.
-      await waitUntil(() => get().proposals.length === 0 || (!!forPageId && get().currentPageId !== forPageId), {
-        signal: ui.signal,
-        timeoutMs: 120_000,
-        what: 'the changes to apply',
-      });
-      if (get().proposals.length > 0) throw new Error('The canvas moved to another page before the changes could be applied — nothing was changed. Try again.');
-      if (layout) {
-        // A staged layout rebuild clears the proposals BEFORE it runs; follow the
-        // rebuild itself so "applied" is not reported while it is still in flight.
-        await softWait(ui, () => get().layoutBusy || toasts.peek().length > 0, 3000);
-        await waitUntil(() => !get().layoutBusy, { signal: ui.signal, timeoutMs: 180_000, what: 'the layout rebuild to finish' });
+      await ui.click(button, label);
+      const clickedAt = Date.now();
+      await waitUntil(
+        () =>
+          (get().lastApplyReport !== reportBefore && !get().applyingProposals) ||
+          // One page: the canvas moved off it before the click landed — nothing ran.
+          (!!scopePageId && !get().applyingProposals && get().lastApplyReport === reportBefore && get().currentPageId !== scopePageId) ||
+          // The click never started an apply (the studio still replying, say): stop
+          // waiting rather than sit out the whole timeout.
+          (!sawApplying && get().lastApplyReport === reportBefore && Date.now() - clickedAt > 5000),
+        // Apply all opens each page in turn; a long run across many pages needs time.
+        { signal: ui.signal, timeoutMs: scopePageId ? 180_000 : 600_000, intervalMs: 300, what: 'the changes to apply' },
+      );
+      // A rebuild runs inside the apply; a PDF page copy runs in the worker and the
+      // store follows it until the copied page is on screen. Wait for that, so the page
+      // measured next is the copy.
+      await waitUntil(() => !get().layoutBusy, { signal: ui.signal, timeoutMs: 180_000, what: 'the layout rebuild to finish' });
+      const reportsNow = get().lastApplyReport ?? [];
+      if (copyPageId && reportsNow.some((r) => r.started === 'copy')) {
+        await softWait(ui, () => get().copyingPageIds.includes(copyPageId), 3000);
+        await waitUntil(() => !get().copyingPageIds.includes(copyPageId), { signal: ui.signal, timeoutMs: 180_000, what: 'the PDF page copy to finish' });
       }
-      // The closing toast is raised as the proposals clear (a rebuild's, as it lands).
+      // The closing toast is raised as the apply ends.
       await softWait(ui, () => toasts.peek().length > 0, 2000);
     } finally {
+      unwatch();
       seen = toasts.stop();
     }
-    const errs = errorToasts(seen);
-    if (errs.length > 0) throw new Error(errs.map((t) => t.text).join(' '));
-    if (layout && seen.length === 0) throw new Error('The layout rebuild did not run — nothing on the page changed.');
-    const partial = seen.some((t) => t.type === 'warning' && /refused/i.test(t.text));
+    const reports = get().lastApplyReport !== reportBefore ? (get().lastApplyReport ?? []) : [];
+    if (reports.length === 0) {
+      throw new Error(
+        get().chatBusy
+          ? 'The studio is still replying, so the apply did not start — nothing was changed. Call magazine.waitForStudio, then apply.'
+          : 'The canvas moved to another page before the changes could be applied — nothing was changed. Try again.',
+      );
+    }
+    if (reports.every((r) => r.declined)) {
+      throw new Error('The user said no at the confirm, so nothing was applied — the changes are still waiting.');
+    }
+    const appliedAny = reports.some((r) => r.applied > 0 || !!r.started);
+    if (!appliedAny) {
+      const errs = errorToasts(seen);
+      throw new Error(`${applyReportLine(reports)}${errs.length > 0 ? ` (${errs.map((t) => t.text).join(' ')})` : ''}`);
+    }
+    // A rebuild that failed on one page while others applied is PARTIAL, not an error:
+    // the per-page report says which page and that its rebuild is still waiting.
+    const partial = applyOutcome(reports) === 'partial';
     // A staged "design N new pages" starts a real build: watch it like addAiPages does.
+    const buildLeft = waitingPages(get().pending, get().pages).some((w) => w.proposals.some((p) => p.kind === 'generate-pages'));
     let buildJobId: string | undefined;
-    if (gen && isBuilding() && get().issueId) {
+    if (gen && !buildLeft && isBuilding() && get().issueId) {
       buildJobId = startMagazineBuildJob({ magazineId: get().issueId!, title: get().issue?.title, mode: 'add', pageCountBefore }).id;
     }
-    return { partial, messages: seen, buildJobId };
+    const buildWaiting = gen && buildLeft
+      ? 'The staged AI page build could NOT start yet (another build is running) — it is still waiting; call magazine.applyStudioChanges again after the running build finishes.'
+      : undefined;
+    // The pages the changes LANDED on — what is measured afterwards. A rebuild or a copy
+    // the user aimed at a NAMED page lands there, not on the page that staged it.
+    const landed: string[] = [];
+    const add = (id: string | null | undefined) => {
+      if (id && !landed.includes(id) && get().pages.some((p) => p.id === id)) landed.push(id);
+    };
+    if (copyPageId && reports.some((r) => r.started === 'copy')) add(copyPageId);
+    if (layoutAt && reports.some((r) => r.started === 'layout')) add(layoutAt.p.pageId || layoutAt.ownerId);
+    for (const r of reports) if (r.applied > 0 && !r.started) add(r.pageId);
+    return { partial, messages: seen, buildJobId, buildWaiting, pageIds: landed, reports };
+  }
+
+  /** Measure each page an apply landed on (the first few). */
+  async function measureLanded(pageIds: string[], signal: AbortSignal) {
+    const out: { page: number | null; check: PageCheck | null; why?: string }[] = [];
+    for (const id of pageIds.slice(0, 4)) {
+      const m = await measurePageId(id, signal);
+      out.push({ page: pageNoOf(get().pages, id), ...m });
+    }
+    return out;
   }
 
   useAgentAction(
     {
       name: 'magazine.applyStudioChanges',
       description:
-        'Press "Use these changes" on the changes the AI Studio has staged (undoable with Ctrl+Z, except page deletions and a layout rebuild — those, and an AI page build, ask the user first).',
-      args: z.object({}),
-      // Asks only for deletions / a layout rebuild / an AI page build (see stagedRiskQuestion).
-      confirm: () => stagedRiskQuestion(),
-      run: async (_a, ui) => {
-        await ready(ui);
-        const staged = get().proposals.map((p) => ({ kind: p.kind, summary: p.summary }));
-        const out = await applyStaged(ui);
+        'Apply EVERY page\'s changes the AI Studio has staged and nobody has applied yet (they wait per page until applied), in page order — the "Apply all" bar; with page (its number as printed), only that page\'s, through its own "Use these changes". Undoable with Ctrl+Z, except page deletions, a layout rebuild and a PDF page copy — those, and an AI page build, ask the user first; so does anything waiting on a page other than the latest request\'s (the card lists every page and its count). A text edit whose box was edited after it was staged is held back, still waiting (perPage heldBecauseEditedSinceStaged) — apply it again only if the user says so. Returns what landed on each page (perPage), anything still waiting, and the pages measured afterwards (pageCheck / pageChecks). To apply only the page you just asked about, pass apply:true to magazine.askStudio or magazine.waitForStudio instead.',
+      // `page` narrows Apply all to one page's waiting changes. The catalog twin takes
+      // the same argument; the two must match (operatorMagazineCatalog.test.ts).
+      args: z.object({ page: z.number().int().min(1).optional() }),
+      // Asks for deletions / a layout rebuild / a PDF page copy / an AI page build
+      // (see stagedRiskQuestion) — and, for every page, whenever it reaches pages other
+      // than the latest request's, names every page and its count (applyAllConfirm).
+      // One named page asks only for its risky kinds: the user named the page.
+      confirm: ({ page }) => (page === undefined ? applyAllConfirm() : onePageApplyConfirm(page)),
+      run: async ({ page }, ui) => {
+        const s = await ready(ui);
+        const scopeId: string | null = page === undefined ? null : targetPage(s.pages, page).id;
+        const before = pendingOut(scopeId);
+        if (before.length === 0) {
+          if (scopeId) {
+            throw actionError(`Nothing is waiting for Apply on page ${page}.`, {
+              next: 'magazine.status lists every waiting change and its page; call this again with that page, or without page for all of them.',
+            });
+          }
+          throw actionError('Nothing is waiting for Apply.', {
+            next: 'Ask the studio for the change first (magazine.askStudio), then apply it. magazine.status lists every waiting change.',
+          });
+        }
+        const out = await applyStaged(ui, scopeId);
+        const checks = await measureLanded(out.pageIds, ui.signal);
+        const first = checks[0];
+        const build = out.buildJobId ? ' An AI page build started in the background — a [job-update] message arrives when it finishes.' : '';
+        const waiting = out.buildWaiting ? ` ${out.buildWaiting}` : '';
+        const errorsSomewhere = checks.some((c) => c.check && c.check.issues.some((i) => i.severity === 'error'));
         return {
-          applied: staged,
+          applied: before,
+          perPage: out.reports.map(reportOut),
+          line: applyReportLine(out.reports),
           partial: out.partial || undefined,
           messages: toastLines(out.messages),
           buildJobId: out.buildJobId,
-          note: out.partial
-            ? 'Some of the changes were refused (see messages) — check the page with readScreen.'
-            : out.buildJobId
-              ? 'Applied; an AI page build started in the background — a [job-update] message arrives when it finishes.'
+          pageCheck: first?.check ?? undefined,
+          measuredPage: first?.page ?? undefined,
+          // More than one page landed: each one's verdict (the first is pageCheck).
+          pageChecks:
+            checks.length > 1
+              ? checks.map((c) => ({ page: c.page, ok: c.check?.ok ?? null, summary: c.check?.summary ?? `not measured (${c.why ?? 'unknown'})`, errors: c.check ? c.check.issues.filter((i) => i.severity === 'error') : [] }))
               : undefined,
+          stillWaiting: pendingOut(),
+          note: out.partial
+            ? `${applyReportLine(out.reports)}${waiting} ${measuredSentence(first?.check, first?.why)}`
+            : `${applyReportLine(out.reports)} ${appliedNote(first?.check, first?.why)}${checks.length > 1 && errorsSomewhere ? ' Another page measured has errors too — see pageChecks.' : ''}${build}${waiting}`,
           pageCount: get().pages.length,
         };
       },
@@ -1398,16 +2073,377 @@ export function useMagazineEditorActions(input: EditorPerms): void {
   useAgentAction(
     {
       name: 'magazine.discardStudioChanges',
-      description: `Press "Don't use these" to dismiss the AI Studio's staged changes (nothing on the page changes).`,
-      args: z.object({}),
-      run: async (_a, ui) => {
-        await ready(ui);
-        const n = get().proposals.length;
-        if (n === 0) return { discarded: 0 };
+      description: `Throw away EVERY page's waiting AI Studio changes (the bar's "Discard"); with page (its number as printed), only that page's. Nothing on the pages changes. The user can press "Bring back" on the message for a few seconds.`,
+      // `page` narrows it to one page's — the same argument as applyStudioChanges.
+      args: z.object({ page: z.number().int().min(1).optional() }),
+      run: async ({ page }, ui) => {
+        const s = await ready(ui);
+        const scopeId: string | null = page === undefined ? null : targetPage(s.pages, page).id;
+        const before = pendingOut(scopeId);
+        const n = before.reduce((sum, w) => sum + w.count, 0);
+        if (n === 0) return { discarded: 0, stillWaiting: pendingOut() };
         await ensureStudioPanel(ui);
-        // The tray shows only on the page the changes are for; elsewhere, the same handler.
-        if (!(await clickIfPresent(ui, 'mag.ai-discard', "Don't use these"))) get().discardProposals();
-        return { discarded: n };
+        // The control the user would press: the bar's Discard for every page, the
+        // open page's tray for its own set — else the same store handler.
+        if (!scopeId) {
+          if (!(await clickIfPresent(ui, 'mag.waiting-discard', 'Discard'))) get().discardWaiting();
+        } else if (scopeId === get().currentPageId) {
+          if (!(await clickIfPresent(ui, 'mag.ai-discard', "Don't use these"))) get().discardWaiting(scopeId);
+        } else {
+          get().discardWaiting(scopeId);
+        }
+        return {
+          discarded: n,
+          pages: before.map((w) => ({ page: w.page, count: w.count })),
+          stillWaiting: pendingOut(),
+          note: `Discarded ${changeCount(n)} on ${pagesPhrase(before.map((w) => w.page))}; nothing on the pages changed.`,
+        };
+      },
+    },
+    canEdit,
+  );
+
+  // ── Seeing the page ──────────────────────────────────────────────────────
+  // A read: measuring changes nothing, so it is offered to anyone who can open the
+  // magazine (like magazine.status).
+  useAgentAction({
+    name: 'magazine.checkPage',
+    description:
+      "Measure a page as it renders in this browser (default: the open page; page = its number as printed): text cut off by its box or running past the page edge, overlapping or hidden elements, empty or broken pictures, tiny or low-contrast text, uneven gaps. Returns pageCheck (ok, and each issue with its element id, what was measured and a fix with numbers) and the page's elements (id, type, role, label, box [x, y, w, h], z). Use it after any page change and before telling the user a page is done.",
+    args: z.object({ page: z.number().int().min(1).optional() }),
+    run: async ({ page }, ui) => {
+      const s = await ready(ui);
+      const target = targetPage(s.pages, page);
+      const n = pageNo(target);
+      ui.step(`Measuring page ${n}`);
+      let data: IssuePageData;
+      try {
+        data = await pageData(target.id);
+      } catch (e) {
+        throw new Error(apiMessage(e, `Page ${n} could not be read just now.`));
+      }
+      const measured = await measureSafely(data, ui.signal);
+      if (!measured.check) {
+        throw actionError(`Page ${n} could not be measured just now: ${measured.why}.`, {
+          next: "Call magazine.checkPage once more; magazine.lookAtPage also returns the server's own measurement of the saved page.",
+        });
+      }
+      ui.flash(`mag.page-${n}`);
+      return {
+        page: n,
+        open: get().currentPageId === target.id,
+        pageCheck: measured.check,
+        ...pageElementList(data.elements),
+      };
+    },
+  });
+
+  // A read too, like checkPage: the server renders the STORED page behind the same read
+  // gate as GET page (canViewPage), so a view-only staff member asking "does page 3 look
+  // right?" gets it as well. It changes nothing.
+  useAgentAction(
+    {
+      name: 'magazine.lookAtPage',
+      description:
+        "A visual review of a page (default: the open page): the server renders the SAVED page and an AI looks at the picture; focus = what to look at ('the headline', 'is the chart readable'). Returns findings (area, issue, fix, and the element id when known) together with pageCheck measured in this browser. Slower than magazine.checkPage — use it after adding a picture or chart or changing the layout, or when the user says something LOOKS wrong.",
+      args: z.object({ page: z.number().int().min(1).optional(), focus: z.string().max(300).optional() }),
+      run: async ({ page, focus }, ui) => {
+        const s = await ready(ui);
+        const target = targetPage(s.pages, page);
+        const n = pageNo(target);
+        ui.step(`Looking at page ${n}`);
+        // The review renders the stored page on the server; the measurement runs here
+        // at the same time. Either one alone still answers.
+        const lookP = requestPageLook(s.issueId!, target.id, focus?.trim() ? { focus: focus.trim() } : {}).then(
+          (r) => ({ ok: true as const, r }),
+          (e: unknown) => ({ ok: false as const, error: apiMessage(e, 'The visual review could not run.') }),
+        );
+        const measured = await pageData(target.id).then(
+          (d) => measureSafely(d, ui.signal),
+          (e: unknown) => ({ check: null, why: apiMessage(e, 'the page could not be read') }),
+        );
+        const look = await within(lookP, 90_000, ui.signal, 'the visual review').catch((e: unknown) => {
+          if (ui.signal.aborted) throw e;
+          return { ok: false as const, error: e instanceof Error ? e.message : String(e) };
+        });
+        const check = measured.check ?? (look.ok ? look.r.check : null);
+        if (!check && !look.ok) throw new Error(`Page ${n} could not be reviewed just now: ${look.error}`);
+        const seen = look.ok && look.r.seen;
+        const findings = look.ok ? look.r.findings : [];
+        const reason = look.ok ? look.r.reason : look.error;
+        ui.flash(`mag.page-${n}`);
+        return {
+          page: n,
+          seen,
+          findings,
+          reason: seen ? undefined : reason,
+          pageCheck: check ?? undefined,
+          note: seen
+            ? findings.length > 0
+              ? 'Fix what matters for the request (magazine.askStudio naming the element id and what to change), then check again — at most 2 rounds.'
+              : 'The visual review found nothing wrong; pageCheck has the measurements.'
+            : `No picture could be reviewed this time (${reason || 'unavailable'}) — pageCheck is measured from the page itself and still applies.`,
+        };
+      },
+    },
+  );
+
+  // ── Charts drawn from numbers ────────────────────────────────────────────
+  useAgentAction(
+    {
+      name: 'magazine.addChart',
+      description:
+        "Draw a chart, graph or table from EXACT numbers and place it on a page (default: the open page) — drawn from the data, never imagined by an image model. chart = { type: 'bar' | 'barh' (long labels, rankings) | 'line' | 'pie' | 'donut' | 'table', title?, subtitle?, source?, categories: [labels], series: [{ name, values: [one number per category] }], unit?: { prefix?, suffix? }, decimals?, showValues?, highlight?: a category, stacked? }. replace = id of an element to put it in place of (from magazine.checkPage); otherwise it goes into an empty picture slot or the largest free area, on top. One undo. Returns dataEcho (every number as drawn — compare it with the user's numbers) and pageCheck.",
+      args: z.object({
+        page: z.number().int().min(1).optional(),
+        chart: chartSpecArgs,
+        replace: z.string().min(1).optional(),
+      }),
+      run: async ({ page, chart, replace }, ui) => {
+        const s = await ready(ui);
+        const summary = targetPage(s.pages, page);
+        // A contributor's submitted/approved page: the server refuses every write.
+        const lock = pageLockReason(summary);
+        if (lock) throw new Error(lock);
+        const target = page ? await openPageN(ui, page) : summary;
+        const n = pageNo(target);
+        if (replace && !get().page?.elements.some((e) => e.id === replace)) {
+          throw new Error(`The element to replace is not on page ${n} — call magazine.checkPage for the current element ids.`);
+        }
+        ui.step(`Drawing the chart from the numbers${chart.title ? `: ${clip(chart.title, 60)}` : ''}`);
+        let result: ChartResult;
+        try {
+          result = await createChart(s.issueId!, target.id, { chart, ...(replace ? { replaceElementId: replace } : {}) });
+        } catch (e) {
+          if (ui.signal.aborted) throw e;
+          // A 400 names the part of the data to fix; a 503 says drawing is down.
+          throw new Error(apiMessage(e, 'The chart could not be drawn.'));
+        }
+        chartSpecs.set(result.asset.id, result.chart ? (chartSpecArgs.safeParse(result.chart).data ?? chart) : chart);
+        ui.step(`Placing it on page ${n}`);
+        // With no `replace`, the server may still have put it into an empty picture slot
+        // (it says which); that slot is then patched rather than covered.
+        const elementId = await placeChart(ui, target, result, replace ?? result.replaceElementId);
+        const measured = await measureOpenPage(ui.signal, target.id);
+        return {
+          page: n,
+          elementId,
+          replaced: replace || result.replaceElementId ? true : undefined,
+          dataEcho: result.dataEcho,
+          alt: result.asset.alt,
+          pageCheck: measured.check ?? undefined,
+          undo: 'One magazine.undo takes the chart back.',
+          note: `${appliedNote(measured.check, measured.why)} Compare dataEcho with the user's numbers; to change one, use magazine.editChart.`,
+        };
+      },
+    },
+    canEdit,
+  );
+
+  useAgentAction(
+    {
+      name: 'magazine.editChart',
+      description:
+        "Change a chart placed earlier (elementId from magazine.checkPage or the addChart result; page = its page, default the open one). changes = any chart field to replace (type, title, subtitle, source, categories together with series, unit, decimals, showValues, highlight, stacked; an empty title removes it) and/or setValues: [{ category, series?, value }] to change single numbers ('change 2023 to 14'). Redraws it in the same place. Returns dataEcho and pageCheck.",
+      args: z.object({
+        page: z.number().int().min(1).optional(),
+        elementId: z.string().min(1),
+        changes: z.record(z.string(), z.unknown()),
+      }),
+      run: async ({ page, elementId, changes }, ui) => {
+        const s = await ready(ui);
+        const summary = targetPage(s.pages, page);
+        const lock = pageLockReason(summary);
+        if (lock) throw new Error(lock);
+        const target = page ? await openPageN(ui, page) : summary;
+        const n = pageNo(target);
+        const el = get().page?.id === target.id ? get().page!.elements.find((e) => e.id === elementId) : undefined;
+        if (!el) throw new Error(`That chart is not on page ${n} — call magazine.checkPage for the current element ids.`);
+        if (el.type !== 'image' || !el.image?.assetId) {
+          throw new Error('That element is not a chart — pass the id of a chart picture (magazine.checkPage labels it by its alt, e.g. “Bar chart — …”).');
+        }
+        const spec = await storedChartSpec(s.issueId!, el.image.assetId);
+        // Merged HERE when the numbers are known, so a bad change is refused before any
+        // drawing. When they cannot be read back in this browser, the server redraws it
+        // from the spec it stored with the picture (editElementId + changes): it applies
+        // the same changes, and refuses with a 400 if the picture is not a drawn chart.
+        const merged = spec ? mergeChartChanges(spec, changes) : null;
+        if (merged && !merged.ok) throw new Error(merged.error);
+        ui.step('Redrawing the chart with the new numbers');
+        let result: ChartResult;
+        try {
+          result = await createChart(
+            s.issueId!,
+            target.id,
+            merged?.ok ? { chart: merged.spec, replaceElementId: elementId } : { editElementId: elementId, changes },
+          );
+        } catch (e) {
+          if (ui.signal.aborted) throw e;
+          if (!merged && e instanceof ApiError && e.status === 400 && /not a chart/i.test(e.message)) {
+            throw actionError('The numbers behind that chart could not be read back, so it cannot be edited in place.', {
+              next: `Redraw it with magazine.addChart { page: ${n}, replace: ${JSON.stringify(elementId)}, chart: <the whole chart with the change> } using the numbers from this conversation (ask the user for any you do not have).`,
+            });
+          }
+          throw new Error(apiMessage(e, 'The chart could not be redrawn.'));
+        }
+        const drawnSpec = result.chart ? chartSpecArgs.safeParse(result.chart).data : undefined;
+        const kept = drawnSpec ?? (merged?.ok ? merged.spec : undefined);
+        if (kept) chartSpecs.set(result.asset.id, kept);
+        const id = await placeChart(ui, target, result, elementId);
+        const measured = await measureOpenPage(ui.signal, target.id);
+        return {
+          page: n,
+          elementId: id,
+          dataEcho: result.dataEcho,
+          alt: result.asset.alt,
+          pageCheck: measured.check ?? undefined,
+          undo: 'One magazine.undo puts the previous chart back.',
+          note: `${appliedNote(measured.check, measured.why)} Compare dataEcho with what the user asked for.`,
+        };
+      },
+    },
+    canEdit,
+  );
+
+  // ── Word and name swaps across the magazine (C17) ────────────────────────
+  useAgentAction(
+    {
+      name: 'magazine.replaceText',
+      description:
+        "Replace a word, name or figure in the text of EVERY page you can edit (e.g. find 'NZTROF', replace 'NOG'; replace '' deletes it). Counts the matches first and asks the user with the count per page; then only the matching words change — no paragraph is retyped. matchCase defaults to true, wholeWord to false. Returns the count per page and pageChecks for the changed pages. Use it for every word or name swap, not askStudio.",
+      args: z.object({
+        find: z
+          .string()
+          .min(1)
+          .max(200)
+          .refine((t) => t.trim().length > 0, 'find is empty'),
+        replace: z.string().max(500),
+        matchCase: z.boolean().optional(),
+        wholeWord: z.boolean().optional(),
+      }),
+      run: async ({ find, replace, matchCase, wholeWord }, ui) => {
+        const s = await ready(ui);
+        const issueId = s.issueId!;
+        if (find === replace) return { found: 0, replaced: 0, note: 'find and replace are the same — nothing to change.' };
+        const body = { find, replace, ...(matchCase !== undefined ? { matchCase } : {}), ...(wholeWord !== undefined ? { wholeWord } : {}) };
+        const numberOf = (p: { pageId: string; pageNumber: number }) => pageNoOf(get().pages, p.pageId) ?? p.pageNumber;
+
+        // 1) Count first — nothing changes until the user has seen where.
+        ui.step(`Looking for “${clip(find, 40)}” on every page`);
+        let dry: Awaited<ReturnType<typeof requestReplaceText>>;
+        try {
+          dry = await requestReplaceText(issueId, { ...body, dryRun: true });
+        } catch (e) {
+          if (ui.signal.aborted) throw e;
+          throw new Error(apiMessage(e, 'The pages could not be searched just now.'));
+        }
+        const found = dry.pages.filter((p) => p.count > 0).map((p) => ({ page: numberOf(p), count: p.count }));
+        // Three things the server counts apart: matches inside LOCKED BOXES on pages that
+        // can be edited (skippedLocked), matches in boxes too full for the longer text
+        // (skippedTooLong: writing them would cut the end of the copy at the stored-HTML
+        // limit), and pages that cannot be edited right now — submitted, approved, being
+        // rebuilt (blocked). Each is said as what it is, before anything changes.
+        const skippedLocked = dry.pages.reduce((sum, p) => sum + (p.skippedLocked ?? 0), 0);
+        const drySkippedTooLong = dry.pages.reduce((sum, p) => sum + (p.skippedTooLong ?? 0), 0);
+        const dryBlocked = (dry.blocked ?? []).map((b) => ({ page: numberOf(b), count: b.count, reason: b.reason }));
+        const leftAlone = replaceLeftAlone(skippedLocked, dryBlocked, drySkippedTooLong);
+        if (dry.total === 0) {
+          return {
+            found: 0,
+            replaced: 0,
+            skippedLocked: skippedLocked || undefined,
+            skippedTooLong: drySkippedTooLong || undefined,
+            blocked: dryBlocked.length > 0 ? dryBlocked : undefined,
+            note:
+              `“${find}” is not in the text of any page you can edit right now${leftAlone.length > 0 ? ` — it IS in: ${leftAlone.join('; ')}` : ''}.` +
+              (leftAlone.length === 0 && matchCase !== false ? ' The search matched capitals — try matchCase: false if the user typed it differently.' : ''),
+          };
+        }
+
+        // 2) The user's OK, with the count per page and what is left alone.
+        const ok = await ui.confirm(
+          replaceQuestion(find, replace, found, { matchCase, wholeWord, skippedLocked, skippedTooLong: drySkippedTooLong, blocked: dryBlocked }),
+        );
+        if (!ok) {
+          return { found: dry.total, pages: found, applied: false, declined: true, note: 'The user declined — nothing was changed. Do not retry unless they ask.' };
+        }
+
+        // 3) Replace, then show the changed pages as they now are.
+        ui.step(`Replacing “${clip(find, 40)}” on ${pageListLabel(found.map((f) => f.page))}`);
+        // Through the store, not the API alone: besides re-reading the magazine and the
+        // open page, it drops undo entries on the rewritten pages. An entry restores a
+        // WHOLE element as it was, so undoing an older edit there would quietly put the
+        // replaced word back. A refusal comes back as its toast, in the server's words.
+        const replaceToasts = watchToasts();
+        let res: Awaited<ReturnType<ReturnType<typeof get>['replaceTextInMagazine']>>;
+        try {
+          res = await get().replaceTextInMagazine({ ...body, dryRun: false });
+        } finally {
+          replaceToasts.stop();
+        }
+        if (!res) throw new Error(firstError(replaceToasts.peek()) || 'The replace did not go through.');
+        const changed = res.pages.filter((p) => p.count > 0);
+        const openId = get().currentPageId;
+        for (const p of changed) {
+          if (p.pageId !== openId) get().ensureThumb(p.pageId);
+          ui.flash(`mag.page-${numberOf(p)}`);
+        }
+
+        // 4) Measure what changed: a longer name can push copy out of its box.
+        const MEASURE_PAGES = 6;
+        const pageChecks: Array<
+          { page: number; ok: boolean; summary: string; errors: PageCheck['issues'] } | { page: number; notMeasured: string }
+        > = [];
+        for (const p of changed.slice(0, MEASURE_PAGES)) {
+          const n = numberOf(p);
+          ui.step(`Measuring page ${n}`);
+          const data = await pageData(p.pageId).catch(() => null);
+          const m = await measureSafely(data, ui.signal);
+          pageChecks.push(
+            m.check
+              ? { page: n, ok: m.check.ok, summary: m.check.summary, errors: m.check.issues.filter((i) => i.severity === 'error').slice(0, 4) }
+              : { page: n, notMeasured: m.why || 'unknown reason' },
+          );
+        }
+        const withErrors = pageChecks.flatMap((c) => ('errors' in c && c.errors.length > 0 ? [c.page] : []));
+        const unmeasured = [
+          ...pageChecks.flatMap((c) => ('notMeasured' in c ? [c.page] : [])),
+          ...changed.slice(MEASURE_PAGES).map(numberOf),
+        ];
+        const short = res.total < dry.total ? ` ${dry.total - res.total} of the ${dry.total} matches were not changed (a page changed meanwhile, or could not be edited — see what was left alone) — run it again to catch the ones a change got in the way of.` : '';
+        // Changes waiting for Apply were rewritten too, so applying them later cannot put
+        // the old words back.
+        const waitingNote = res.waitingUpdated ? ` ${changeCount(res.waitingUpdated)} waiting for Apply got the same replacement.` : '';
+        // Pages left as they were, and why: submitted/approved pages are counted, never
+        // changed; a page edited twice under the replace is skipped rather than guessed.
+        // A page that started rebuilding between the count and the write comes back in
+        // `blocked` with reason 'page-rebuilding' from the write retry, not only from the
+        // first read — it is listed with the others.
+        const blocked = (res.blocked ?? []).map((b) => ({ page: numberOf(b), count: b.count, reason: b.reason }));
+        const conflicts = (res.conflicts ?? []).map((c) => numberOf(c));
+        // The write re-counts against the page as it then is, so its own figure wins.
+        const skippedTooLong = res.pages.reduce((sum, p) => sum + (p.skippedTooLong ?? 0), 0);
+        const leftAfter = replaceLeftAlone(undefined, blocked, skippedTooLong);
+        const leftAloneNote = leftAfter.length > 0 ? ` Left alone: ${leftAfter.join('; ')}.` : '';
+        return {
+          replaced: res.total,
+          found: dry.total,
+          applied: res.applied,
+          pages: changed.map((p) => ({ page: numberOf(p), count: p.count })),
+          skippedLocked: skippedLocked || undefined,
+          skippedTooLong: skippedTooLong || undefined,
+          blocked: blocked.length > 0 ? blocked : undefined,
+          notChangedBecauseEditedMeanwhile: conflicts.length > 0 ? conflicts : undefined,
+          waitingChangesUpdated: res.waitingUpdated || undefined,
+          pageChecks,
+          undo: `Not on the undo stack — to reverse it, call magazine.replaceText with find ${JSON.stringify(replace)} and replace ${JSON.stringify(find)}.`,
+          note:
+            `Applied and measured — see pageChecks; fix any errors before reporting.${short}${leftAloneNote}${waitingNote}` +
+            (withErrors.length > 0
+              ? ` Errors on ${pageListLabel(withErrors)}: fix them (magazine.askStudio on that page naming the element id and the measured numbers, or magazine.adjustPage) and check again.`
+              : ' No errors on the measured pages.') +
+            (unmeasured.length > 0 ? ` Not measured: ${pageListLabel(unmeasured)} — call magazine.checkPage on them.` : ''),
+        };
       },
     },
     canEdit,
@@ -1626,7 +2662,7 @@ export function useMagazineEditorActions(input: EditorPerms): void {
     {
       name: 'magazine.fillPage',
       description:
-        "Press the page's Fill wand (above the page on the canvas): AI writes copy into empty text boxes and tightens crowded text. Waits for it; returns the text blocks it changed. Undoable with magazine.undo.",
+        "Press the page's Fill wand (above the page on the canvas): AI writes copy into empty text boxes and tightens crowded text. Waits for it; returns the text blocks it changed and the page measured afterwards (pageCheck). Undoable with magazine.undo.",
       args: z.object({ page: z.number().int().min(1) }),
       run: async ({ page }, ui) => runPageFormat(ui, 'fill', page),
     },
@@ -1637,7 +2673,7 @@ export function useMagazineEditorActions(input: EditorPerms): void {
     {
       name: 'magazine.adjustPage',
       description:
-        "Press the page's Adjust wand (above the page on the canvas): AI tightens crowded / overflowing text and re-balances an AI-built layout, without filling empty boxes. Waits for it; returns what changed. Undoable with magazine.undo.",
+        "Press the page's Adjust wand (above the page on the canvas): AI tightens crowded / overflowing text and re-balances an AI-built layout, without filling empty boxes. Waits for it; returns what changed and the page measured afterwards (pageCheck). Undoable with magazine.undo.",
       args: z.object({ page: z.number().int().min(1) }),
       run: async ({ page }, ui) => runPageFormat(ui, 'adjust', page),
     },

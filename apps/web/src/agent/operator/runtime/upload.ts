@@ -10,6 +10,10 @@
 //
 // The ghost cursor still goes to the visible control first (the styled button
 // the input hides behind), so the user sees WHERE the file went.
+//
+// The file is the user's original where possible: the chat sends the model a
+// reduced JPEG of every image, and placing THAT flattened transparent logos and
+// charts onto black boxes (attachmentsStore.attachmentToFile).
 // ---------------------------------------------------------------------------
 
 import { useOperator } from '../operatorStore';
@@ -91,6 +95,9 @@ export async function uploadToInput(
     throw new Error(why || `“${labelOf(el) || nameFromAgentId(agentId)}” is disabled right now.`);
   }
 
+  // The user's ORIGINAL file when this session still has it (a transparent PNG
+  // stays a transparent PNG at full size), else the copy the chat sent the model —
+  // see attachmentToFile and agent/attachments/originals.
   const file = await attachmentToFile(att);
   if (input.accept && !accepts(input.accept, file)) {
     throw new Error(

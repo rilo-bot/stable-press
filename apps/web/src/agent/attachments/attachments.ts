@@ -12,6 +12,7 @@
 
 import { compressImageToBlob } from '@/lib/upload';
 import type { FileUIPart, UIMessage } from 'ai';
+import { rememberOriginal } from './originals';
 
 /** Most files the assistant can usefully read in one message. */
 export const MAX_ATTACHMENTS = 5;
@@ -73,9 +74,13 @@ export async function fileToAttachment(file: File): Promise<ChatAttachment> {
     if (file.size > MAX_IMAGE_BYTES) {
       throw new Error(`${file.name || 'That image'} is too large (max ${Math.round(MAX_IMAGE_BYTES / MB)} MB).`);
     }
-    // Downscale so the data URL — re-sent on every turn — stays small.
+    // Downscale so the data URL — re-sent on every turn — stays small. That copy is
+    // for the MODEL to read; the original file is remembered beside it (./originals)
+    // so a tool that PLACES the picture gets the user's real PNG/WebP/GIF — alpha,
+    // size and all — instead of a flattened, downscaled JPEG.
     const blob = await compressImageToBlob(file, { maxDim: 1568, quality: 0.8 });
     const url = await blobToDataUrl(blob);
+    rememberOriginal(url, file);
     return { id: nextId(), name: file.name || 'image.jpg', mediaType: 'image/jpeg', kind: 'image', url, size: blob.size };
   }
   if (isPdf(file)) {

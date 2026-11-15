@@ -119,6 +119,12 @@ export interface ScreenSnapshot {
   dialogs: string[];
   /** Visible page text, trimmed (≤ ~1500 chars). UNTRUSTED user content. */
   text: string;
+  /**
+   * Guidance about THIS SCREEN from the app itself, not page content — e.g. "verify
+   * magazine pages with magazine.checkPage; this snapshot does not measure layout".
+   * Absent when the screen has none.
+   */
+  note?: string;
 }
 
 // ── Presence (implemented in presence/presenceApi.ts as `presence`) ──────────

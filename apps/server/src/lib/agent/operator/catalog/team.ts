@@ -22,7 +22,7 @@ export const SURFACES: CatalogSurface[] = [
       },
       {
         name: 'roles.list',
-        description: 'List the roles you can give (slug, label, description). Use a slug or label as `role` in team.invite / team.changeRole.',
+        description: 'List the roles you can give (slug, label, description). Use a slug or label as "role" in team.invite / team.changeRole.',
         args: '{}',
       },
       {

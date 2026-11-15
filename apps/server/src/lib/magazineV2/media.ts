@@ -33,7 +33,8 @@
 // structure, so it takes the unfiltered library on purpose — see the note there.
 // Reading a reference is the feature; only its pixels are off-limits.
 //
-// Pure data + one predicate. No I/O, no DOM, no model.
+// Pure data, one predicate, and a reader for a picture's pixel size from its first bytes.
+// No I/O, no DOM, no model.
 // ---------------------------------------------------------------------------
 
 /**
@@ -136,6 +137,48 @@ export interface MediaRow extends MediaRowLike {
   _id: string;
   alt?: string;
   source?: string;
+  /**
+   * A picture lifted out of a document the user attached (finding C45): the document
+   * it came from and its 1-based page there. Such a row keeps `pageIndex: null` — the
+   * page of the DOCUMENT is not a page of the magazine, and recording it as pageIndex
+   * would make rankMediaForPage offer it as the "own photo" of whichever magazine page
+   * shares that number.
+   */
+  docId?: string;
+  docName?: string;
+  docPage?: number;
+}
+
+/** The alt text a picture lifted out of an attached document is stored with:
+ *  "Results.pdf — page 2, picture 1". Readable to a person in the media panel and
+ *  matchable by the Studio when the user says "the photo on page 2 of the PDF". */
+export function documentPhotoAlt(docName: string, docPage: number, n: number): string {
+  const name = String(docName ?? '').trim().slice(0, 160) || 'document';
+  return `${name} — page ${Math.max(1, Math.round(docPage))}, picture ${Math.max(1, Math.round(n))}`;
+}
+
+/**
+ * Where a library row came from, in a few words — for the Studio's list_media and the
+ * media panel. A picture from an attached document says which document and page, so
+ * "put the horse photo from page 2 of the PDF on this page" can be answered with the
+ * client's own picture instead of a stranger's stock photo.
+ */
+export function mediaOrigin(m: Pick<MediaRow, 'source' | 'docName' | 'docPage' | 'kind'> & { pageIndex?: number | null }): string {
+  if (m.docName) return `from “${m.docName}”${typeof m.docPage === 'number' && m.docPage > 0 ? `, page ${m.docPage}` : ''}`;
+  switch (m.source) {
+    case 'chart':
+      return 'a chart drawn from data';
+    case 'ai-image':
+      return m.kind === 'graphic' ? 'an AI illustration' : 'an AI-generated picture';
+    case 'stock':
+      return 'a stock photo';
+    case 'upload':
+      return 'uploaded by the user';
+    case 'extracted':
+      return typeof m.pageIndex === 'number' ? `from page ${m.pageIndex + 1} of the imported magazine` : 'from an imported page';
+    default:
+      return '';
+  }
 }
 
 /**
@@ -158,6 +201,23 @@ export function userPhotosFrom(media: MediaRow[]): UserPhoto[] {
   return media
     .filter((m) => m.source === 'upload' && isPlaceableMedia(m))
     .map((m) => ({ url: m.url as string, assetId: String(m._id), alt: m.alt ?? '' }));
+}
+
+/**
+ * May a row fill an empty PHOTO slot that nobody chose a picture for (the apply-layout
+ * top-up)? Not everything placeable may: a drawn CHART (it shows one page's numbers —
+ * and a deleted chart even ranked first for its own page), a picture lifted out of an
+ * attached DOCUMENT (a logo, a form header, a chart from someone's PDF — placed only
+ * when asked for by name), and an AI GRAPHIC (an illustration or poster made for one
+ * place). Before those kinds existed, the newest rows were the user's own uploads and
+ * stock photos; now the newest are often these, and a rebuilt page got a bar chart from
+ * another page in its photo slot. All of them stay placeable on request.
+ */
+export function fitsAPhotoSlot(m: { source?: unknown; kind?: unknown; docId?: unknown }): boolean {
+  if (m.source === 'chart') return false;
+  if (typeof m.docId === 'string' && m.docId) return false;
+  if (m.source === 'ai-image' && m.kind === 'graphic') return false;
+  return true;
 }
 
 /** A media row with the two fields that decide how RELEVANT it is to a given page. */
@@ -188,13 +248,151 @@ export interface RankableMediaRow extends MediaRow {
  *
  * Stable: rows that tie keep their relative order, so the result does not shuffle
  * between two calls with the same input.
+ *
+ * `forPhotoSlots`: the pool for filling empty photo slots nobody chose a picture for —
+ * charts, document pictures and AI graphics are left out (fitsAPhotoSlot).
  */
-export function rankMediaForPage<T extends RankableMediaRow>(media: T[], pageIndex: number): T[] {
-  const placeable = media.filter((m) => isPlaceableMedia(m));
+export function rankMediaForPage<T extends RankableMediaRow>(media: T[], pageIndex: number, opts: { forPhotoSlots?: boolean } = {}): T[] {
+  const placeable = media.filter((m) => isPlaceableMedia(m) && (!opts.forPhotoSlots || fitsAPhotoSlot(m)));
   const onThisPage = (m: T) => Number.isInteger(m.pageIndex) && m.pageIndex === pageIndex;
   const newest = (a: T, b: T) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? ''));
   return [
     ...placeable.filter(onThisPage),
     ...placeable.filter((m) => !onThisPage(m)).sort(newest),
   ];
+}
+
+// ── A picture's own pixel size ───────────────────────────────────────────────
+//
+// "Resize each image box to exactly its own ratio (1426x806 -> 640x362 …)" — the client
+// had to work the numbers out themselves, because nothing recorded how big an uploaded
+// picture is. The upload route now reads it from the stored file's first bytes (every
+// format we accept keeps its size in its header), so the assistant can describe each
+// picture with its size and make a box exactly its shape.
+
+/** Width and height in pixels. */
+export interface PixelSize {
+  width: number;
+  height: number;
+}
+
+const be16 = (b: Buffer, i: number) => (b[i]! << 8) | b[i + 1]!;
+const le16 = (b: Buffer, i: number) => b[i]! | (b[i + 1]! << 8);
+const le24 = (b: Buffer, i: number) => b[i]! | (b[i + 1]! << 8) | (b[i + 2]! << 16);
+
+/** A JPEG's EXIF orientation (1–8), or 1 when it has none. 5–8 are turned a quarter. */
+function jpegOrientation(b: Buffer, app1: number, len: number): number {
+  const start = app1 + 4; // after the marker and its length
+  if (b.toString('latin1', start, start + 6) !== 'Exif\u0000\u0000') return 1;
+  const tiff = start + 6;
+  const little = b.toString('latin1', tiff, tiff + 2) === 'II';
+  const u16 = (i: number) => (little ? le16(b, i) : be16(b, i));
+  const u32 = (i: number) => (little ? b.readUInt32LE(i) : b.readUInt32BE(i));
+  const end = Math.min(b.length, app1 + 2 + len);
+  if (tiff + 8 > end) return 1;
+  const ifd = tiff + u32(tiff + 4);
+  if (ifd + 2 > end) return 1;
+  const count = u16(ifd);
+  for (let k = 0; k < count; k++) {
+    const e = ifd + 2 + k * 12;
+    if (e + 12 > end) break;
+    if (u16(e) === 0x0112) {
+      const v = u16(e + 8);
+      return v >= 1 && v <= 8 ? v : 1;
+    }
+  }
+  return 1;
+}
+
+/**
+ * The pixel size an image is DRAWN at, read from the first bytes of a PNG, JPEG, GIF
+ * or WebP file (the formats the library accepts) — or null when the bytes do not say.
+ * A JPEG turned a quarter by its EXIF orientation (a phone's portrait photo) reports
+ * the turned size, which is what every browser shows. Never throws.
+ */
+export function imageDimensions(b: Buffer): PixelSize | null {
+  try {
+    if (b.length >= 24 && b.readUInt32BE(0) === 0x89504e47 && b.toString('latin1', 12, 16) === 'IHDR') {
+      return sized(b.readUInt32BE(16), b.readUInt32BE(20));
+    }
+    if (b.length >= 10 && (b.toString('latin1', 0, 6) === 'GIF87a' || b.toString('latin1', 0, 6) === 'GIF89a')) {
+      return sized(le16(b, 6), le16(b, 8));
+    }
+    if (b.length >= 30 && b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP') {
+      const chunk = b.toString('latin1', 12, 16);
+      if (chunk === 'VP8 ') return sized(le16(b, 26) & 0x3fff, le16(b, 28) & 0x3fff);
+      if (chunk === 'VP8L' && b[20] === 0x2f) {
+        return sized(1 + (b[21]! | ((b[22]! & 0x3f) << 8)), 1 + (((b[22]! & 0xc0) >> 6) | (b[23]! << 2) | ((b[24]! & 0x0f) << 10)));
+      }
+      if (chunk === 'VP8X') return sized(1 + le24(b, 24), 1 + le24(b, 27));
+      return null;
+    }
+    if (b.length >= 4 && b[0] === 0xff && b[1] === 0xd8) {
+      let i = 2;
+      let orientation = 1;
+      while (i + 9 < b.length) {
+        if (b[i] !== 0xff) return null;
+        const marker = b[i + 1]!;
+        if (marker === 0xff) {
+          i += 1; // fill byte
+          continue;
+        }
+        if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+          i += 2; // a marker with no length
+          continue;
+        }
+        const len = be16(b, i + 2);
+        if (marker === 0xe1) orientation = jpegOrientation(b, i, len);
+        // Start-of-frame markers carry the size (C4 = Huffman table, C8 = reserved, CC = arithmetic table).
+        if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+          const h = be16(b, i + 5);
+          const w = be16(b, i + 7);
+          return orientation >= 5 ? sized(h, w) : sized(w, h);
+        }
+        if (len < 2) return null;
+        i += 2 + len;
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function sized(width: number, height: number): PixelSize | null {
+  return Number.isInteger(width) && Number.isInteger(height) && width > 0 && height > 0 && width <= 30_000 && height <= 30_000 ? { width, height } : null;
+}
+
+/**
+ * The size to record for an upload: what the file's bytes say, unless the browser's
+ * own measurement is the same picture turned a quarter (an orientation this reader
+ * missed) — then the browser's, since it is what people see. The browser's alone (no
+ * readable bytes) is kept as a hint; anything implausible is dropped.
+ */
+export function chooseImageSize(fromBytes: PixelSize | null, fromClient: { width?: unknown; height?: unknown } | null | undefined): PixelSize | null {
+  const cw = Number(fromClient?.width);
+  const ch = Number(fromClient?.height);
+  const client = Number.isFinite(cw) && Number.isFinite(ch) ? sized(Math.round(cw), Math.round(ch)) : null;
+  if (fromBytes && client && client.width === fromBytes.height && client.height === fromBytes.width) return client;
+  return fromBytes ?? client;
+}
+
+/** A library picture whose own size is known, as the Studio reads it. */
+export interface SizedMediaRow {
+  url: string;
+  assetId: string;
+  width: number;
+  height: number;
+}
+
+/** The pictures in a set of media rows whose size is recorded: width × height, else the
+ *  box a chart was drawn for. Documents and rows without a url are left out. */
+export function sizedPictures(rows: ReadonlyArray<{ _id?: unknown; url?: unknown; kind?: unknown; width?: unknown; height?: unknown; chartBox?: { w?: unknown; h?: unknown } | null }>): SizedMediaRow[] {
+  const out: SizedMediaRow[] = [];
+  for (const r of rows) {
+    if (typeof r.url !== 'string' || !r.url || r.kind === 'doc') continue;
+    const s = sized(Math.round(Number(r.width)), Math.round(Number(r.height))) ?? sized(Math.round(Number(r.chartBox?.w)), Math.round(Number(r.chartBox?.h)));
+    if (s) out.push({ url: r.url, assetId: String(r._id ?? ''), ...s });
+  }
+  return out;
 }

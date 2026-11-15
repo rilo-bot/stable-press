@@ -114,8 +114,9 @@ function Tile({
   // away — but that also means they can sit waiting with zero sign they exist. A
   // small badge here is the only place a non-active page can say "come back and
   // decide on this" instead of the Review & Apply tray, which only ever shows for
-  // the page you're currently on.
-  const hasPendingReview = useEditorStore((st) => st.proposalsPageId === page.id && st.proposals.length > 0);
+  // the page you're currently on. Read from the per-page map (`pending`), not the
+  // open page's mirror, so EVERY page with waiting changes is marked.
+  const hasPendingReview = useEditorStore((st) => (st.pending[page.id]?.length ?? 0) > 0);
 
   // Ask for the thumbnail the first time this tile is anywhere near the viewport.
   // The observer accounts for the rail's own scroll clipping, so an unscrolled

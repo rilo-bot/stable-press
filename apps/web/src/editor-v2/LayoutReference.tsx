@@ -185,7 +185,8 @@ export function LayoutReference() {
     <div className="flex flex-col gap-2">
       <p className="text-ui-sm leading-relaxed text-studio-ink-3">
         Take a page's <b className="text-studio-ink-2">arrangement</b> — where things sit and how big they are.
-        Your own words and photos fill it; nothing is copied from the reference.
+        Fresh words are written for your magazine and your own photos are re-used; nothing is copied from the
+        reference.
       </p>
 
       {/* THE MEASURED PATH FIRST, because it is the better one and was the hidden one.

@@ -90,6 +90,32 @@ test('text fields are coerced onto the allowed scales', () => {
   assert.ok(el!.text!.lineHeight <= 3);
 });
 
+test('a ceiling below the size the text prints at is raised to that size (no snap-back on the next refit)', () => {
+  // The state "make it bigger" used to leave behind: fontSize 26 over a ceiling of 18.
+  const [el] = validateElements(
+    [{ type: 'text', x: 0, y: 0, w: 400, h: 200, text: { content: 'c', fontSize: 26, maxFontSize: 18, minFontSize: 14 } }],
+    PAGE,
+  );
+  assert.equal(el!.text!.fontSize, 26);
+  assert.equal(el!.text!.maxFontSize, 26);
+  assert.equal(el!.text!.minFontSize, 14);
+});
+
+test('a ceiling above the current size is kept, and the floor never sits above the ceiling', () => {
+  const [el] = validateElements(
+    [{ type: 'text', x: 0, y: 0, w: 400, h: 200, text: { content: 'c', fontSize: 18, maxFontSize: 30, minFontSize: 40 } }],
+    PAGE,
+  );
+  assert.equal(el!.text!.maxFontSize, 30);
+  assert.equal(el!.text!.minFontSize, 30);
+});
+
+test('text with no family keeps the inherit default (older elements depend on it)', () => {
+  const [el] = validateElements([{ type: 'text', x: 0, y: 0, w: 400, h: 200, text: { content: 'c' } }], PAGE);
+  assert.equal(el!.text!.fontFamily, 'inherit');
+  assert.equal(el!.text!.maxFontSize, undefined, 'no ceiling is invented for text that never had one');
+});
+
 test('an element image URL pointing at an internal host is stripped (SSRF)', () => {
   // These are fetched server-side by the Puppeteer PDF export.
   for (const url of [

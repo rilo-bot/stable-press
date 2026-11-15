@@ -73,6 +73,7 @@ export type MagazineRole =
   | 'copy' // Copywriter: headlines, body, captions
   | 'layout' // Art Director: page layout spec
   | 'critic' // Visual Critic: judges a rendered page
+  | 'look' // Page look: the Studio's / Stable Hand's eyes on a page they edited (magazineV2/pageLook.ts)
   | 'photo' // Photo Director: picks/briefs photos
   | 'editor' // Editor-in-Chief: whole-issue pass
   | 'studio' // Magazine AI Studio chat in the editor
@@ -89,6 +90,9 @@ export const MAGAZINE_ROLE_DEFAULTS: Record<MagazineRole, { model: string; effor
   copy: { model: SONNET, effort: 'low' },
   layout: { model: OPUS, effort: 'medium' },
   critic: { model: SONNET, effort: 'low' },
+  // Same model and depth as the critic: one image, a short JSON list back, and a
+  // person waiting on the chat turn — so low effort keeps it inside its 25s cap.
+  look: { model: SONNET, effort: 'low' },
   photo: { model: SONNET, effort: 'low' },
   editor: { model: OPUS, effort: 'medium' },
   studio: { model: SONNET, effort: 'medium' },

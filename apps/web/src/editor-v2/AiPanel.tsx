@@ -5,9 +5,13 @@
 // gold accents, parchment text. The model stages proposals server-side; this
 // panel shows the reply + a Review & Apply tray that commits them through the
 // rev-guarded element CRUD (store.applyAllProposals).
+//
+// Staged changes WAIT PER PAGE until applied (store `pending`): the tray shows the
+// open page's set, the bar at the top (WaitingChangesBar) every page's, and each
+// reply carries a line built from what it really staged — never from its own words.
 
 import { useEffect, useRef, useState } from 'react';
-import { Sparkles, Send, Square, Loader2, Check, X, Plus, Pencil, Trash2, Paperclip, FileText, FilePlus2, ArrowLeftRight, Image as ImageIcon, Mic, Volume2, VolumeX, MessagesSquare, MessageSquarePlus, ChevronDown, Eye, LayoutTemplate, Lock } from 'lucide-react';
+import { Sparkles, Send, Square, Loader2, Check, X, Plus, Pencil, Trash2, Paperclip, FileText, FilePlus2, ArrowLeftRight, Image as ImageIcon, Mic, Volume2, VolumeX, MessagesSquare, MessageSquarePlus, ChevronDown, Eye, LayoutTemplate, Lock, Copy, AlertTriangle, Wrench, PaintBucket, Clock, CircleSlash } from 'lucide-react';
 import type { UIMessage } from 'ai';
 import { toast } from 'sonner';
 import { MarkdownMessage } from '@/components/MarkdownMessage';
@@ -20,8 +24,10 @@ import { useEditorStore } from './store';
 import { readOnlyReason } from './review';
 import { ShimmerText, WorkingLine } from './BuildProgress';
 import { ThreadList } from './ThreadList';
-import { uploadMediaImage, uploadMediaDoc, listUploads, listMedia, getUploadText, type AttachedImage, type MagazineUpload, type MediaAsset } from './api';
+import { uploadMediaImage, uploadMediaDoc, listUploads, listMedia, getUploadText, type AttachedDoc, type AttachedImage, type MagazineUpload, type MediaAsset } from './api';
 import type { AgentProposal } from './model';
+import { checkErrors, looksLikeGraphic, problemsLabel, problemsTooltip, thumbOf, trayRows } from './proposals';
+import { WaitingChangesBar } from './WaitingChangesBar';
 
 /** One file staged in the composer. Images and PDFs carry an object URL so the
  *  right pane can render the REAL file, and once sent, the media-library URL the
@@ -34,10 +40,70 @@ interface PanelAttachment {
    *  on remove/unmount. Only read for a thumbnail when `isImage`. */
   imgUrl?: string;
   text?: string; // cached ingest text (fullText for docs, vision digest for images)
-  mediaUrl?: string; // cached media-library URL (images only, set on first send)
+  mediaUrl?: string; // cached library URL (set on first send) — also the "already stored" guard
+  /** A document's stored upload id (set on first send): what later turns read it by. */
+  docId?: string;
+  /** An image's measured shape (set on first send), and whether it reads as a graphic
+   *  — see measureImage. */
+  dims?: { width: number; height: number };
+  graphic?: boolean;
   /** Came off the clipboard rather than the picker. Only used to keep "Pasted
    *  image N" numbering continuous across separate pastes. */
   pasted?: boolean;
+}
+
+/**
+ * An image's pixel size, and whether it has see-through pixels.
+ *
+ * The size goes to the assistant with the picture so it can give it a box of the
+ * SAME shape — a wide chart placed in a squarish box used to lose its axis labels to
+ * the crop. Transparency is the clearest sign of a logo or cut-out, which must be
+ * shown whole. Sampled small (48×48): enough to tell a clear background from a few
+ * soft edge pixels, and cheap. null when the browser cannot decode the file — the
+ * upload goes ahead without the measurements.
+ */
+async function measureImage(file: File): Promise<{ width: number; height: number; transparent: boolean } | null> {
+  if (typeof createImageBitmap !== 'function') return null;
+  let bmp: ImageBitmap | null = null;
+  try {
+    bmp = await createImageBitmap(file);
+    const { width, height } = bmp;
+    if (!width || !height) return null;
+    let transparent = false;
+    // Only formats that CAN carry alpha are sampled; a JPEG never has any.
+    if (/^image\/(png|webp|gif)$/i.test(file.type)) {
+      const side = 48;
+      const canvas = document.createElement('canvas');
+      canvas.width = side;
+      canvas.height = side;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (ctx) {
+        ctx.drawImage(bmp, 0, 0, side, side);
+        const data = ctx.getImageData(0, 0, side, side).data;
+        let clear = 0;
+        for (let i = 3; i < data.length; i += 4) if ((data[i] ?? 255) < 250) clear++;
+        transparent = clear / (side * side) > 0.02;
+      }
+    }
+    return { width, height, transparent };
+  } catch {
+    return null;
+  } finally {
+    bmp?.close();
+  }
+}
+
+/** The shape to record for a stored image: the uploaded file's own size when it was
+ *  re-encoded (see placeableImage), else the original's. */
+async function uploadDims(
+  original: File,
+  upload: File,
+  measured: { width: number; height: number } | null,
+): Promise<{ width: number; height: number } | undefined> {
+  const own = measured ? { width: measured.width, height: measured.height } : undefined;
+  if (upload === original) return own;
+  const m = await measureImage(upload);
+  return m ? { width: m.width, height: m.height } : own;
 }
 
 /** PDFs are the one document type the browser renders natively, so they get a
@@ -88,15 +154,16 @@ const kindIcon = (k: AgentProposal['kind']) =>
   : k === 'delete' || k === 'remove-page' ? <Trash2 size={11} />
   : k === 'add-page' || k === 'generate-pages' ? <FilePlus2 size={11} />
   : k === 'reorder-page' ? <ArrowLeftRight size={11} />
-  // A layout rebuild is the one proposal that replaces the WHOLE page, so it gets
-  // its own mark rather than reading as another small edit in the list.
+  // A layout rebuild and a PDF page copy are the proposals that replace the WHOLE
+  // page, so each gets its own mark rather than reading as another small edit.
   : k === 'apply-layout' ? <LayoutTemplate size={11} />
+  : k === 'copy-document-page' ? <Copy size={11} />
+  : k === 'set-background' ? <PaintBucket size={11} />
   : <Pencil size={11} />;
 
-function thumbOf(p: AgentProposal): string | undefined {
-  const url = (p.element?.image?.url ?? p.patch?.image?.url) as string | undefined;
-  return url && /^https?:\/\/|^\/api\//.test(url) ? url : undefined;
-}
+/** A background colour a proposal sets, for a swatch in the tray. */
+const swatchOf = (p: AgentProposal): string | undefined =>
+  p.kind === 'set-background' && p.background?.type === 'color' && /^#[0-9a-f]{6}$/i.test(p.background.value ?? '') ? p.background.value : undefined;
 
 /** `onClose` is passed only where the panel is a phone bottom sheet: it adds a
  *  close button to the header. The docked desktop pane closes from the toolbar. */
@@ -112,8 +179,15 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
   const selectedId = useEditorStore((s) => s.selectedId);
   const sendChat = useEditorStore((s) => s.sendChat);
   const applyAll = useEditorStore((s) => s.applyAllProposals);
+  const applying = useEditorStore((s) => s.applyingProposals);
   const discard = useEditorStore((s) => s.discardProposals);
   const setPreviewDoc = useEditorStore((s) => s.setPreviewDoc);
+  const lastCheck = useEditorStore((s) => s.lastCheck);
+  const lastCheckPageId = useEditorStore((s) => s.lastCheckPageId);
+  const lastCheckApplied = useEditorStore((s) => s.lastCheckApplied);
+  const dismissCheck = useEditorStore((s) => s.dismissCheck);
+  const uploadsVersion = useEditorStore((s) => s.uploadsVersion);
+  const noteUploadsChanged = useEditorStore((s) => s.noteUploadsChanged);
 
   const issueId = useEditorStore((s) => s.issueId);
   // AI Activity: document reads from this panel are the Magazine Builder's, for this magazine.
@@ -182,7 +256,18 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
       })
       .finally(() => { if (alive) setUploadsLoading(false); });
     return () => { alive = false; };
-  }, [issueId, tab]);
+    // uploadsVersion: anything this tab stored since (a PDF sent in chat) — and the
+    // pictures the server takes out of a PDF arrive in the library in the background.
+  }, [issueId, tab, uploadsVersion]);
+
+  // A stored PDF's own pictures are taken out in the background (the server says so
+  // with `extractingPictures`) and reach the media library a minute or so later. Say so,
+  // and read the library again then, so they show up without a reload.
+  const notePictureExtraction = (names: string[]) => {
+    if (names.length === 0) return;
+    toast.message(`Pictures from ${names.map((n) => `“${n}”`).join(', ')} will appear in Uploads and the picture library in a minute or so.`);
+    window.setTimeout(() => noteUploadsChanged(), 45_000);
+  };
 
   const previewUpload = async (u: MagazineUpload) => {
     if (!issueId) return;
@@ -200,6 +285,22 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
     }
   };
   const previewImage = (m: MediaAsset) => setPreviewDoc({ name: m.alt || 'Image', isImage: true, imageUrl: m.url });
+  /** A document chip in a sent message: open the STORED copy, so "which PDF was that?"
+   *  has an answer after a reload too. */
+  const previewDocById = async (docId: string, name: string) => {
+    if (!issueId) return;
+    try {
+      const full = await getUploadText(issueId, docId);
+      setPreviewDoc({
+        name: full.originalName || name,
+        isImage: false,
+        text: full.sourceText || '(No extractable text was stored for this document.)',
+        docUrl: isPdfType(full.contentType) ? full.url : undefined,
+      });
+    } catch {
+      toast.error('Could not open that document.');
+    }
+  };
   const fillFromUpload = async (u: MagazineUpload) => {
     if (!issueId || chatBusy || blockedReason) return;
     try {
@@ -207,7 +308,13 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
       const text = (full.sourceText || '').trim();
       if (!text) { toast.error('That upload has no readable text to fill from.'); return; }
       setTab('chat');
-      void sendChat(`Fill this page from “${u.originalName}”.`, text);
+      // The document rides along by id as well as by text, so the thread remembers
+      // WHICH file this was: a follow-up ("now use its second section on page 6") can
+      // read it again instead of the assistant inventing what it no longer has.
+      const doc: AttachedDoc = { docId: u.id, name: u.originalName };
+      void sendChat(`Fill this page from “${u.originalName}”.`, text, undefined, [{ name: u.originalName, isImage: false, docId: u.id }], {
+        attachedDocs: [doc],
+      });
     } catch {
       toast.error('Could not read that upload.');
     }
@@ -222,10 +329,14 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
   const addUploadFiles = async (list: FileList | null) => {
     if (!list || list.length === 0 || !issueId || !roleCanEdit) return;
     setUploadsAdding(true);
+    let storedAny = false;
+    const extracting: string[] = [];
     for (const f of Array.from(list)) {
       try {
         if (f.type.startsWith('image/')) {
-          const media = await uploadMediaImage(issueId, await placeableImage(f), f.name);
+          const upload = await placeableImage(f);
+          const measured = await measureImage(f);
+          const media = await uploadMediaImage(issueId, upload, f.name, undefined, await uploadDims(f, upload, measured));
           setUploadImages((prev) => [media, ...prev]);
         } else {
           let sourceText = '';
@@ -236,6 +347,8 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
           }
           const doc = await uploadMediaDoc(issueId, f, { sourceText });
           setUploads((prev) => [doc, ...prev]);
+          storedAny = true;
+          if (doc.extractingPictures) extracting.push(f.name);
         }
       } catch (e) {
         toast.error(e instanceof Error ? e.message : `Could not add “${f.name}”.`);
@@ -243,6 +356,10 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
     }
     setUploadsAdding(false);
     if (uploadsFileRef.current) uploadsFileRef.current.value = '';
+    // The page panel's PDF pickers ("Copy a page exactly", "Match a layout") read the
+    // same library: tell them, so a PDF added here is offered there without a reload.
+    if (storedAny) noteUploadsChanged();
+    notePictureExtraction(extracting);
   };
 
   // Revoke every attachment's object URL on unmount (removal revokes eagerly).
@@ -395,7 +512,8 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
     if ((!t && atts.length === 0) || chatBusy || ingesting || blockedReason) return;
     let src: string | undefined;
     let images: AttachedImage[] | undefined;
-    let attachRefs: { name: string; isImage: boolean; url?: string }[] | undefined;
+    let attachRefs: { name: string; isImage: boolean; url?: string; docId?: string }[] | undefined;
+    let docs: AttachedDoc[] | undefined;
     /** The attachments THIS turn is carrying — see the note where the composer is
      *  cleared. Anything staged after this point belongs to the next turn. */
     const sentIds = new Set<string>();
@@ -403,6 +521,8 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
       setIngesting(true);
       const parts: string[] = [];
       const imgs: AttachedImage[] = [];
+      let storedDoc = false;
+      const extracting: string[] = [];
       const worked = atts.map((a) => ({ ...a })); // cache results without mutating state mid-flight
       for (const a of worked) sentIds.add(a.id);
       // Persist the caches by id (never replace the list wholesale) so an
@@ -410,6 +530,17 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
       const mergeWorked = () => setAtts((prev) => prev.map((p) => worked.find((w) => w.id === p.id) ?? p));
       for (const a of worked) {
         if (a.isImage) {
+          // 0) Its shape, and whether it is a graphic (see measureImage). Measured on
+          //    the ORIGINAL: re-encoding for the library drops transparency.
+          if (!a.dims) {
+            const m = await measureImage(a.file);
+            if (m) {
+              a.dims = { width: m.width, height: m.height };
+              a.graphic = looksLikeGraphic(a.file.name, m.transparent);
+            } else {
+              a.graphic = looksLikeGraphic(a.file.name, false);
+            }
+          }
           // 1) Persist the image to the issue's media library so the agent can
           //    actually PLACE it on the page (set_element_image / add_media_image
           //    only accept library or on-page urls).
@@ -419,7 +550,7 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
               // placeableImage. The staged File is left alone either way, so the
               // composer chip and the preview pane still show what was pasted.
               const upload = await placeableImage(a.file);
-              a.mediaUrl = (await uploadMediaImage(issueId, upload, a.file.name)).url;
+              a.mediaUrl = (await uploadMediaImage(issueId, upload, a.file.name, undefined, await uploadDims(a.file, upload, a.dims ?? null))).url;
             } catch (e) {
               // SAY WHAT WENT WRONG. This used to be a bare `catch {}` under a message
               // that only reported the consequence, so every cause looked identical:
@@ -438,7 +569,14 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
               console.warn('[studio] media upload failed', a.file.name, e);
             }
           }
-          if (a.mediaUrl) imgs.push({ url: a.mediaUrl, name: a.file.name });
+          if (a.mediaUrl) {
+            imgs.push({
+              url: a.mediaUrl,
+              name: a.file.name,
+              ...(a.dims ? { width: a.dims.width, height: a.dims.height } : {}),
+              ...(a.graphic ? { graphic: true } : {}),
+            });
+          }
           // 2) Read what it shows (vision digest) so copy can reference it.
           //    Optional for images — a failed read must not sink the turn.
           if (!a.text) {
@@ -461,14 +599,27 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
               return;
             }
           }
-          // Persist the document to the magazine's Uploads library (best-effort) so
-          // it appears in the Uploads tab and can fill pages later. `mediaUrl`
-          // doubles as the "already stored" guard so a re-send doesn't duplicate it.
+          // Persist the document to the magazine's Uploads library so it appears in
+          // the Uploads tab, can fill pages later — and, by its id, can be READ AGAIN
+          // on later turns. The text below reaches this turn only; it used to be the
+          // document's only route to the assistant, so "now use the figures from the
+          // PDF" one message later found nothing. `mediaUrl` doubles as the "already
+          // stored" guard so a re-send doesn't duplicate it.
           if (!a.mediaUrl && issueId) {
             try {
-              a.mediaUrl = (await uploadMediaDoc(issueId, a.file, { sourceText: a.text })).url;
-            } catch {
-              /* storage is optional — the doc still fills THIS turn via its text */
+              const stored = await uploadMediaDoc(issueId, a.file, { sourceText: a.text });
+              a.mediaUrl = stored.url;
+              a.docId = stored.id;
+              storedDoc = true;
+              if (stored.extractingPictures) extracting.push(a.file.name);
+            } catch (e) {
+              // Not fatal — the document still fills THIS turn through its text — but
+              // say so: without a stored copy, later messages cannot read it, and the
+              // user should know before they rely on that.
+              const why = e instanceof Error && e.message ? e.message.trim().replace(/[.\s]+$/, '') : '';
+              toast.message(
+                `Couldn't save “${a.file.name}” to this magazine${why ? ` — ${why}` : ''}. I can use it for this message, but attach it again if you refer to it later.`,
+              );
             }
           }
           parts.push(worked.length > 1 ? `[Attached document “${a.file.name}”]\n${a.text}` : a.text);
@@ -478,9 +629,19 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
       setIngesting(false);
       src = parts.filter(Boolean).join('\n\n') || undefined;
       images = imgs.length > 0 ? imgs : undefined;
+      // The stored documents, by id, so the server can keep them with the message.
+      const sentDocs = worked.filter((a) => !a.isImage && a.docId).map((a) => ({ docId: a.docId!, name: a.file.name }));
+      docs = sentDocs.length > 0 ? sentDocs : undefined;
+      if (storedDoc) noteUploadsChanged();
+      notePictureExtraction(extracting);
       // Display metadata shown as chips inside the sent user bubble (images use
       // their persisted media URL for the thumbnail, not the revoked object URL).
-      attachRefs = worked.map((a) => ({ name: a.file.name, isImage: a.isImage, url: a.isImage ? a.mediaUrl : undefined }));
+      attachRefs = worked.map((a) => ({
+        name: a.file.name,
+        isImage: a.isImage,
+        url: a.isImage ? a.mediaUrl : undefined,
+        ...(!a.isImage && a.docId ? { docId: a.docId } : {}),
+      }));
     }
     // A default instruction when the user sends attachments with no prompt.
     const bodyText =
@@ -499,7 +660,17 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
     for (const a of atts) if (sentIds.has(a.id) && a.imgUrl) URL.revokeObjectURL(a.imgUrl);
     setAtts((prev) => prev.filter((a) => !sentIds.has(a.id)));
     setPreviewDoc(null);
-    void sendChat(bodyText, src, images, attachRefs);
+    void sendChat(bodyText, src, images, attachRefs, docs ? { attachedDocs: docs } : undefined);
+  };
+
+  // ── The page check, as a chip: "2 problems after these changes · Fix" ──
+  // The server checks the page as it will be once the staged changes land, and sends
+  // back only errors those changes introduced. The chip makes them visible and gives
+  // one click to have the assistant fix them — the assistant re-checks its fix.
+  const checkIssues = lastCheckPageId === currentPageId ? checkErrors(lastCheck) : [];
+  const fixProblems = () => {
+    if (chatBusy || ingesting || blockedReason || readOnlyThread) return;
+    void sendChat('Fix the problems the page check found.');
   };
 
   return (
@@ -550,6 +721,10 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
           </button>
         )}
       </div>
+
+      {/* Every page's waiting changes — above the tabs, so it shows on Chat and Uploads
+          alike and whichever page is open. Renders nothing when nothing is waiting. */}
+      <WaitingChangesBar />
 
       {/* Tabs */}
       <div className="flex border-b border-studio-hair text-ui-sm font-semibold">
@@ -638,12 +813,22 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
               )}
             </div>
           ))}
-          {uploadImages.map((m) => (
-            <button key={m.id} type="button" onClick={() => previewImage(m)} title="Preview" data-agent-id={`mag.ai-upload-image-${m.id}`} data-agent-label={`Preview uploaded image “${m.alt || 'Image'}”`} className="flex w-full items-center gap-2 rounded-md border border-studio-hair bg-studio-raise px-2.5 py-2 text-left text-ui-sm hover:bg-studio-raise">
-              <img src={m.url} alt="" className="h-7 w-10 flex-shrink-0 rounded-sm object-cover" />
-              <span className="min-w-0 flex-1 truncate text-studio-ink">{m.alt || 'Image'}</span>
-            </button>
-          ))}
+          {uploadImages.map((m) => {
+            // A picture taken out of an attached PDF says which document and page it
+            // came from — "the horse photo on page 2 of the brochure" is how people
+            // ask for it — unless its description already does.
+            const fromDoc = m.docName && !(m.alt || '').includes(m.docName) ? `From “${m.docName}”${m.docPage ? `, page ${m.docPage}` : ''}` : '';
+            return (
+              <button key={m.id} type="button" onClick={() => previewImage(m)} title="Preview" data-agent-id={`mag.ai-upload-image-${m.id}`} data-agent-label={`Preview uploaded image “${m.alt || 'Image'}”`} className="flex w-full items-center gap-2 rounded-md border border-studio-hair bg-studio-raise px-2.5 py-2 text-left text-ui-sm hover:bg-studio-raise">
+                {/* A graphic (chart, logo) is shown whole; a photo fills its tile. */}
+                <img src={m.url} alt="" className={'h-7 w-10 flex-shrink-0 rounded-sm ' + (m.kind === 'graphic' ? 'object-contain' : 'object-cover')} />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-studio-ink">{m.alt || 'Image'}</span>
+                  {fromDoc && <span className="block truncate text-studio-ink-4">{fromDoc}</span>}
+                </span>
+              </button>
+            );
+          })}
         </div>
       ) : (
         <>
@@ -672,7 +857,7 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
             <br />• <strong className="text-studio-ink">Add a photo</strong> — attach one, or paste it with Ctrl/Cmd+V
             <br />• <strong className="text-studio-ink">Fill this page</strong> — attach a document and ask me to use it
             <br />• <strong className="text-studio-ink">Change one thing</strong> — click it on the page first, then tell me what to do
-            <br /><br />Nothing changes until you press <strong className="text-studio-ink">Use these changes</strong>.
+            <br /><br />Nothing changes until you apply it. What I stage waits on its page — across messages, pages and reloads — until you press <strong className="text-studio-ink">Use these changes</strong> (this page) or <strong className="text-studio-ink">Apply all</strong> (every page).
           </p>
         )}
         {chat.map((m, i) => (
@@ -688,18 +873,38 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
                 <>
                   {m.attachments && m.attachments.length > 0 && (
                     <div className="mb-1 flex flex-wrap gap-1">
-                      {m.attachments.map((a, j) => (
-                        <span key={j} className="flex max-w-full items-center gap-1 rounded bg-black/20 px-1.5 py-0.5 text-ui-sm text-studio-ink">
-                          {a.isImage && a.url ? (
-                            <img src={a.url} alt="" className="h-4 w-4 flex-shrink-0 rounded object-cover" />
-                          ) : a.isImage ? (
-                            <ImageIcon size={10} className="flex-shrink-0" />
-                          ) : (
+                      {m.attachments.map((a, j) =>
+                        !a.isImage && a.docId ? (
+                          <button
+                            key={j}
+                            type="button"
+                            onClick={() => void previewDocById(a.docId!, a.name)}
+                            title="Saved to this magazine's Uploads — the Design Helper can read it again on any later message. Click to open it."
+                            data-agent-id={`mag.ai-sent-doc-${a.docId}`}
+                            data-agent-label={`Open the attached document “${a.name}” (saved to this magazine)`}
+                            className="flex max-w-full items-center gap-1 rounded bg-black/20 px-1.5 py-0.5 text-ui-sm text-studio-ink hover:bg-black/30"
+                          >
                             <FileText size={10} className="flex-shrink-0" />
-                          )}
-                          <span className="truncate">{a.name}</span>
-                        </span>
-                      ))}
+                            <span className="truncate">{a.name}</span>
+                            {/* Stored, not just read for this turn: "please just store it" is done
+                                the moment the chip carries an id. */}
+                            <span className="flex flex-shrink-0 items-center gap-0.5 text-emerald-100/80">
+                              <Check size={9} /> saved
+                            </span>
+                          </button>
+                        ) : (
+                          <span key={j} className="flex max-w-full items-center gap-1 rounded bg-black/20 px-1.5 py-0.5 text-ui-sm text-studio-ink">
+                            {a.isImage && a.url ? (
+                              <img src={a.url} alt="" className="h-4 w-4 flex-shrink-0 rounded object-cover" />
+                            ) : a.isImage ? (
+                              <ImageIcon size={10} className="flex-shrink-0" />
+                            ) : (
+                              <FileText size={10} className="flex-shrink-0" />
+                            )}
+                            <span className="truncate">{a.name}</span>
+                          </span>
+                        ),
+                      )}
                     </div>
                   )}
                   {typeof m.pageIndex === 'number' && (
@@ -708,7 +913,23 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
                   {m.content}
                 </>
               ) : (
-                <MarkdownMessage text={m.content} />
+                <>
+                  <MarkdownMessage text={m.content} />
+                  {/* What this turn REALLY staged, from its proposals — the reply can
+                      describe work it never did; this line cannot. */}
+                  {m.note && (
+                    <p
+                      data-agent-id={i === chat.length - 1 ? 'mag.ai-staged-line' : undefined}
+                      className={
+                        'mt-1.5 flex items-start gap-1.5 border-t border-studio-hair pt-1.5 text-ui-sm leading-snug ' +
+                        (/^Nothing was changed/.test(m.note) ? 'text-studio-ink-3' : 'text-[var(--gold-light)]')
+                      }
+                    >
+                      {/^Nothing was changed/.test(m.note) ? <CircleSlash size={11} className="mt-0.5 flex-shrink-0" /> : <Clock size={11} className="mt-0.5 flex-shrink-0" />}
+                      <span>{m.note}</span>
+                    </p>
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -724,30 +945,85 @@ export function AiPanel({ onClose }: { onClose?: () => void } = {}) {
         )}
       </div>
 
+      {/* Page-check chip: problems the staged (or just applied) changes leave on this
+          page, measured — not guessed. "Fix" asks the assistant to repair them. */}
+      {checkIssues.length > 0 && (
+        <div
+          data-agent-id="mag.ai-check"
+          data-agent-label={problemsLabel(checkIssues.length, lastCheckApplied)}
+          role="status"
+          className="flex items-center gap-2 border-t border-amber-400/25 bg-amber-400/10 px-3 py-1.5 text-ui-sm text-amber-200"
+          title={problemsTooltip(checkIssues)}
+        >
+          <AlertTriangle size={12} className="flex-shrink-0" />
+          <span className="min-w-0 flex-1 truncate">{problemsLabel(checkIssues.length, lastCheckApplied)}</span>
+          <button
+            type="button"
+            onClick={fixProblems}
+            disabled={chatBusy || ingesting || !!blockedReason || readOnlyThread}
+            data-agent-id="mag.ai-check-fix"
+            data-agent-label="Ask the Design Helper to fix the problems the page check found"
+            title={problemsTooltip(checkIssues)}
+            className="flex flex-shrink-0 items-center gap-1 rounded-sm border border-amber-300/40 px-2 py-0.5 font-semibold text-amber-100 hover:bg-amber-400/15 disabled:opacity-40"
+          >
+            <Wrench size={11} /> Fix
+          </button>
+          <button
+            type="button"
+            onClick={() => dismissCheck()}
+            data-agent-id="mag.ai-check-dismiss"
+            aria-label="Hide this notice"
+            title="Hide this notice"
+            className="flex-shrink-0 text-amber-200/60 hover:text-amber-100"
+          >
+            <X size={11} />
+          </button>
+        </div>
+      )}
+
       {/* Review & apply tray */}
       {showTray && (
         <div className="studio-scroll max-h-[46%] space-y-2 overflow-y-auto border-t-2 px-3 py-2.5" style={{ borderColor: 'var(--gold-mid)', background: 'rgba(212,168,67,0.08)' }}>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="flex items-center gap-1.5 text-ui-sm font-bold uppercase tracking-wider" style={{ color: 'var(--gold-light)' }}>
               <span className="flex h-5 min-w-5 items-center justify-center rounded-full px-1 text-ui-sm font-bold text-studio-bg" style={{ background: 'var(--gold-bright)' }}>{proposals.length}</span>
-              Ready to review
+              Waiting on this page
             </span>
             <div className="flex items-center gap-1.5">
-              <button onClick={() => void applyAll()} data-agent-id="mag.ai-apply" className="flex items-center gap-1 rounded-sm bg-emerald-500 px-2.5 py-1 text-ui-sm font-semibold text-studio-ink hover:bg-emerald-600" title="Apply these changes to the page">
-                <Check size={12} /> Use these changes
+              {/* Disabled while an apply runs (a second press started a second,
+                  overlapping apply of the same changes) and while the assistant is
+                  replying: that turn is building on exactly these changes. */}
+              <button onClick={() => void applyAll()} disabled={applying || chatBusy} data-agent-id="mag.ai-apply" className="flex items-center gap-1 rounded-sm bg-emerald-500 px-2.5 py-1 text-ui-sm font-semibold text-studio-ink hover:bg-emerald-600 disabled:opacity-60" title={chatBusy ? 'The Design Helper is still working on these changes' : 'Apply these changes to the page'}>
+                {applying ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />} {applying ? 'Applying…' : 'Use these changes'}
               </button>
-              <button onClick={() => discard()} data-agent-id="mag.ai-discard" className="flex items-center gap-1 rounded-sm border border-studio-edge px-2.5 py-1 text-ui-sm text-studio-ink-2 hover:bg-studio-raise-2" title="Dismiss these suggestions — nothing has been changed yet">
+              <button onClick={() => discard()} disabled={applying || chatBusy} data-agent-id="mag.ai-discard" className="flex items-center gap-1 rounded-sm border border-studio-edge px-2.5 py-1 text-ui-sm text-studio-ink-2 hover:bg-studio-raise-2 disabled:opacity-50" title="Dismiss this page's waiting changes — nothing has been changed yet, and the message offers to bring them back">
                 <X size={12} /> Don’t use these
               </button>
             </div>
           </div>
-          {proposals.map((p) => {
+          {trayRows(proposals).map(({ p, n, label }) => {
             const thumb = thumbOf(p);
+            const swatch = swatchOf(p);
             return (
               <div key={p.id} className="flex items-center gap-2 rounded-md border px-2.5 py-2 text-ui-sm" style={{ borderColor: 'rgba(212,168,67,0.3)', background: 'rgba(212,168,67,0.05)' }}>
                 <span className="flex h-4 w-4 flex-shrink-0 items-center justify-center" style={{ color: 'var(--gold-light)' }}>{kindIcon(p.kind)}</span>
-                {thumb && <img src={thumb} alt="" className="h-7 w-10 flex-shrink-0 rounded-sm object-cover" />}
-                <span className="text-studio-ink">{p.summary}</span>
+                {thumb && <img src={thumb.url} alt="" className={'h-7 w-10 flex-shrink-0 rounded-sm ' + (thumb.contain ? 'object-contain' : 'object-cover')} />}
+                {swatch && <span className="h-5 w-5 flex-shrink-0 rounded-sm border border-studio-edge" style={{ background: swatch }} aria-hidden="true" />}
+                <span className="min-w-0">
+                  <span className="block text-studio-ink">
+                    {label ?? p.summary}
+                    {/* A group's label already counts its changes. */}
+                    {n > 1 && !label && <span className="ml-1 font-semibold" style={{ color: 'var(--gold-light)' }}>×{n}</span>}
+                  </span>
+                  {/* What the server measured about this change (e.g. text that will not
+                      fit its box) — said before Apply, not discovered after it. */}
+                  {p.warning && (
+                    <span className="mt-0.5 flex items-start gap-1 text-amber-200">
+                      <AlertTriangle size={10} className="mt-0.5 flex-shrink-0" />
+                      <span>{p.warning}</span>
+                    </span>
+                  )}
+                </span>
               </div>
             );
           })}

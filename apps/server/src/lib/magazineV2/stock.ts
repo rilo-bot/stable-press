@@ -6,7 +6,9 @@
 //
 // Two ways in:
 //   • fetchAndStoreStock — search and store the FIRST hit, unattended (the editor
-//     agent, and the generator's fallback when the Photo Director is unavailable).
+//     agent, and the generator's fallback when the Photo Director is unavailable);
+//     with `avoidUsed`, the first hit the magazine does not hold yet, so "find
+//     another photo" really finds another (stockVariety.ts).
 //   • searchStockCandidates + storeStockCandidate — search several, let someone
 //     (the Photo Director, photoDirector.ts) LOOK at the previews and pick, then
 //     store only the chosen one. Nothing is stored for the candidates not chosen.
@@ -36,6 +38,7 @@ import {
   type StoredPhoto,
 } from '../stock.js';
 import { COL } from './collections.js';
+import { chooseStock, type StockMediaRow } from './stockVariety.js';
 
 // Re-exported so the generator's existing imports from this module keep working —
 // it asks `isStockConfigured()` before planning a photo slot at all.
@@ -47,6 +50,12 @@ export interface StoredStockImage {
   url: string;
   assetId: string;
   alt: string;
+  /** (avoidUsed) This photo was already in the magazine's library: its existing row
+   *  is returned and nothing new was stored. */
+  reused?: boolean;
+  /** (avoidUsed) Every result for the query is already in the magazine — a DIFFERENT
+   *  photo needs a different, more specific query. */
+  allUsed?: boolean;
 }
 
 /** Write the MediaAsset row for a photo already copied into our bucket. */
@@ -59,6 +68,8 @@ async function recordStockAsset(stored: StoredPhoto, ctx: { magazineId: string; 
     url: stored.url,
     contentType: stored.contentType,
     size: stored.bytes,
+    // The provider's pixel size, so a box can be made the photo's own shape.
+    ...(stored.width && stored.height ? { width: stored.width, height: stored.height } : {}),
     alt: stored.alt,
     kind: 'photo',
     source: 'stock',
@@ -76,16 +87,45 @@ async function recordStockAsset(stored: StoredPhoto, ctx: { magazineId: string; 
  * Search + store a stock photo as a MediaAsset. Returns the element-ready image
  * reference, or null on no key/S3, no result, or any error (NEVER throws — a
  * missing photo must not fail the page; the caller degrades to a colour block).
+ *
+ * `avoidUsed` (the Studio's "add a photo" / "find another one"): skip every Pexels
+ * photo this magazine already holds and store the next result instead, so a repeat
+ * request gets a DIFFERENT picture. When every result is already held, the existing
+ * library row of the best match comes back with `reused` + `allUsed` set — no second
+ * copy is downloaded or stored (stockVariety.ts). Without it, the top hit is stored,
+ * exactly as before (generation keeps its own ledger, photoDirector.ts).
  */
 export async function fetchAndStoreStock(
-  opts: { query: string; orientation?: StockOrientation },
+  opts: { query: string; orientation?: StockOrientation; avoidUsed?: boolean },
   ctx: { magazineId: string; pageIndex: number },
 ): Promise<StoredStockImage | null> {
   if (!isStockConfigured()) return null;
   try {
-    const stored = await findAndStoreStockPhoto(opts, `public/magazinesV2/${ctx.magazineId}`);
-    if (!stored) return null;
-    return await recordStockAsset(stored, ctx);
+    const prefix = `public/magazinesV2/${ctx.magazineId}`;
+    if (!opts.avoidUsed) {
+      const stored = await findAndStoreStockPhoto({ query: opts.query, orientation: opts.orientation }, prefix);
+      if (!stored) return null;
+      return await recordStockAsset(stored, ctx);
+    }
+    const rows = (await db.collection(COL.media).find({ magazineId: ctx.magazineId })) as StockMediaRow[];
+    // One request returns a page of results (lib/stock.ts SEARCH_PER_PAGE); asking for
+    // all of them costs the same quota as asking for one.
+    const candidates = await searchStockPhotos(opts.query, { orientation: opts.orientation, count: 12 });
+    const choice = chooseStock(candidates, rows);
+    if (choice.kind === 'fresh') {
+      const stored = await storeStockPhoto(choice.candidate, prefix);
+      return stored ? await recordStockAsset(stored, ctx) : null;
+    }
+    if (choice.kind === 'reuse') {
+      return {
+        url: String(choice.row.url),
+        assetId: String(choice.row._id),
+        alt: choice.row.alt ?? choice.candidate.alt,
+        reused: true,
+        allUsed: true,
+      };
+    }
+    return null;
   } catch (err) {
     console.warn('[magazineV2] stock fetch failed:', err instanceof Error ? err.message : err);
     return null;

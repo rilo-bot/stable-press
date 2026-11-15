@@ -11,6 +11,8 @@
 // one I just sent".
 // ---------------------------------------------------------------------------
 
+import { originalFor } from '@/agent/attachments/originals';
+
 export interface OperatorAttachment {
   /** File name as the user attached it ("stable.png"). */
   name: string;
@@ -119,8 +121,27 @@ function dataUrlToBlob(url: string): Blob {
   return new Blob([decodeURIComponent(body)], { type: mime });
 }
 
-/** The attachment as a real File, ready for a file input. */
+/** A PDF the user sent (by type, or by name when the type was lost). */
+export function isPdfAttachment(att: Pick<OperatorAttachment, 'name' | 'mediaType'>): boolean {
+  return att.mediaType === 'application/pdf' || /\.pdf$/i.test(att.name);
+}
+
+/**
+ * The attachment as a real File, ready for a file input.
+ *
+ * For an image the user attached in THIS session, that is their ORIGINAL file
+ * (agent/attachments/originals): the chat sends the model a reduced JPEG, and
+ * rebuilding the file from that copy placed a flattened, downscaled picture — a
+ * transparent logo or chart PNG landed on a black box. A thread restored after a
+ * reload has no originals, so it falls back to the sent data URL as before.
+ */
 export async function attachmentToFile(att: OperatorAttachment): Promise<File> {
+  const original = originalFor(att.url);
+  if (original) {
+    return original instanceof File && original.name
+      ? original
+      : new File([original], nameFor(att.name, original.type), { type: original.type, lastModified: Date.now() });
+  }
   let blob: Blob;
   if (att.url.startsWith('data:')) blob = dataUrlToBlob(att.url);
   else {

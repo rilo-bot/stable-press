@@ -41,7 +41,15 @@ export interface ImageUploadOptions {
   quality?: number;
 }
 
-/** Compress a user-selected image File to a JPEG Blob via canvas. */
+/**
+ * Compress a user-selected image File to a JPEG Blob via canvas.
+ *
+ * JPEG has no alpha. Per the canvas spec a transparent pixel encodes as BLACK, so a
+ * logo or cut-out PNG used to come out as dark ink on a solid black box — and in
+ * the Operator chat that copy is what got placed on the page. The canvas is painted
+ * white first, so transparency flattens onto paper instead. Callers that must keep
+ * the alpha use compressToPngBlob, or the original file (agent/attachments/originals).
+ */
 export function compressImageToBlob(
   file: File,
   { maxDim = 1280, quality = 0.72 }: { maxDim?: number; quality?: number } = {},
@@ -64,6 +72,10 @@ export function compressImageToBlob(
         canvas.height = Math.max(1, Math.round(h * scale));
         const ctx = canvas.getContext('2d');
         if (!ctx) { reject(new Error('Canvas not available.')); return; }
+        // White ground under any transparency (see the note above) — JPEG would
+        // otherwise turn it black.
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         canvas.toBlob(
           (blob) => (blob ? resolve(blob) : reject(new Error('Could not encode the image.'))),

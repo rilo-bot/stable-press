@@ -51,7 +51,9 @@ export interface ElementTextData {
   role: TextRole;
   fontFamily: string;
   fontSize: number; // px at the page's canonical dims — the CURRENT (fit) size
-  maxFontSize?: number; // design's intended ceiling; refit shrinks from here
+  /** Design's intended ceiling; refit shrinks from here. Never below fontSize (coerceText),
+   *  and an explicit size change moves it with the size (writePipeline.normalizeElementPatch). */
+  maxFontSize?: number;
   /** The design's FLOOR — refit may not shrink below it (defaults to 55% of the
    *  ceiling). Carried on the element because the print legibility floor has to survive
    *  every later write: without it, refitText re-fits from `maxFontSize * 0.55` and a
@@ -118,7 +120,13 @@ export interface MagazineElement {
 }
 
 export const MAX_ELEMENTS_PER_PAGE = 400;
-const MAX_TEXT_HTML = 8000;
+/**
+ * The most stored HTML one text element keeps; validation CUTS anything longer
+ * (coerceText). Exported so a deterministic edit that lengthens copy (a find-and-
+ * replace) can refuse a box it would push past this, instead of having the end of the
+ * client's paragraph silently cut off on write.
+ */
+export const MAX_TEXT_HTML = 8000;
 const MAX_FONT_FAMILY = 80;
 const MAX_ALT = 300;
 const MAX_QR_URL = 2000;
@@ -202,7 +210,12 @@ function coerceText(o: Record<string, unknown>): ElementTextData {
     autoFit,
   };
   if (typeof t.maxFontSize === 'number' && Number.isFinite(t.maxFontSize)) {
-    out.maxFontSize = clampNum(t.maxFontSize, 6, 400, out.fontSize);
+    // A ceiling below the size the text already prints at is a contradiction, and a
+    // harmful one: the next refit (a word changed, the box nudged) starts from the old
+    // ceiling and silently undoes a size someone asked for — "make it bigger" took the
+    // body from 18 to 26 and the next one-word fix put it back to 18. Text saved that
+    // way before writePipeline moved the ceiling with the size heals on its next write.
+    out.maxFontSize = Math.max(clampNum(t.maxFontSize, 6, 400, out.fontSize), out.fontSize);
   }
   if (typeof t.minFontSize === 'number' && Number.isFinite(t.minFontSize)) {
     // Never above the ceiling it is a floor for, or refit would have no range to work in.

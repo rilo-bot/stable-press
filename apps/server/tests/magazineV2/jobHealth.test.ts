@@ -22,6 +22,12 @@ import {
   silentForMs,
   NO_BEAT_MS,
   NO_BEAT_GRACE_MS,
+  API_NO_BEAT_MS,
+  ADD_PAGES_INTERRUPTED,
+  KEEP_ALIVE_JOB_TYPES,
+  issueStatusAfterDeadJob,
+  keptAliveByTimer,
+  requeuedJobFields,
 } from '../../src/lib/magazineV2/jobHealth.js';
 
 const NOW = Date.parse('2026-08-26T12:00:00.000Z');
@@ -112,4 +118,84 @@ test('silentForMs reports the gap, floored at zero', () => {
   assert.equal(silentForMs({ lastBeatAt: ago(3 * MIN) }, NOW), 3 * MIN);
   // A clock skew that puts the beat in the future must not produce a negative.
   assert.equal(silentForMs({ lastBeatAt: new Date(NOW + 5_000).toISOString() }, NOW), 0);
+});
+
+// ── generation keep-alive, requeue, and what a dead "add pages" leaves ─────
+//
+// The incident: a deploy restarted the worker mid "add pages". Generation never
+// beat, so the job sat 'running' on the 45-minute grace with the magazine
+// 'processing' (studio frozen on "Designing pages", publish refused), and then the
+// watchdog marked a good 'ready'/'published' magazine 'failed'.
+
+test('generation is kept alive by the worker timer; CPU-bound extraction is not', () => {
+  assert.equal(keptAliveByTimer('generateIssue'), true);
+  assert.equal(keptAliveByTimer('generatePages'), true);
+  // MuPDF blocks the event loop while a page rasterises — a timer there could miss
+  // its window on one heavy page and get a LIVE job reaped.
+  for (const type of ['processIssue', 'processPage', 'copyDocumentPage', 'readSourceDoc', 'renderIssuePdf', 'noop', undefined, 7]) {
+    assert.equal(keptAliveByTimer(type), false, String(type));
+  }
+  assert.deepEqual([...KEEP_ALIVE_JOB_TYPES].sort(), ['generateIssue', 'generatePages']);
+});
+
+test('a kept-alive generation run that dies is caught in minutes, not 45', () => {
+  // The worker's keep-alive beat stops with the process; NO_BEAT_MS later the run
+  // is presumed dead even though it started only a few minutes ago.
+  const died = { startedAt: ago(8 * MIN), lastBeatAt: ago(NO_BEAT_MS + 30_000) };
+  assert.equal(jobIsPresumedDead(died, NOW), true);
+  // …while a live one, beating every half minute, is alive however long it runs.
+  assert.equal(jobIsPresumedDead({ startedAt: ago(40 * MIN), lastBeatAt: ago(30_000) }, NOW), false);
+});
+
+test('the API watchdog waits longer than the worker sweep for a beating job', () => {
+  // The worker requeues a dead run at NO_BEAT_MS (a retry); the API is the
+  // backstop for a worker that is down altogether and must not win that race.
+  assert.ok(API_NO_BEAT_MS > NO_BEAT_MS);
+  assert.ok(API_NO_BEAT_MS < NO_BEAT_GRACE_MS, 'still far faster than the old 45 minutes');
+  const silentSix = { startedAt: ago(20 * MIN), lastBeatAt: ago(6 * MIN) };
+  assert.equal(jobIsPresumedDead(silentSix, NOW), true, 'worker sweep: requeue');
+  assert.equal(jobIsPresumedDead(silentSix, NOW, { noBeatMs: API_NO_BEAT_MS }), false, 'API: not yet');
+});
+
+test('a requeued job is judged as a fresh, never-beaten job', () => {
+  const stamp = new Date(NOW).toISOString();
+  const fields = requeuedJobFields(stamp, 'Requeued after worker restart (silent 6min).');
+  assert.equal(fields.status, 'queued');
+  assert.equal(fields.startedAt, stamp);
+  assert.equal(fields.lastBeatAt, null);
+  assert.equal(fields.lastError, 'Requeued after worker restart (silent 6min).');
+  // The dead run's stale beat is gone, so the API's heal-on-read does not fail the
+  // magazine while the retry waits its turn.
+  const deadRun = { startedAt: ago(30 * MIN), lastBeatAt: ago(6 * MIN) };
+  assert.equal(jobIsPresumedDead(deadRun, NOW, { noBeatMs: NO_BEAT_MS }), true);
+  const requeued = { ...deadRun, ...fields };
+  assert.equal(isBeating(requeued), false);
+  assert.equal(jobIsPresumedDead(requeued, NOW), false);
+  assert.equal(jobIsPresumedDead(requeued, NOW, { noBeatMs: API_NO_BEAT_MS }), false);
+});
+
+test('a dead "add pages" job restores the status the magazine had, with a note', () => {
+  for (const prev of ['ready', 'draft', 'published']) {
+    const out = issueStatusAfterDeadJob({ type: 'generatePages', payload: { issueId: 'i', prevStatus: prev } }, 'ignored');
+    assert.deepEqual(out, { status: prev, stage: '', processingError: ADD_PAGES_INTERRUPTED });
+  }
+  // An unknown or missing previous status lands on 'ready', never on 'failed' or a
+  // status the studio does not know.
+  for (const prev of [undefined, '', 'processing', 'failed', 42]) {
+    const out = issueStatusAfterDeadJob({ type: 'generatePages', payload: { prevStatus: prev } }, 'ignored');
+    assert.equal(out.status, 'ready', String(prev));
+  }
+  assert.equal(issueStatusAfterDeadJob({ type: 'generatePages' }, 'x').status, 'ready');
+});
+
+test('any other dead job still fails the magazine, with the caller\'s message', () => {
+  for (const type of ['generateIssue', 'processIssue', 'readSourceDoc']) {
+    assert.deepEqual(issueStatusAfterDeadJob({ type, payload: { issueId: 'i', prevStatus: 'ready' } }, 'It stalled.'), {
+      status: 'failed',
+      stage: '',
+      processingError: 'It stalled.',
+    });
+  }
+  assert.equal(issueStatusAfterDeadJob(null, 'No job.').status, 'failed');
+  assert.equal(issueStatusAfterDeadJob(undefined, 'No job.').processingError, 'No job.');
 });

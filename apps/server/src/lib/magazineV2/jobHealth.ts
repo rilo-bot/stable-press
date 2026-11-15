@@ -100,3 +100,87 @@ export function silentForMs(job: JobLiveness, nowMs: number): number | null {
   const sign = lastSignOfLife(job);
   return sign === null ? null : Math.max(0, nowMs - sign);
 }
+
+// ── Keeping generation alive, and what a dead one leaves behind ─────────────
+//
+// THE GAP THIS CLOSES. Generation ('generateIssue', 'generatePages') never beat,
+// so it stayed on the 45-minute grace above. A deploy that restarted the worker
+// while it was adding pages left the job 'running' and the magazine 'processing'
+// for three quarters of an hour — the studio showing "Designing pages" and
+// refusing publish and page edits all that time — and then the watchdog marked a
+// perfectly good 'ready' or 'published' magazine 'failed'.
+//
+// Two changes, both decided here so the worker's sweep and the API's heal-on-read
+// cannot disagree:
+//   1. The worker keeps these jobs alive with a TIMER while the handler's promise
+//      is pending (queue.ts). Generation is I/O-bound — model calls — so the event
+//      loop is free and the timer fires as long as the process lives; a dead
+//      process stops beating at once and is caught in NO_BEAT_MS. Beating per
+//      composed page instead could go quiet for longer than NO_BEAT_MS on one slow
+//      page and be reaped while alive. CPU-bound extraction (MuPDF blocks the loop)
+//      is deliberately NOT on the list: a timer there could not fire while a big
+//      page rasterises, which is the false kill this whole file exists to avoid.
+//   2. A dead 'add pages' job puts the magazine back the way it was. The pages it
+//      was adding are only inserted at the very end of the run, so an interrupted
+//      run has changed nothing worth failing the whole magazine over.
+
+/** Job types the worker keeps alive with a timer for as long as their handler runs. */
+export const KEEP_ALIVE_JOB_TYPES: readonly string[] = ['generateIssue', 'generatePages'];
+
+export function keptAliveByTimer(type: unknown): boolean {
+  return typeof type === 'string' && KEEP_ALIVE_JOB_TYPES.includes(type);
+}
+
+/**
+ * How long the API's heal-on-read lets a BEATING job stay silent.
+ *
+ * Twice the worker's NO_BEAT_MS on purpose. A worker that restarted mid-job sweeps
+ * at NO_BEAT_MS and REQUEUES the job (it still has attempts left), which is the
+ * better outcome — the work is retried. The API is the backstop for a worker that
+ * is down altogether, so it should not win that race and throw the retry away.
+ */
+export const API_NO_BEAT_MS = 2 * NO_BEAT_MS;
+
+/** What the magazine says when an interrupted "add pages" run is given up on. */
+export const ADD_PAGES_INTERRUPTED = 'Adding pages was interrupted. Please try again.';
+
+const RESTORABLE_STATUSES = ['ready', 'draft', 'published'];
+
+/**
+ * The fields a 'processing' magazine is given when the job working on it is given
+ * up on (abandoned by the sweep, retired by the API watchdog, or out of attempts).
+ *
+ * An "add pages" job carries the status the magazine had before (`prevStatus`),
+ * and the magazine goes back to it — a published magazine stays published — with
+ * a processingError the studio shows as a toast. Anything else (an import, a
+ * from-scratch build) has no previous state worth restoring and is 'failed', as
+ * before. Callers write this guarded on `status: 'processing'`.
+ */
+export function issueStatusAfterDeadJob(
+  job: Record<string, unknown> | null | undefined,
+  failMessage: string,
+): { status: string; stage: string; processingError: string } {
+  if (job?.type === 'generatePages') {
+    const prev = (job.payload as { prevStatus?: unknown } | undefined)?.prevStatus;
+    const status = typeof prev === 'string' && RESTORABLE_STATUSES.includes(prev) ? prev : 'ready';
+    return { status, stage: '', processingError: ADD_PAGES_INTERRUPTED };
+  }
+  return { status: 'failed', stage: '', processingError: failMessage };
+}
+
+/**
+ * The fields that put a job back in the queue.
+ *
+ * `startedAt` is reset and `lastBeatAt` cleared because both watchdogs judge a
+ * QUEUED job too: left as they were, a job requeued after a crash still carries
+ * the dead run's last beat, so the API's heal-on-read would see "beating job,
+ * silent for minutes" and fail the magazine while the job sat waiting for its
+ * retry. Null rather than absent because the db wrapper only $sets; a null
+ * lastBeatAt reads as "never beat" (lastSignOfLife ignores non-strings).
+ */
+export function requeuedJobFields(
+  nowIso: string,
+  lastError: string,
+): { status: 'queued'; lastError: string; startedAt: string; lastBeatAt: null; updatedAt: string } {
+  return { status: 'queued', lastError, startedAt: nowIso, lastBeatAt: null, updatedAt: nowIso };
+}

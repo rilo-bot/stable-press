@@ -14,7 +14,14 @@
 
 import { db } from '../../server/src/lib/db.js';
 import { COL } from '../../server/src/lib/magazineV2/collections.js';
-import { jobIsPresumedDead, silentForMs, type JobLiveness } from '../../server/src/lib/magazineV2/jobHealth.js';
+import {
+  issueStatusAfterDeadJob,
+  jobIsPresumedDead,
+  keptAliveByTimer,
+  requeuedJobFields,
+  silentForMs,
+  type JobLiveness,
+} from '../../server/src/lib/magazineV2/jobHealth.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -44,13 +51,21 @@ export type JobHandlers = Record<string, JobHandler>;
  *  live job is never mistaken for a dead one, and cheap enough to ignore. */
 const BEAT_INTERVAL_MS = 15_000;
 
+/** How often the keep-alive timer beats for KEEP_ALIVE_JOB_TYPES (jobHealth.ts).
+ *  A little over BEAT_INTERVAL_MS so the throttle never swallows a tick, and still
+ *  ten beats inside every NO_BEAT_MS window. */
+const KEEP_ALIVE_INTERVAL_MS = 30_000;
+
 const POLL_INTERVAL_MS = Math.max(250, Number(process.env.MAGAZINE_V2_POLL_INTERVAL_MS ?? 2000));
 
 // How long a job may sit in `running` before we treat it as orphaned. A worker
 // that crashes/restarts (or is OOM-killed by the host) mid-job leaves its job
 // stuck in `running` forever — claimOne only ever grabs `queued`, so nothing
 // ever picks it back up and the issue's client spins indefinitely. We sweep for
-// these and requeue (or fail) them. NOTE: there is no per-job heartbeat, so if
+// these and requeue (or fail) them. This grace applies only to jobs that never
+// beat — a beating job (readSourceDoc, renderIssuePdf, and generation via the
+// keep-alive timer in processNextJob) is judged on NO_BEAT_MS instead, see
+// jobHealth.ts. For the non-beating ones: if
 // you ever run MORE THAN ONE worker, this must exceed the longest real job
 // runtime or a sweep on one worker could requeue a job another worker is still
 // running. With a single worker it's always safe (the loop only sweeps while
@@ -96,9 +111,12 @@ function terminalStamp(): { finishedAt: string; updatedAt: string; expiresAt: Da
 export async function processNextJob(handlers: JobHandlers): Promise<boolean> {
   // Atomic claim: flip the oldest queued job to `running` and bump its attempt
   // count in one operation, so no two workers take the same job.
+  // `lastBeatAt: null` on claim: a beat left over from an earlier, dead attempt
+  // would otherwise make this fresh run look like a beating job that has been
+  // silent for minutes, and both watchdogs would reap it before it began.
   const job = await db
     .collection(COL.jobs)
-    .claimOne({ status: 'queued' }, { status: 'running', startedAt: nowIso(), updatedAt: nowIso() }, { attempts: 1 });
+    .claimOne({ status: 'queued' }, { status: 'running', startedAt: nowIso(), updatedAt: nowIso(), lastBeatAt: null }, { attempts: 1 });
   if (!job) return false;
 
   const handler = handlers[String(job.type)];
@@ -147,13 +165,26 @@ export async function processNextJob(handlers: JobHandlers): Promise<boolean> {
     console.log(`[worker] job ${job._id} (${job.type}) skipped — issue ${targetIssueId} was deleted`);
     return true;
   }
+  // KEEP-ALIVE for generation (jobHealth.ts KEEP_ALIVE_JOB_TYPES). These handlers
+  // do not beat on their own, and used to sit on the 45-minute no-beat grace — so a
+  // worker restart mid "add pages" froze the magazine in 'processing' for 45
+  // minutes and then failed it. A timer that beats while the handler's promise is
+  // pending makes a live run beat for as long as the process lives, and a dead
+  // process stop beating at once, so a crash is caught in NO_BEAT_MS (minutes).
+  //
+  // Only these types: they are I/O-bound (model calls), so the timer always gets
+  // its turn on the event loop. MuPDF extraction blocks the loop while a page
+  // rasterises; a timer there could miss NO_BEAT_MS on one heavy page and get a
+  // LIVE job reaped, so extraction keeps the long grace.
+  const keepAlive = keptAliveByTimer(job.type) ? setInterval(() => void ctx.beat(), KEEP_ALIVE_INTERVAL_MS) : null;
+  // First beat now, not one interval in: a crash in the first half-minute is then
+  // judged on NO_BEAT_MS too.
+  if (keepAlive) void ctx.beat();
   try {
     if (!handler) throw new Error(`No handler registered for job type "${job.type}".`);
-    // NO beat up front, deliberately. A job only earns the strict NO_BEAT_MS rule
-    // by actually reporting progress; one that never calls beat() keeps the long
-    // grace it has always had. Beating here would have handed every job a
-    // lastBeatAt — including generation, which does not beat internally and
-    // legitimately runs for half an hour — and reaped it after five minutes.
+    // No beat up front for any OTHER job, deliberately. A job only earns the strict
+    // NO_BEAT_MS rule by actually reporting progress (or by the keep-alive above);
+    // one that never calls beat() keeps the long grace it has always had.
     await handler(job.payload, ctx);
     await db.collection(COL.jobs).updateOne(job._id, { status: 'done', lastError: '', ...terminalStamp() });
     console.log(`[worker] job ${job._id} (${job.type}) done`);
@@ -171,26 +202,28 @@ export async function processNextJob(handlers: JobHandlers): Promise<boolean> {
         job._id,
         permanent
           ? { status: 'failed', lastError: message, ...terminalStamp() }
-          : { status: 'queued', lastError: message, updatedAt: nowIso() },
+          : requeuedJobFields(nowIso(), message),
       );
     // Idempotent issue handlers now RETHROW on failure (instead of self-marking
     // the issue failed) so these retries actually run. Once attempts are spent,
     // the queue owns the terminal state — surface it on the issue so the client's
     // progress poll stops spinning. Guarded on 'processing' so it can never
     // clobber an issue a self-handling job (e.g. add-pages) already restored, and
-    // is a harmless no-op for jobs with no issueId (e.g. `noop`).
+    // is a harmless no-op for jobs with no issueId (e.g. `noop`). An "add pages"
+    // job restores the status the magazine had before rather than failing it.
     if (permanent) {
       const failedIssueId = (job.payload as { issueId?: string } | undefined)?.issueId;
       if (failedIssueId) {
         await db
           .collection(COL.magazines)
-          .updateOneIf(
-            failedIssueId,
-            { status: 'processing' },
-            { status: 'failed', stage: '', processingError: message, updatedAt: nowIso() },
-          );
+          .updateOneIf(failedIssueId, { status: 'processing' }, { ...issueStatusAfterDeadJob(job, message), updatedAt: nowIso() });
       }
     }
+  } finally {
+    // Whatever path left the try, the timer must not outlive the job: it would
+    // keep beating on a row that is already done (harmless) and, worse, keep the
+    // process's event loop busy for nothing.
+    if (keepAlive) clearInterval(keepAlive);
   }
   return true;
 }
@@ -234,19 +267,27 @@ async function recoverOrphanedJobs(): Promise<void> {
         .updateOneIf(job._id, { status: 'running' }, { status: 'failed', lastError: msg, ...terminalStamp() });
       if (failed) {
         console.error(`[worker] job ${job._id} (${job.type}) ${msg}`);
+        // An "add pages" run restores the magazine's previous status; anything
+        // else is failed as before (jobHealth.ts issueStatusAfterDeadJob).
         if (issueId)
           await db
             .collection(COL.magazines)
             .updateOneIf(
               issueId,
               { status: 'processing' },
-              { status: 'failed', stage: '', processingError: 'Generation was interrupted and could not recover. Please try again.', updatedAt: nowIso() },
+              {
+                ...issueStatusAfterDeadJob(job, 'Generation was interrupted and could not recover. Please try again.'),
+                updatedAt: nowIso(),
+              },
             );
       }
     } else {
+      // requeuedJobFields resets startedAt and clears the dead run's lastBeatAt, so
+      // the API's heal-on-read does not judge the waiting retry by a beat from the
+      // run that died — which would fail the magazine before the retry ran.
       const requeued = await db
         .collection(COL.jobs)
-        .updateOneIf(job._id, { status: 'running' }, { status: 'queued', lastError: `Requeued after worker restart (silent ${silence}).`, updatedAt: nowIso() });
+        .updateOneIf(job._id, { status: 'running' }, requeuedJobFields(nowIso(), `Requeued after worker restart (silent ${silence}).`));
       if (requeued) console.warn(`[worker] requeued orphaned job ${job._id} (${job.type}) — silent ${silence}, attempt ${attempts}/${maxAttempts}`);
     }
   }

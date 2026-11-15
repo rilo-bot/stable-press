@@ -12,14 +12,56 @@
 // twelve of them — half-undone being indistinguishable from broken.
 // Page-structure ops (add/remove/reorder/generate page) and a layout rebuild are
 // still NOT on the stack: they replace or destroy whole pages, and both paths warn
-// the user first.
+// the user first. A page's BACKGROUND is on it, as one more reversible op.
+//
+// STAGED CHANGES ARE KEPT PER PAGE (`pending`), across messages, page switches and
+// reloads, until the user applies or discards them — see pendingChanges.ts for why.
 // ---------------------------------------------------------------------------
 
 import { create } from 'zustand';
 import { toast } from 'sonner';
-import type { MagazineElement, MagazinePageV2, AgentProposal } from './model';
+import type { MagazineElement, MagazinePageV2, AgentProposal, PageCheck, ChartSpec, PageBackgroundInput } from './model';
 import * as api from './api';
 import { ApiError, type IssueMeta, type PageSummary } from './api';
+import { copyFailureText } from './pageCopy';
+import {
+  appliedMessage,
+  insertIndexFor,
+  inOrder,
+  isExclusiveKind,
+  isPageKind,
+  pageHeadline,
+  planPageSteps,
+  removalQuestion,
+  reorderIndices,
+} from './proposals';
+import {
+  accumulateTurn,
+  applyOutcome,
+  applyReportLine,
+  changeCount,
+  claimsChange,
+  foldChanges,
+  hasStagedLine,
+  holdStaleTextChanges,
+  MAX_SENT_PER_TURN,
+  orphanPageIds,
+  otherPagesTail,
+  pagesPhrase,
+  parsePending,
+  pendingFor,
+  pendingStorageKey,
+  pendingTotal,
+  rebaseForReplace,
+  serializePending,
+  stagedLine,
+  trayFor,
+  waitingPages,
+  withoutPages,
+  withPage,
+  type PageApplyReport,
+  type PendingByPage,
+} from './pendingChanges';
 
 /** A file the user attached to a chat turn, shown as a chip inside their sent
  *  message bubble (so the attachment reads as "sent", not stuck in the input). */
@@ -27,6 +69,8 @@ export interface ChatAttachmentRef {
   name: string;
   isImage: boolean;
   url?: string; // media-library URL for images (thumbnail); undefined for docs
+  /** A document's stored upload id — what later turns read it back by. */
+  docId?: string;
 }
 export interface ChatMessage {
   role: 'user' | 'assistant';
@@ -38,6 +82,28 @@ export interface ChatMessage {
   id?: string;
   pageIndex?: number | null;
   createdAt?: string;
+  /**
+   * Assistant replies only: the line shown under the reply saying what the turn
+   * REALLY staged ("Waiting for Apply: 2 changes on page 3 — …", "Nothing was
+   * changed."). Built from the proposals, never from the reply — see
+   * pendingChanges.stagedLine. Present on in-session replies.
+   */
+  note?: string;
+}
+
+/** What the last Design Helper turn really did — read by The Stable Hand, which must
+ *  report this and not the model's own account of it. */
+export interface StudioTurnRecord {
+  pageId: string;
+  /** Changes this turn staged. */
+  added: number;
+  /** Everything waiting on that page now. */
+  onPage: number;
+  /** The deterministic line (the server's, else the panel's own). */
+  line: string;
+  /** The reply says it changed something while the turn staged nothing. */
+  claimedWithoutChange: boolean;
+  at: number;
 }
 
 /** Map a persisted server chat message into the in-store shape. */
@@ -73,7 +139,9 @@ export interface PreviewDoc {
 type UndoOp =
   | { op: 'update'; pageId: string; elementId: string; before: MagazineElement; after: MagazineElement }
   | { op: 'add'; pageId: string; element: MagazineElement }
-  | { op: 'delete'; pageId: string; element: MagazineElement };
+  | { op: 'delete'; pageId: string; element: MagazineElement }
+  /** The page's own background — both ends are what the server stored. */
+  | { op: 'background'; pageId: string; before: MagazinePageV2['background']; after: MagazinePageV2['background'] };
 
 /** One Ctrl+Z's worth of work: a single edit, or every write of one AI apply. */
 interface UndoEntry {
@@ -115,22 +183,128 @@ interface EditorState {
   /** null = a new, not-yet-created chat: the first turn creates it server-side. */
   activeThreadId: string | null;
   loadThreads: () => Promise<void>;
-  /** Switch the transcript to a thread. Discards staged proposals — they belong to
-   *  a turn, and applying them from a different conversation would be a surprise. */
+  /** Switch the transcript to a thread. Staged changes are NOT touched: they belong to
+   *  their PAGE, not to a conversation, and switching chats used to throw them away. */
   openThread: (threadId: string) => Promise<void>;
   /** A blank chat. Nothing is written until the first message is sent. */
   newThread: () => void;
   renameThread: (threadId: string, title: string) => Promise<void>;
   removeThread: (threadId: string) => Promise<void>;
+  /**
+   * EVERY staged change waiting for Apply, by page id — the source of truth.
+   *
+   * Changes accumulate across messages and across pages, survive page switches, and
+   * are saved per magazine in this browser (localStorage), so a reload keeps them. A
+   * set leaves only by being applied (or refused by the server on apply), by being
+   * discarded — which offers "Bring back" — or with its page.
+   */
+  pending: PendingByPage;
+  /**
+   * The OPEN page's waiting changes (a mirror of `pending[currentPageId]`), and that
+   * page's id when it has any. Kept so everything that read the single tray — the
+   * panel's tray, the page rail's marker, The Stable Hand — still reads the right
+   * thing for the page on screen. Never written on its own: every write goes through
+   * `pending`, and these follow.
+   */
   proposals: AgentProposal[];
   proposalsPageId: string | null;
+  /** "Use these changes" (one page) or "Apply all" is running. The buttons are
+   *  disabled meanwhile, and an automation waits on this rather than on the tray
+   *  emptying — a page build that could not start yet stays waiting. */
+  applyingProposals: boolean;
+  /**
+   * Apply every page's waiting changes, in page order — or only `onlyPageId`'s. Each
+   * page is opened in turn (its own rev), its set applied as on its own tray, and one
+   * Ctrl+Z takes the element edits of the whole run back. Resolves with what happened
+   * on each page (also kept as `lastApplyReport`); null when it could not start.
+   */
+  applyAllWaiting: (onlyPageId?: string) => Promise<PageApplyReport[] | null>;
+  /** Per page, what the last apply did. */
+  lastApplyReport: PageApplyReport[] | null;
+  /**
+   * Throw away waiting changes — one page's, or every page's when no id is given.
+   * The toast offers "Bring back" for a while, so a slip loses nothing. Returns how
+   * many were discarded.
+   */
+  discardWaiting: (pageId?: string) => number;
+  /** What the last Design Helper turn really staged (see StudioTurnRecord). */
+  lastTurn: StudioTurnRecord | null;
+  /**
+   * What the last page build asked to write FROM documents was really given, as the
+   * server echoed it (null for a build without documents, or before any). Lets a
+   * caller say "written from Results.pdf" only when the server took that document.
+   */
+  lastBuildSources: api.BuildSources | null;
+  /**
+   * Set the OPEN page's background — a colour, a library picture, or none. One undo
+   * step, rev-guarded like an element write. False when the server refused it (said
+   * in a toast).
+   */
+  setPageBackground: (background: PageBackgroundInput) => Promise<boolean>;
+  /**
+   * The page check the last turn came back with: what its changes would leave wrong
+   * on the page (text cut off, a hidden picture…). Only ever NEW errors — the server
+   * leaves out what was already wrong before the turn. Shown as the panel's
+   * "N problems · Fix" chip while `lastCheckPageId` is the open page.
+   */
+  lastCheck: PageCheck | null;
+  lastCheckPageId: string | null;
+  /** The changes the check describes have been applied (the chip says "on this
+   *  page" rather than "after these changes"). */
+  lastCheckApplied: boolean;
+  /** Hide the problems chip (the user has seen it, or moved on). */
+  dismissCheck: () => void;
+  /**
+   * Bumped whenever this tab stores a document or picture in the magazine's
+   * libraries. The PDF pickers and the Uploads tab re-read on it, so a PDF sent in
+   * chat shows up in "Copy a page exactly" without a reload.
+   */
+  uploadsVersion: number;
+  noteUploadsChanged: () => void;
   /** When set, the right pane shows this attachment instead of the Inspector. */
   previewDoc: PreviewDoc | null;
   setPreviewDoc: (d: PreviewDoc | null) => void;
-  sendChat: (text: string, sourceText?: string, attachedImages?: api.AttachedImage[], attachments?: ChatAttachmentRef[]) => Promise<void>;
+  sendChat: (
+    text: string,
+    sourceText?: string,
+    attachedImages?: api.AttachedImage[],
+    attachments?: ChatAttachmentRef[],
+    extras?: { attachedDocs?: api.AttachedDoc[] },
+  ) => Promise<void>;
   loadOlderChat: () => Promise<void>;
+  /** "Use these changes": apply the OPEN page's waiting changes. */
   applyAllProposals: () => Promise<void>;
+  /** "Don't use these": discard the open page's waiting changes (with "Bring back"). */
   discardProposals: () => void;
+  /**
+   * Pages a PDF copy staged in chat ('copy-document-page') is being written to right
+   * now. The copy runs in the worker; the store follows it (see followPageCopy) until
+   * the copied page is on screen, and an automation waits on this list emptying.
+   */
+  copyingPageIds: string[];
+  /**
+   * Draw a chart from exact numbers (POST …/chart) and put it on the OPEN page as one
+   * undoable step: an add, or — with `replaceElementId`, or an empty picture slot the
+   * server chose — a patch of that picture (any other element is swapped for it).
+   * Null when it was not placed (the reason is toasted). `dataEcho` lists every number
+   * as drawn, to check against what the user gave.
+   */
+  placeChart: (
+    chart: ChartSpec,
+    opts?: { box?: { x: number; y: number; w: number; h: number }; replaceElementId?: string },
+  ) => Promise<{ elementId: string; dataEcho: string } | null>;
+  /**
+   * Replace a word or name across every page the user may edit (POST …/replace-text).
+   * With `dryRun` it only counts. When it really replaced, the pages it rewrote are
+   * re-read — the server wrote them, so the canvas and the rail would otherwise keep
+   * showing the old words and every later edit there would be refused as stale.
+   * Null when the request failed (toasted).
+   */
+  /** A magazine-wide find and replace (POST …/replace-text). After a real run the
+   *  changes waiting for Apply get the same replacement (`waitingUpdated` counts them),
+   *  so applying them later cannot write the old words back. Refused (null, with a
+   *  toast) while a Design Helper turn is in flight. */
+  replaceTextInMagazine: (body: { find: string; replace: string; matchCase?: boolean; wholeWord?: boolean; dryRun?: boolean }) => Promise<(api.ReplaceTextResult & { waitingUpdated?: number }) | null>;
 
   /**
    * Full page data for the thumbnail rail, keyed by pageId.
@@ -204,7 +378,13 @@ interface EditorState {
   batchEdits: <T>(label: string, fn: () => Promise<T>) => Promise<T>;
 
   addPage: () => Promise<void>;
-  generatePages: (count: number, topic?: string, atIndex?: number) => Promise<void>;
+  /**
+   * Start an AI page build. False when it did not start — a build is already
+   * running (said in a toast: it used to return silently, so a staged "design 2 new
+   * pages" was reported applied and never happened) or the request was refused.
+   * `docIds` = documents to write the new pages from.
+   */
+  generatePages: (count: number, topic?: string, atIndex?: number, docIds?: string[]) => Promise<boolean>;
   duplicatePage: (pageId: string) => Promise<void>;
   deletePage: (pageId: string) => Promise<void>;
   reorder: (from: number, to: number) => Promise<void>;
@@ -272,6 +452,14 @@ interface EditorState {
 }
 
 const el = (p: MagazinePageV2 | null, id: string | null) => p?.elements.find((e) => e.id === id) ?? null;
+
+/** A page's number as the canvas prints it (its index + 1), or 0 when it is not in
+ *  the list. Never its POSITION in `pages`: a contributor shared only page 3 holds a
+ *  one-item list, and position 1 is not "page 1". */
+const pageNumberIn = (pages: PageSummary[], pageId: string | null | undefined): number => {
+  const p = pageId ? pages.find((x) => x.id === pageId) : undefined;
+  return p ? p.index + 1 : 0;
+};
 
 /**
  * Merge a META-ONLY issue response into state.
@@ -393,6 +581,62 @@ function scrollToPage(pageId: string, tries = 3): void {
   if (tries > 0) requestAnimationFrame(() => scrollToPage(pageId, tries - 1));
 }
 
+/**
+ * The page an apply is writing to, while it writes.
+ *
+ * Every element write goes to the OPEN page, and each is a round trip. The canvas's
+ * scroll-settle picker opens whatever page is centred, so a scroll during an apply
+ * used to move the open page and the rest of the set was refused half way. While
+ * this is set, only that page (or a forced re-read) may be opened; the picker's
+ * next settle after the apply catches up with the scroll.
+ */
+let pinnedPageId: string | null = null;
+
+/**
+ * How the last applyLayout call ended. Its caller (applying a staged rebuild) has to
+ * tell "the user said no at the confirm" — the rebuild stays waiting — from "it ran"
+ * and from "it failed" (the reason was already toasted; it also stays waiting, to
+ * try again or discard). applyLayout itself returns only the fidelity or null.
+ */
+let layoutOutcome: 'declined' | 'failed' | 'done' = 'done';
+
+/** The waiting changes this browser kept for a magazine. Never throws: storage can be
+ *  missing (private mode), full or corrupt, and none of that may stop a magazine
+ *  from opening. */
+function loadPending(issueId: string): PendingByPage {
+  try {
+    if (typeof localStorage === 'undefined') return {};
+    return parsePending(localStorage.getItem(pendingStorageKey(issueId)), { now: Date.now() });
+  } catch {
+    return {};
+  }
+}
+
+/** Keep a magazine's waiting changes in this browser (removed when there are none). */
+function savePending(issueId: string, map: PendingByPage): void {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    const key = pendingStorageKey(issueId);
+    if (pendingTotal(map) === 0) {
+      localStorage.removeItem(key);
+      return;
+    }
+    const raw = serializePending(map, Date.now());
+    // Too large to keep: leave the stored copy as it was rather than erase it. The
+    // set still lives in memory for this session.
+    if (raw) localStorage.setItem(key, raw);
+  } catch {
+    /* quota or a blocked storage — the set still lives in memory for this session */
+  }
+}
+
+/** A state update that replaces the waiting-changes map and keeps the open page's
+ *  tray (`proposals` / `proposalsPageId`) in step with it. */
+const withPending = (st: Pick<EditorState, 'currentPageId'>, pending: PendingByPage): Partial<EditorState> => ({
+  pending,
+  ...trayFor(pending, st.currentPageId),
+});
+
 export const useEditorStore = create<EditorState>((set, get) => ({
   issueId: null,
   issue: null,
@@ -420,8 +664,20 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   chatHasMore: false,
   chatOldest: null,
   chatLoadingOlder: false,
+  pending: {},
   proposals: [],
   proposalsPageId: null,
+  applyingProposals: false,
+  lastApplyReport: null,
+  lastTurn: null,
+  lastBuildSources: null,
+  lastCheck: null,
+  lastCheckPageId: null,
+  lastCheckApplied: false,
+  dismissCheck: () => set({ lastCheck: null, lastCheckPageId: null, lastCheckApplied: false }),
+  uploadsVersion: 0,
+  noteUploadsChanged: () => set((st) => ({ uploadsVersion: st.uploadsVersion + 1 })),
+  copyingPageIds: [],
   previewDoc: null,
   setPreviewDoc: (d) => set({ previewDoc: d }),
   thumbs: {},
@@ -460,10 +716,28 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     // chatBusy/formatBusy are reset here too: they belong to a turn or a pass on the
     // magazine we are LEAVING, and an in-flight one whose response is discarded (see
     // sendChat) would otherwise leave the new magazine's composer disabled forever.
-    set({ loading: true, error: null, issueId: id, generating: false, adding: false, justGenerated: false, currentPageId: null, page: null, chat: [], proposals: [], proposalsPageId: null, editedSinceLoad: false, thumbs: {}, chatBusy: false, formatBusy: false, layoutBusy: false });
+    //
+    // The waiting changes this browser kept for THIS magazine come back here, before
+    // anything else, so a reload never loses them (and the save that follows every
+    // change to `pending` writes back exactly what was read).
+    set({ loading: true, error: null, issueId: id, generating: false, adding: false, justGenerated: false, currentPageId: null, page: null, chat: [], pending: loadPending(id), proposals: [], proposalsPageId: null, lastApplyReport: null, lastTurn: null, lastBuildSources: null, editedSinceLoad: false, thumbs: {}, chatBusy: false, formatBusy: false, layoutBusy: false, applyingProposals: false, lastCheck: null, lastCheckPageId: null, lastCheckApplied: false, copyingPageIds: [] });
     try {
       const { issue, pages } = await api.getIssue(id);
+      if (get().issueId !== id) return;
       set({ issue, pages, loading: false, undoStack: [], redoStack: [], selectedId: null });
+      // Changes kept for pages that are no longer in the magazine can never land.
+      // (Not while the list is empty — a magazine still uploading has no pages yet.)
+      if (pages.length > 0) {
+        const gone = orphanPageIds(get().pending, pages);
+        if (gone.length > 0) set((st) => withPending(st, withoutPages(st.pending, gone)));
+      }
+      // Say what is still waiting from before, once, so a set kept across a reload is
+      // not discovered by accident on Apply.
+      const kept = waitingPages(get().pending, pages);
+      if (kept.length > 0) {
+        const n = kept.reduce((sum, w) => sum + w.proposals.length, 0);
+        toast.message(`${changeCount(n)} from the Design Helper ${n === 1 ? 'is' : 'are'} still waiting for Apply on ${pagesPhrase(kept.map((w) => w.page))}.`);
+      }
       if (pages[0]) await get().openPage(pages[0].id);
       // Load the conversation list and open the most recent one — the behaviour of
       // every chat app: you come back to where you left off. Best-effort; a chat
@@ -496,6 +770,9 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     // tab) would needlessly refetch and reset selection — skip it, unless the
     // caller explicitly wants the page re-read (see `force` on the interface).
     if (!force && get().currentPageId === pageId && get().page) return;
+    // An apply is writing to another page right now (see pinnedPageId) — unless that
+    // page has just been deleted, when the editor must be free to land elsewhere.
+    if (!force && pinnedPageId && pageId !== pinnedPageId && get().pages.some((p) => p.id === pinnedPageId)) return;
     const ticket = ++openSeq;
     try {
       const page = await api.getPage(issueId, pageId);
@@ -508,11 +785,9 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       // Proposals used to be cleared here, which was defensible when a page change
       // meant a deliberate click — but the canvas's scroll-settle picker calls this
       // on every scroll, so asking the assistant for changes and then scrolling up
-      // to look at the page silently threw them away. They stay: the tray is gated
-      // on `proposalsPageId === currentPageId`, so it hides while you are elsewhere
-      // and comes back when you return, and applyAllProposals refuses to apply a
-      // set that belongs to another page. Cleared per-issue in load(), and per
-      // conversation in openThread/newThread.
+      // to look at the page silently threw them away. They are kept per page now
+      // (`pending`): the tray shows the page on screen's own set, and every other
+      // page's set waits in the bar until Apply all or Discard.
       //
       // A stale selectedId harmlessly resolves to nothing on a page that doesn't
       // contain it (every consumer looks it up on the current page). previewDoc is
@@ -526,6 +801,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
         page,
         currentPageId: pageId,
         thumbs: { ...st.thumbs, ...(st.page ? { [st.page.id]: st.page } : {}), [pageId]: page },
+        ...trayFor(st.pending, pageId),
       }));
     } catch (e) {
       if (ticket !== openSeq || get().issueId !== issueId) return;
@@ -725,16 +1001,32 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     }
   },
 
-  generatePages: async (count, topic, atIndex) => {
+  generatePages: async (count, topic, atIndex, docIds) => {
     const { issueId, generating } = get();
-    if (!issueId || generating) return;
-    set({ generating: true, adding: true });
+    if (!issueId) return false;
+    // SAY it, rather than returning quietly. Only one build runs at a time, and a
+    // silent bail is how a staged "design 2 new pages" came to be reported applied
+    // while nothing was ever made.
+    if (generating || get().issue?.status === 'processing') {
+      toast.warning('A page build is already running — try again once it finishes.');
+      return false;
+    }
+    set({ generating: true, adding: true, lastBuildSources: null });
     try {
-      await api.generatePages(issueId, count, topic || undefined, atIndex);
+      const started = await api.generatePages(issueId, count, topic || undefined, atIndex, docIds);
+      if (get().issueId === issueId) set({ lastBuildSources: started.fromDocuments ?? null });
+      // Some of the documents had no readable text (a scan, or still being read): the
+      // pages are written from the others. Said now, not discovered in the pages later.
+      const skipped = started.fromDocuments?.skipped ?? [];
+      if (skipped.length > 0) {
+        toast.warning(
+          `${skipped.map((n) => `“${n}”`).join(', ')} ${skipped.length === 1 ? 'has' : 'have'} no readable text yet, so the new pages are written from the other document${started.fromDocuments!.used === 1 ? '' : 's'}.`,
+        );
+      }
     } catch (e) {
       set({ generating: false, adding: false });
       toast.error(e instanceof Error ? e.message : 'Failed to start generation');
-      return;
+      return false;
     }
     toast.message('Designing new pages…');
     // Poll until the issue settles out of 'processing' — NO wall-clock cap. The
@@ -783,6 +1075,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       }
     };
     genPoll = setTimeout(() => void tick(), 1500);
+    return true;
   },
 
   duplicatePage: async (pageId) => {
@@ -803,8 +1096,16 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     const finish = async (pages: PageSummary[]) => {
       // The page is gone, so its stack entries can never be replayed — and undo now
       // re-creates elements, so leaving them would have it try to restore an element
-      // onto a page that no longer exists.
-      set((st) => ({ pages, editedSinceLoad: true, undoStack: withoutPage(st.undoStack, pageId), redoStack: withoutPage(st.redoStack, pageId) }));
+      // onto a page that no longer exists. Its waiting changes go with it, said aloud.
+      const lost = pendingFor(get().pending, pageId).length;
+      set((st) => ({
+        pages,
+        editedSinceLoad: true,
+        undoStack: withoutPage(st.undoStack, pageId),
+        redoStack: withoutPage(st.redoStack, pageId),
+        ...withPending(st, withoutPages(st.pending, [pageId])),
+      }));
+      if (lost > 0) toast.message(`The ${changeCount(lost)} waiting for Apply on that page went with it.`);
       if (get().currentPageId === pageId && pages[0]) await get().openPage(pages[0].id);
     };
     try {
@@ -906,8 +1207,9 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     try {
       const { issue, pages } = await api.resetIssue(s.issueId);
       // thumbs are cleared with everything else: reset() destroys every page, and a
-      // stale tile for a page that no longer exists would be a ghost in the rail.
-      set({ issue, pages, selectedId: null, undoStack: [], redoStack: [], proposals: [], proposalsPageId: null, thumbs: {} });
+      // stale tile for a page that no longer exists would be a ghost in the rail. The
+      // same goes for changes waiting on those pages — none of them exist any more.
+      set({ issue, pages, selectedId: null, undoStack: [], redoStack: [], pending: {}, proposals: [], proposalsPageId: null, thumbs: {}, lastCheck: null, lastCheckPageId: null, lastCheckApplied: false });
       if (pages[0]) await get().openPage(pages[0].id);
       toast.success('Reset to a blank page.');
     } catch (e) {
@@ -1024,6 +1326,8 @@ export const useEditorStore = create<EditorState>((set, get) => ({
    * put it.
    */
   applyLayout: async (reading, targetPageId, fit = 'exact') => {
+    // Every early return below is a failure unless it says otherwise (see layoutOutcome).
+    layoutOutcome = 'failed';
     const s = get();
     if (!s.issueId || !s.page || s.layoutBusy) return null;
     const issueId = s.issueId;
@@ -1043,10 +1347,34 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       return null;
     }
     const isOpen = pageId === s.page.id;
-    // The open page's own element array is authoritative; for any other page the rail
-    // summary is what we have, and it carries both the rev and the element count.
-    const rev = isOpen ? s.page.rev : summary!.rev;
-    const count = isOpen ? s.page.elements.length : summary!.elementCount;
+    // The open page's own element array is authoritative. Any OTHER page is read
+    // fresh, here, before the confirm.
+    //
+    // It used to take the rev from the rail summary — and element writes bump only the
+    // OPEN page's rev, never its summary. So a page edited earlier in the session ("do
+    // page 2 like this" after working on page 2, then moving on) sent a stale rev and
+    // was refused with a 409 every time, until a reload. The fresh read also makes the
+    // confirm's item count true; the server's own rev check still catches a real
+    // concurrent edit.
+    let rev: number;
+    let count: number;
+    if (isOpen) {
+      rev = s.page.rev;
+      count = s.page.elements.length;
+    } else {
+      const target = await api.getPage(issueId, pageId).catch(() => null);
+      if (!target) {
+        toast.error('Couldn’t read that page just now — check your connection, then try again.');
+        return null;
+      }
+      if (get().issueId !== issueId) return null;
+      rev = target.rev;
+      count = target.elements.length;
+      set((st) => ({
+        pages: st.pages.map((p) => (p.id === pageId ? { ...p, rev: target.rev, elementCount: target.elements.length } : p)),
+        thumbs: { ...st.thumbs, [pageId]: target },
+      }));
+    }
     // THE CONFIRM LIVES HERE, not in the panel that used to own it. A rebuild replaces
     // every element and the undo stack cannot cover it, and there are two ways to reach
     // it: the reference panel and the assistant staging `apply-layout` in chat. With the
@@ -1063,7 +1391,10 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     const ok = window.confirm(
       `Rebuild ${where} to match that reference?\n\nThe page is cleared and recreated in the image's design — fresh words are written for your magazine, and the page's photos are re-used where the layout wants pictures. Its current ${count} item${count === 1 ? '' : 's'} are replaced and cannot be brought back with undo.`,
     );
-    if (!ok) return null;
+    if (!ok) {
+      layoutOutcome = 'declined';
+      return null;
+    }
     set({ layoutBusy: true });
     try {
       const { page, leftOver, fidelity, warning, tightSummary } = await api.applyLayoutToPage(issueId, pageId, { rev, reading, fit });
@@ -1103,13 +1434,20 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       // the WRITING rather than the layout, and it is the one thing here the user can
       // actually fix. It used to be a 422 quoting an element id at them.
       if (tightSummary) toast.warning(tightSummary);
+      layoutOutcome = 'done';
       return fidelity;
     } catch (e) {
       // A 409 carries the server's current page: adopt it so the user is looking at
-      // what actually exists before they try again.
+      // what actually exists before they try again — and put its rev on the SUMMARY
+      // and the rail's copy too, or a retry from another page would send the same
+      // stale rev and be refused again.
       if (e instanceof ApiError && e.status === 409 && e.body?.page) {
         const fresh = e.body.page as MagazinePageV2;
-        set((st) => (st.currentPageId === pageId ? { page: fresh } : {}));
+        set((st) => ({
+          ...(st.currentPageId === pageId ? { page: fresh } : {}),
+          pages: st.pages.map((p) => (p.id === pageId ? { ...p, rev: fresh.rev, elementCount: fresh.elements.length } : p)),
+          thumbs: { ...st.thumbs, [pageId]: fresh },
+        }));
         toast.error('This page changed while you were choosing a layout — have another look, then try again.');
         return null;
       }
@@ -1354,7 +1692,10 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     // Clear the transcript FIRST. Loading over the old one would leave another
     // conversation on screen for the length of the fetch, and the user would read it
     // as belonging to the thread they just clicked.
-    set({ activeThreadId: threadId, chat: [], chatHasMore: false, chatOldest: null, proposals: [], proposalsPageId: null });
+    //
+    // The staged changes (and the check that describes them) stay: they wait on their
+    // PAGE, not in a conversation. Opening a chat used to throw them away.
+    set({ activeThreadId: threadId, chat: [], chatHasMore: false, chatOldest: null });
     try {
       const t = await api.listThreadMessages(id, threadId, { limit: 50 });
       set((st) => (st.issueId === id && st.activeThreadId === threadId
@@ -1373,8 +1714,9 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   },
 
   // No server call: an empty chat that nobody has spoken in isn't worth a document.
-  // The first turn creates it and adopts the id the server returns.
-  newThread: () => set({ activeThreadId: null, chat: [], chatHasMore: false, chatOldest: null, proposals: [], proposalsPageId: null }),
+  // The first turn creates it and adopts the id the server returns. Waiting changes
+  // stay with their pages (see openThread).
+  newThread: () => set({ activeThreadId: null, chat: [], chatHasMore: false, chatOldest: null }),
 
   renameThread: async (threadId, title) => {
     const id = get().issueId;
@@ -1408,7 +1750,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   },
 
   // ── AI editing assistant ──
-  sendChat: async (text, sourceText, attachedImages, attachments) => {
+  sendChat: async (text, sourceText, attachedImages, attachments, extras) => {
     const s = get();
     const body = text.trim();
     if (!body || !s.issueId || !s.currentPageId || s.chatBusy) return;
@@ -1420,6 +1762,20 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     const issueId = s.issueId;
     const forPageId = s.currentPageId;
     const forThreadId = s.activeThreadId;
+    /**
+     * The changes still waiting in the tray for THIS page go with the turn.
+     *
+     * "Make the headline bigger" → staged; "and make it red" → the second turn used to
+     * be built from the STORED page and its list replaced the tray, so the bigger
+     * headline vanished without a word. The server replays these onto its working
+     * copy, so the new turn builds on them and returns the combined set. Capped like
+     * the server caps them.
+     */
+    const pending = pendingFor(s.pending, forPageId).slice(0, MAX_SENT_PER_TURN);
+    // The page as the turn is built from it — what each text edit it stages is written
+    // against. Read NOW, not when the reply lands: a word typed into a box while the turn
+    // runs is exactly the edit Apply must not overwrite unseen.
+    const sentElements = s.page?.id === forPageId ? s.page.elements : s.thumbs[forPageId]?.elements;
     set({ chat: [...s.chat, { role: 'user', content: body, attachments }], chatBusy: true });
     /**
      * Is this reply still wanted?
@@ -1440,7 +1796,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     try {
       // ONE turn, plus the thread id. The server reads the rest of the history from
       // the thread itself — the client's transcript is for display, not the prompt.
-      const { reply, proposals, threadId } = await api.chatAgent(
+      const turn = await api.chatAgent(
         issueId,
         forPageId,
         [{ role: 'user', content: body }],
@@ -1448,20 +1804,104 @@ export const useEditorStore = create<EditorState>((set, get) => ({
         sourceText,
         attachedImages,
         forThreadId ?? undefined,
+        // `baseText` is this client's own bookkeeping (the words a text edit was staged
+        // against) — the server has no use for it, so it stays here.
+        { pendingProposals: pending.map(({ baseText: _base, ...p }) => p), attachedDocs: extras?.attachedDocs },
       );
+      const { reply, threadId } = turn;
       if (!stillOurs()) {
         if (sameIssue()) set({ chatBusy: false });
         return;
       }
+      // Combine with what is ALREADY waiting on this page, read at the moment the reply
+      // lands. The tray's buttons are disabled during a turn, but an automation can
+      // still discard or apply underneath it — and a change applied meanwhile must not
+      // come back in the reply to be applied twice (withoutSettled, inside
+      // accumulateTurn). Other pages' waiting changes are never touched: a turn on page
+      // 8 used to replace the tray that held page 7's.
+      const now = get();
+      const result = accumulateTurn({
+        map: now.pending,
+        pageId: forPageId,
+        sent: pending,
+        reply: Array.isArray(turn.proposals) ? turn.proposals : [],
+        serverMerged: turn.pendingMerged,
+        turnTag: `t${Date.now().toString(36)}`,
+        // So each new text edit remembers the words it was written against (Apply holds
+        // it back if the box is edited in between).
+        elements: sentElements,
+      });
+      // THE LINE UNDER THE REPLY, from the proposals and never from the reply. A reply
+      // once said "All six paragraphs are 20px…" after calling no tool at all; this
+      // line would have said "Nothing was changed". The server writes its own when it
+      // can; only this client knows what waits on OTHER pages, so that tail is ours.
+      const others = waitingPages(result.map, now.pages).filter((w) => w.pageId !== forPageId);
+      const claimed = claimsChange(reply);
+      // `staged.line` is what the server sends; `stagedLine` was this client's name for
+      // it before the two met, read only as a fallback.
+      const serverLine =
+        typeof turn.staged?.line === 'string' ? turn.staged.line.trim() : typeof turn.stagedLine === 'string' ? turn.stagedLine.trim() : '';
+      const tail = otherPagesTail(others).trim();
+      const line = serverLine
+        ? `${serverLine}${tail && !/Also waiting:/.test(serverLine) ? ` ${tail}` : ''}`
+        : stagedLine({ added: result.added, pageNumber: pageNumberIn(now.pages, forPageId), onPage: result.onPage.length, others, claimed });
+      // Not twice: a reply the server already ended with its line gets only the tail.
+      // A bare "Nothing was changed." under a reply that already says so in its own
+      // words ("nothing was changed on the page") is the same sentence twice, too. Only
+      // the bare line: one that also says what is still waiting adds something.
+      const saysNothingChanged = /^Nothing was changed\.?$/i.test(serverLine) && /\bnothing (?:was|has been) changed\b/i.test(reply);
+      const alreadySaid = (serverLine && (reply.includes(serverLine) || saysNothingChanged)) || (!serverLine && hasStagedLine(reply));
+      const note = alreadySaid ? tail || undefined : line;
       set((st) => ({
-        chat: [...st.chat, { role: 'assistant', content: reply }],
-        proposals,
-        proposalsPageId: forPageId,
+        chat: [...st.chat, { role: 'assistant', content: reply, ...(note ? { note } : {}) }],
+        ...withPending(st, result.map),
         chatBusy: false,
+        lastTurn: {
+          pageId: forPageId,
+          added: result.added.length,
+          onPage: result.onPage.length,
+          line,
+          claimedWithoutChange: claimed && result.added.length === 0,
+          at: Date.now(),
+        },
+        // The page check comes back only when this turn's changes leave NEW errors.
+        // No check = nothing new is wrong, so an older chip goes too — unless the
+        // page's set was KEPT exactly as it was (a question, from a server that does
+        // not replay the waiting changes): the old check still describes those changes.
+        ...(turn.check
+          ? { lastCheck: turn.check, lastCheckPageId: forPageId, lastCheckApplied: false }
+          : result.mode === 'kept'
+            ? {}
+            : { lastCheck: null, lastCheckPageId: null, lastCheckApplied: false }),
         // Adopt the thread the server used — on the first turn of a new chat this is
         // the id it just created. Without this, every turn would start another one.
         activeThreadId: threadId || st.activeThreadId,
       }));
+      // A replaying server's list is the page's set from now on. Anything waiting that
+      // it left out WITHOUT a replacement is named — usually the user asked to drop it,
+      // but a server that does not know a kind yet drops it too — and can come back.
+      if (result.droppedList.length > 0) {
+        const lost = result.droppedList;
+        // The server says WHY it could not keep a change (its element is gone, or now
+        // locked) — worth one clause, since "Bring back" will not help with those.
+        const why = (turn.pendingDropped ?? []).find((d) => lost.some((p) => p.id === d.id) && d.reason)?.reason;
+        toast.message(
+          `The Design Helper took ${lost.length === 1 ? 'this waiting change' : `${changeCount(lost.length)} waiting`} off this page: ${lost
+            .slice(0, 2)
+            .map((p) => `“${p.summary}”`)
+            .join(', ')}${lost.length > 2 ? ` and ${lost.length - 2} more` : ''}${why ? ` (${why.replace(/[.\s]+$/, '')})` : ''}.`,
+          {
+            duration: 12_000,
+            action: {
+              label: 'Bring back',
+              onClick: () => {
+                if (get().issueId !== issueId || !get().pages.some((p) => p.id === forPageId)) return;
+                set((st) => withPending(st, withPage(st.pending, forPageId, foldChanges([...lost, ...pendingFor(st.pending, forPageId)]))));
+              },
+            },
+          },
+        );
+      }
       // Refresh the list so the new/renamed thread appears with its real title and
       // sorts to the top. Cheap, and it keeps the list honest without a socket.
       void get().loadThreads();
@@ -1510,167 +1950,741 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     }
   },
 
-  // Apply every staged proposal in order through the rev-guarded CRUD. 'add'
-  // proposals return the server id, remapped so later proposals that referenced
-  // the temp id resolve. Each write bumps the page rev (handled by the reused
-  // store methods), so sequential awaits keep the token current.
+  // "Use these changes": the OPEN page's waiting changes, through the rev-guarded
+  // CRUD (applyPageSet). Apply all runs the same thing page by page.
   applyAllProposals: async () => {
     const s = get();
-    if (!s.page || s.proposalsPageId !== s.currentPageId || s.proposals.length === 0 || !s.issueId) return;
-    const issueId = s.issueId;
-    /** The page these proposals were written FOR — re-checked before every write. */
-    const forPageId = s.currentPageId;
-    const idMap = new Map<string, string>();
-    const isPageKind = (k: AgentProposal['kind']) => k === 'add-page' || k === 'remove-page' || k === 'reorder-page' || k === 'generate-pages';
-
-    // A layout rebuild replaces every element on the page, so it can never be mixed
-    // with element edits — the agent's tools refuse the combination at staging time
-    // (see hasLayout in agent.ts), and this handles it on its own rather than trying
-    // to interleave it with edits that would be applied to elements it destroyed.
-    const layout = s.proposals.find((p) => p.kind === 'apply-layout');
-    if (layout) {
-      const reading = layout.layoutReading as api.LayoutReading | undefined;
-      set({ proposals: [], proposalsPageId: null });
-      if (!reading) {
-        toast.error('That layout could not be applied — ask the assistant to read the image again.');
-        return;
-      }
-      // Straight through the same store action the panel uses, and the confirm now
-      // genuinely lives in there — this comment used to claim a shared confirm while the
-      // only one was in LayoutReference.tsx, so a chat rebuild asked nothing at all.
-      // `pageId` is set only when the user NAMED a page; the server resolved the ordinal
-      // against the real page order, so this is an id and not an index that could have
-      // drifted since the assistant answered.
-      await get().applyLayout(reading, layout.pageId);
-      return;
+    // Not while a turn is running: that turn was sent these changes and builds on
+    // them — applying underneath it would race the reply.
+    if (!s.page || !s.currentPageId || !s.issueId || s.applyingProposals || s.chatBusy) return;
+    if (pendingFor(s.pending, s.currentPageId).length === 0) return;
+    set({ applyingProposals: true });
+    let report: PageApplyReport | null = null;
+    try {
+      report = await applyPageSet(set, get, false);
+    } finally {
+      pinnedPageId = null;
+      set({ applyingProposals: false, lastApplyReport: report ? [report] : [] });
     }
+  },
 
-    // Refusals are COUNTED, not just survived. Each loop keeps going after a failure
-    // (one bad proposal shouldn't strand the rest), but the toast at the end has to
-    // reflect what actually happened: since the submissions flow landed, a page op can
-    // legitimately be refused — a submitted page, a published draft — and reporting
-    // "Applied the assistant's changes" over a swallowed 409 tells the user their
-    // magazine changed when it did not.
-    let refused = 0;
-    let applied = 0;
-
-    // 1) Element edits on the current page (rev-guarded CRUD; add → id remap).
-    //
-    // The whole apply is ONE undo entry. This is the fix for "we can't undo what the
-    // AI does": the writes were always going through the undoable CRUD, but a turn
-    // that swaps a photo (delete + add) or rewrites five blocks landed as five
-    // separate entries — or, for add/delete, as none at all, because only `update`
-    // used to be recorded. Now every element write is reversible and the user takes
-    // the assistant's turn back with the one Ctrl+Z they expect.
-    // Every write below is judged by its RETURN VALUE, not by whether it threw.
-    // These store actions absorb their own errors (that is how a conflict reconciles
-    // instead of exploding), so they never reject — which made the try/catch that
-    // used to wrap them dead code, `refused` permanently 0, and the closing toast
-    // "Applied the assistant's changes" a flat untruth over an apply where every
-    // single write had been refused.
-    //
-    // An 'add' that fails also has to STOP the proposals that depended on it: with no
-    // id in the map, a later update/delete naming the temp id would be sent to the
-    // server as if it were real, get refused for a different reason, and be counted
-    // twice. Its dependants are counted once, here, and never sent.
-    const dead = new Set<string>();
-    await get().batchEdits('the assistant’s changes', async () => {
-      for (const p of s.proposals.filter((x) => !isPageKind(x.kind))) {
-        // The page under us MUST NOT move mid-apply. Each write is a round trip, and
-        // the canvas's scroll-settle picker can make another page active while they
-        // run — at which point the remaining proposals, written for this page, would
-        // be applied to that one. Stop instead, and count the rest as refused.
-        if (get().currentPageId !== forPageId) { refused++; continue; }
-        if (p.kind === 'add' && p.element) {
-          const newId = await get().addElement(p.element);
-          if (!newId) { refused++; if (p.tempId) dead.add(p.tempId); continue; }
-          if (p.tempId) idMap.set(p.tempId, newId);
-          applied++;
-        } else if (p.kind === 'update' && p.elementId && p.patch) {
-          if (dead.has(p.elementId)) { refused++; continue; }
-          if (await get().commit(idMap.get(p.elementId) ?? p.elementId, p.patch)) applied++;
-          else refused++;
-        } else if (p.kind === 'delete' && p.elementId) {
-          if (dead.has(p.elementId)) { refused++; continue; }
-          if (await get().deleteElement(idMap.get(p.elementId) ?? p.elementId)) applied++;
-          else refused++;
-        }
+  /**
+   * APPLY ALL: every page's waiting changes, in page order.
+   *
+   * Each page is opened in turn — every write goes to the open page, with that page's
+   * own rev — and its set is applied exactly as its own tray's "Use these changes"
+   * would (applyPageSet, quiet: one toast at the end instead of one per page). The
+   * confirms still ask, per page, before anything that cannot be undone. The element
+   * edits of the whole run are ONE undo entry.
+   */
+  applyAllWaiting: async (onlyPageId) => {
+    const s = get();
+    if (!s.issueId || s.applyingProposals || s.chatBusy) return null;
+    const issueId = s.issueId;
+    const order = waitingPages(s.pending, s.pages).filter((w) => !onlyPageId || w.pageId === onlyPageId);
+    // Pages that left the magazine since their changes were staged: nothing there can
+    // land, and it is said rather than left waiting forever.
+    const orphans = onlyPageId ? [] : orphanPageIds(s.pending, s.pages);
+    if (order.length === 0 && orphans.length === 0) return [];
+    set({ applyingProposals: true });
+    const reports: PageApplyReport[] = [];
+    const blank = (pageId: string, page: number): PageApplyReport => ({ pageId, page, applied: 0, refused: 0, waiting: 0, elementWrites: 0, pageOps: 0 });
+    try {
+      if (orphans.length > 0) {
+        for (const id of orphans) reports.push({ ...blank(id, 0), waiting: pendingFor(s.pending, id).length, gone: true });
+        set((st) => withPending(st, withoutPages(st.pending, orphans)));
       }
-    });
-
-    // 2) Page-structure edits — indices resolved against the LATEST page list each
-    // step (earlier ops shift positions). Blank/reorder/remove refresh summaries;
-    // generate-pages hands off to the polling generation flow.
-    let deferGenerate: { count: number; topic?: string; atIndex?: number } | null = null;
-    for (const p of s.proposals.filter((x) => isPageKind(x.kind))) {
-      try {
-        if (p.kind === 'add-page') {
-          const { pages } = await api.addPage(issueId, p.atIndex);
-          set({ pages, editedSinceLoad: true });
-          applied++;
-        } else if (p.kind === 'reorder-page' && p.from != null && p.to != null) {
-          const { pages } = await api.reorderPages(issueId, p.from, p.to);
-          set({ pages, editedSinceLoad: true });
-          applied++;
-        } else if (p.kind === 'remove-page' && p.targetIndex != null) {
-          const target = get().pages[p.targetIndex];
-          // A target that has since gone (or the last remaining page, which the
-          // server won't delete) is a refusal, not a silent skip.
-          if (!target || get().pages.length <= 1) refused++;
-          else {
-            // Deleting a SUBMITTED page is refused first time with a 409 naming who
-            // submitted it. Route it through the store's own deletePage so the owner
-            // gets that confirmation dialog instead of a silent no-op — the assistant
-            // asking on their behalf is no reason to skip the warning.
-            if (target.review === 'submitted') {
-              const before = get().pages.length;
-              await get().deletePage(target.id);
-              if (get().pages.length === before) refused++;
-              else applied++;
-            } else {
-              const { pages } = await api.deletePage(issueId, target.id);
-              // Same pruning as deletePage's own path — this branch skips it only
-              // because it doesn't need the submitted-page confirmation.
-              set((st) => ({ pages, editedSinceLoad: true, undoStack: withoutPage(st.undoStack, target.id), redoStack: withoutPage(st.redoStack, target.id) }));
-              if (get().currentPageId === target.id && pages[0]) await get().openPage(pages[0].id);
-              applied++;
-            }
+      await get().batchEdits(order.length > 1 ? 'the assistant’s changes on several pages' : 'the assistant’s changes', async () => {
+        for (const w of order) {
+          if (get().issueId !== issueId) break;
+          // An earlier page's set may have deleted this page.
+          if (!get().pages.some((p) => p.id === w.pageId)) {
+            reports.push({ ...blank(w.pageId, w.page), waiting: pendingFor(get().pending, w.pageId).length, gone: true });
+            set((st) => withPending(st, withoutPages(st.pending, [w.pageId])));
+            continue;
           }
-        } else if (p.kind === 'generate-pages' && p.count) {
-          // Only one generation run per apply (they can't overlap while processing).
-          // Counted as applied: the run is started below, so "nothing was altered"
-          // would be the wrong sentence to close on.
-          deferGenerate = { count: p.count, topic: p.topic, atIndex: p.atIndex };
-          applied++;
+          // Applied or discarded meanwhile (an automation, another click).
+          if (pendingFor(get().pending, w.pageId).length === 0) continue;
+          if (get().currentPageId !== w.pageId || get().page?.id !== w.pageId) {
+            pinnedPageId = w.pageId;
+            await get().goToPage(w.pageId);
+          }
+          if (get().currentPageId !== w.pageId || get().page?.id !== w.pageId) {
+            reports.push({ ...blank(w.pageId, w.page), waiting: pendingFor(get().pending, w.pageId).length, notOpened: true });
+            continue;
+          }
+          const r = await applyPageSet(set, get, true);
+          if (r) reports.push(r);
         }
-      } catch {
+      });
+    } finally {
+      pinnedPageId = null;
+      set({ applyingProposals: false, lastApplyReport: reports });
+    }
+    if (get().issueId === issueId) {
+      // ONE sentence naming every page — what landed, what was refused, what waits.
+      const line = applyReportLine(reports);
+      const outcome = applyOutcome(reports);
+      const undoable = reports.some((r) => r.elementWrites > 0);
+      if (outcome === 'all') toast.success(`${line}${undoable ? ' Undo with Ctrl+Z.' : ''}`);
+      else if (outcome === 'partial') toast.warning(line);
+      else toast.error(line);
+    }
+    return reports;
+  },
+
+  discardProposals: () => {
+    const id = get().currentPageId;
+    if (id) get().discardWaiting(id);
+  },
+
+  // A discarded set takes its page check with it — the check described changes that
+  // will now never land. A check on changes already APPLIED stays: the page still has
+  // those problems. Nothing is lost on a slip: the toast brings the set back.
+  discardWaiting: (pageId) => {
+    const st0 = get();
+    const issueId = st0.issueId;
+    const ids = pageId ? [pageId] : Object.keys(st0.pending);
+    const removed: Record<string, AgentProposal[]> = {};
+    let n = 0;
+    for (const id of ids) {
+      const list = pendingFor(st0.pending, id);
+      if (list.length > 0) {
+        removed[id] = [...list];
+        n += list.length;
+      }
+    }
+    if (n === 0) return 0;
+    set((st) => ({
+      ...withPending(st, withoutPages(st.pending, Object.keys(removed))),
+      ...(st.lastCheckPageId && removed[st.lastCheckPageId] && !st.lastCheckApplied ? { lastCheck: null, lastCheckPageId: null } : {}),
+    }));
+    const numbers = Object.keys(removed)
+      .map((id) => pageNumberIn(get().pages, id))
+      .filter((x) => x > 0);
+    toast.message(`Discarded ${changeCount(n)}${numbers.length > 0 ? ` on ${pagesPhrase(numbers)}` : ''} — nothing on the page${numbers.length === 1 ? ' was' : 's were'} changed.`, {
+      duration: 12_000,
+      action: {
+        label: 'Bring back',
+        onClick: () => {
+          if (get().issueId !== issueId) return;
+          set((st) => {
+            let next = st.pending;
+            // Older first, so anything staged since still wins where the two overlap.
+            for (const [id, list] of Object.entries(removed)) {
+              if (st.pages.some((p) => p.id === id)) next = withPage(next, id, foldChanges([...list, ...pendingFor(next, id)]));
+            }
+            return withPending(st, next);
+          });
+        },
+      },
+    });
+    return n;
+  },
+
+  setPageBackground: async (background) => {
+    const s0 = get();
+    if (!s0.page || !s0.issueId) return false;
+    const issueId = s0.issueId;
+    const pageId = s0.page.id;
+    const before = s0.page.background;
+    // Optimistic, like an element edit: the page answers at once, and the stored page
+    // that comes back replaces the guess ('none' is drawn white until then).
+    const shown: MagazinePageV2['background'] =
+      background.type === 'image' && background.value
+        ? { type: 'image', value: background.value }
+        : background.type === 'color' && background.value
+          ? { type: 'color', value: background.value }
+          : { type: 'color', value: '#ffffff' };
+    set((st) => (st.page && st.page.id === pageId ? { page: { ...st.page, background: shown } } : {}));
+    const send = async (rev: number, isRetry: boolean): Promise<boolean> => {
+      try {
+        const { page } = await api.setPageBackground(issueId, pageId, rev, background);
+        const after = page?.background ?? shown;
+        set((st) => {
+          if (!st.page || st.page.id !== pageId) return { editedSinceLoad: true };
+          const merged: MagazinePageV2 = {
+            ...st.page,
+            ...page,
+            elements: Array.isArray(page?.elements) ? page.elements : st.page.elements,
+            background: after,
+            rev: typeof page?.rev === 'number' ? page.rev : st.page.rev,
+          };
+          return { page: merged, thumbs: { ...st.thumbs, [pageId]: merged }, editedSinceLoad: true };
+        });
+        record(set, { op: 'background', pageId, before, after }, 'the page background');
+        return true;
+      } catch (e) {
+        // Someone wrote the page first: adopt it and ask again once, like commit().
+        const fresh = e instanceof ApiError && e.status === 409 ? (e.body?.page as MagazinePageV2 | undefined) : undefined;
+        if (fresh && !isRetry && fresh.id === pageId) {
+          set((st) => (st.page && st.page.id === pageId ? { page: { ...fresh, background: shown } } : {}));
+          return send(fresh.rev, true);
+        }
+        // A write that did not land must not stay painted.
+        if (handleWriteError(e, set, get) === 'unreconciled') {
+          set((st) => (st.page && st.page.id === pageId ? { page: { ...st.page, background: before } } : {}));
+        }
+        return false;
+      }
+    };
+    return send(s0.page.rev, false);
+  },
+
+  placeChart: async (chart, opts) => {
+    const s = get();
+    if (!s.issueId || !s.page) return null;
+    const issueId = s.issueId;
+    const pageId = s.page.id;
+    let res: api.ChartResult;
+    try {
+      res = await api.createChart(issueId, pageId, { chart, ...(opts?.box ? { box: opts.box } : {}), ...(opts?.replaceElementId ? { replaceElementId: opts.replaceElementId } : {}) });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'The chart could not be drawn.');
+      return null;
+    }
+    // Drawn for THAT page's free space; placing it on whatever page scrolled into
+    // view meanwhile would put it somewhere nobody chose.
+    if (get().issueId !== issueId || get().page?.id !== pageId) {
+      toast.message('You moved to another page while the chart was drawn, so it was not placed. Try again on that page.');
+      return null;
+    }
+    // The element the chart takes the place of: the one asked for, or — with neither a
+    // box nor a target — an empty picture slot the server chose by itself. Leaving that
+    // slot under the new chart would stack two pictures in one place.
+    const replaceId = opts?.replaceElementId ?? res.replaceElementId;
+    if (replaceId) {
+      const before = get().page?.elements.find((e) => e.id === replaceId);
+      if (!before) {
+        toast.error('The element the chart was meant to replace is no longer on this page.');
+        return null;
+      }
+      const drawn = res.element;
+      if (before.type === 'image') {
+        // A picture is PATCHED (same id, so whatever names it still finds it): its new
+        // image, drawn to be shown whole (`contain`), and the box the server settled on.
+        // One undo entry, like any edit. The server's `patch` wins where it is given.
+        const patch: Partial<MagazineElement> = {
+          ...(typeof drawn.x === 'number' ? { x: drawn.x } : {}),
+          ...(typeof drawn.y === 'number' ? { y: drawn.y } : {}),
+          ...(typeof drawn.w === 'number' ? { w: drawn.w } : {}),
+          ...(typeof drawn.h === 'number' ? { h: drawn.h } : {}),
+          ...(typeof res.patch?.zIndex === 'number' ? { zIndex: res.patch.zIndex } : {}),
+          ...(drawn.image ? { image: { ...(before.image ?? { assetId: '', url: '', alt: '', fit: 'contain' as const }), ...drawn.image } } : {}),
+        };
+        return (await get().commit(before.id, patch, before)) ? { elementId: before.id, dataEcho: res.dataEcho } : null;
+      }
+      // Anything else (a text box the chart stands in for) is SWAPPED: the chart is
+      // added first, so a refused add never leaves a hole, then the old element goes —
+      // both inside one batch, so one undo takes the whole swap back.
+      return get().batchEdits('the chart', async () => {
+        const id = await get().addElement(drawn);
+        if (!id) return null;
+        if (!(await get().deleteElement(before.id))) {
+          toast.warning('The chart was added, but the element it replaces could not be removed — delete it by hand.');
+        }
+        return { elementId: id, dataEcho: res.dataEcho };
+      });
+    }
+    const id = await get().addElement(res.element);
+    return id ? { elementId: id, dataEcho: res.dataEcho } : null;
+  },
+
+  replaceTextInMagazine: async (body) => {
+    const issueId = get().issueId;
+    if (!issueId) return null;
+    // A Design Helper turn in flight was sent the waiting changes as they are now and
+    // will hand them back with the OLD words after the replace has rebased them —
+    // putting the old words back in the tray. Replace once it has answered.
+    if (!body.dryRun && get().chatBusy) {
+      toast.error('The Design Helper is still answering — replace once its reply is in, so its changes get the new words too.');
+      return null;
+    }
+    let res: api.ReplaceTextResult;
+    try {
+      res = await api.replaceText(issueId, body);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Could not replace that text.');
+      return null;
+    }
+    if (body.dryRun || get().issueId !== issueId) return res;
+    // Changes waiting for Apply were written from the OLD words, and a staged text edit
+    // carries its box's whole content: applied later, it would put the replaced word
+    // straight back (the reason the undo entries below go too). The same replace runs
+    // over them — on every page the replace could edit; a page it was refused on keeps
+    // its words, and so do its waiting changes.
+    const refusedPages = new Set((res.blocked ?? []).map((b) => b.pageId));
+    const ro = { matchCase: body.matchCase, wholeWord: body.wholeWord };
+    const rebased: { pageId: string; count: number }[] = [];
+    set((st) => {
+      let next = st.pending;
+      for (const [pageId, list] of Object.entries(st.pending)) {
+        if (refusedPages.has(pageId)) continue;
+        const r = rebaseForReplace(list, body.find, body.replace, ro);
+        if (r.list === list) continue;
+        next = withPage(next, pageId, r.list);
+        if (r.changed > 0) rebased.push({ pageId, count: r.changed });
+      }
+      return next === st.pending ? {} : withPending(st, next);
+    });
+    const waitingUpdated = rebased.reduce((n, r) => n + r.count, 0);
+    if (waitingUpdated > 0) {
+      const numbers = rebased.map((r) => pageNumberIn(get().pages, r.pageId)).filter((x) => x > 0);
+      toast.message(
+        `Also changed it in ${changeCount(waitingUpdated)} waiting for Apply${numbers.length > 0 ? ` on ${pagesPhrase(numbers)}` : ''}, so applying them will not bring the old words back.`,
+      );
+    }
+    const out = waitingUpdated > 0 ? { ...res, waitingUpdated } : res;
+    if (!res.applied) return out;
+    const changed = new Set(res.pages.filter((p) => p.count > 0).map((p) => p.pageId));
+    if (changed.size === 0) return out;
+    // The server rewrote these pages. Their rail copies go, and so do undo entries on
+    // them: an entry restores a WHOLE element as it was, so undoing an older edit there
+    // would quietly put the replaced word back as well. (The replace itself is not on
+    // the stack — it spans pages; the same replace the other way round reverses it.)
+    set((st) => {
+      const thumbs = { ...st.thumbs };
+      for (const id of changed) delete thumbs[id];
+      const prune = (stack: UndoEntry[]) => stack.filter((entry) => !entry.ops.some((op) => changed.has(op.pageId)));
+      return { thumbs, undoStack: prune(st.undoStack), redoStack: prune(st.redoStack), editedSinceLoad: true };
+    });
+    await get().refreshIssue();
+    const cur = get().currentPageId;
+    if (cur && changed.has(cur)) await get().openPage(cur, true);
+    return out;
+  },
+}));
+
+// Keep each magazine's waiting changes in this browser after EVERY change to them, so
+// a reload (or a closed tab) at any moment finds them again. One subscriber rather
+// than a save beside each of the writes to `pending`, so none can be forgotten.
+// (load() puts the stored set into `pending` first, so the save that follows a
+// magazine switch writes back what was just read — never an empty set over it.)
+useEditorStore.subscribe((st, prev) => {
+  if (st.pending !== prev.pending && st.issueId) savePending(st.issueId, st.pending);
+});
+
+/**
+ * Start a PDF page copy (POST …/copy-document-page). Returns the page and the rev it
+ * had BEFORE, which is how the watch tells the copied page from the old one; null
+ * when the server refused (its sentence is shown — it already names the reason).
+ */
+async function startPageCopy(
+  set: (partial: Partial<EditorState> | ((st: EditorState) => Partial<EditorState>)) => void,
+  get: () => EditorState,
+  docId: string,
+  sourcePage: number,
+  pageId?: string,
+): Promise<{ pageId: string; revBefore: number | undefined } | null> {
+  const s = get();
+  const issueId = s.issueId;
+  const target = pageId ?? s.currentPageId;
+  if (!issueId || !target) return null;
+  // The open page carries the rev our own writes produced; its summary lags behind.
+  const revBefore = s.page?.id === target ? s.page.rev : s.pages.find((p) => p.id === target)?.rev;
+  try {
+    const { from } = await api.copyDocumentPage(issueId, target, { docId, sourcePage });
+    // Shown as running at once, before the first poll, so the rail does not look idle.
+    set((st) => ({
+      pages: st.pages.map((p) => (p.id === target ? { ...p, status: 'pending' } : p)),
+    }));
+    toast.success(`Copying page ${from.sourcePage} of “${from.name}” — it will appear here shortly.`);
+    return { pageId: target, revBefore };
+  } catch (e) {
+    toast.error(e instanceof Error ? e.message : 'That page could not be copied.');
+    return null;
+  }
+}
+
+/**
+ * Follow a started PDF copy until the copied page is on screen, then say how it went.
+ *
+ * Joins the ONE shared wait per page (pageCopyWatch.ts) that the page panel and The
+ * Stable Hand use, rather than running a second poll beside it; that wait re-reads
+ * the magazine and reloads the page on the canvas when it lands. Imported lazily:
+ * that module reads this store, so a static import would be a cycle. While it runs
+ * the page is listed in `copyingPageIds`.
+ */
+async function followPageCopy(
+  set: (partial: Partial<EditorState> | ((st: EditorState) => Partial<EditorState>)) => void,
+  get: () => EditorState,
+  pageId: string,
+  revBefore: number | undefined,
+): Promise<boolean> {
+  const issueId = get().issueId;
+  if (!issueId) return false;
+  set((st) => ({ copyingPageIds: st.copyingPageIds.includes(pageId) ? st.copyingPageIds : [...st.copyingPageIds, pageId] }));
+  try {
+    const { watchPageCopy } = await import('./pageCopyWatch');
+    const outcome = await watchPageCopy(pageId, revBefore);
+    // Another magazine was opened meanwhile: none of this is the open one's business.
+    if (outcome.state === 'left' || get().issueId !== issueId) return false;
+    const n = pageNumberIn(get().pages, pageId);
+    if (outcome.state === 'done') {
+      // Every element on that page is new, so undo entries naming the old ones are
+      // ghosts — the same pruning a layout rebuild does.
+      set((st) => ({ undoStack: withoutPage(st.undoStack, pageId), redoStack: withoutPage(st.redoStack, pageId), editedSinceLoad: true }));
+      toast.success(`The PDF page is on ${n > 0 ? `page ${n}` : 'the page'} now.`);
+      return true;
+    }
+    if (outcome.state === 'failed') toast.error(copyFailureText(outcome.summary, n));
+    else if (outcome.state === 'gone') toast.error('That page is no longer in this magazine, so the copy has nowhere to show.');
+    else toast.message('The PDF page is still being copied — it will show once you reopen that page.');
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (get().issueId === issueId) set((st) => ({ copyingPageIds: st.copyingPageIds.filter((x) => x !== pageId) }));
+  }
+}
+
+type SetState = (partial: Partial<EditorState> | ((st: EditorState) => Partial<EditorState>)) => void;
+
+/**
+ * Apply the OPEN page's waiting changes — the body of that page's "Use these
+ * changes", and of each page's turn in Apply all. Returns what happened (null when
+ * no page is open).
+ *
+ * `quiet` leaves the closing toast to the caller (Apply all says one sentence for
+ * every page). Confirms are never quiet: a page deletion, a layout rebuild and a PDF
+ * copy each ask first, and a "no" leaves that page's whole set waiting.
+ *
+ * What stays waiting afterwards: anything not tried (the page moved under the
+ * apply), a page build that cannot start yet, and the rest of a set whose page
+ * rebuild ran on its own. What a server REFUSED is dropped and counted — it was
+ * tried and would only be refused again.
+ */
+async function applyPageSet(set: SetState, get: () => EditorState, quiet: boolean): Promise<PageApplyReport | null> {
+  const s = get();
+  if (!s.page || !s.currentPageId || !s.issueId) return null;
+  const issueId = s.issueId;
+  /** The page these proposals were written FOR — re-checked before every write. */
+  const forPageId = s.currentPageId;
+  const list = [...pendingFor(s.pending, forPageId)];
+  const report: PageApplyReport = {
+    pageId: forPageId,
+    page: pageNumberIn(s.pages, forPageId),
+    applied: 0,
+    refused: 0,
+    waiting: 0,
+    elementWrites: 0,
+    pageOps: 0,
+  };
+  if (list.length === 0) return report;
+  /** What stays waiting on this page (unless the page itself is gone). */
+  const keep = (rest: AgentProposal[]) =>
+    set((st) => (st.pages.some((p) => p.id === forPageId) ? withPending(st, withPage(st.pending, forPageId, rest)) : withPending(st, withoutPages(st.pending, [forPageId]))));
+  // The canvas must not move this page out from under the writes (see pinnedPageId).
+  pinnedPageId = forPageId;
+
+  // ── A whole-page change runs on its own ──
+  //
+  // A layout rebuild and a PDF page copy each replace every element on a page, so
+  // neither can be mixed with element edits. Anything staged with one STAYS WAITING
+  // (it used to be thrown away with a toast) — the user decides what happens to it.
+  const exclusive = list.find((p) => isExclusiveKind(p.kind));
+  if (exclusive) {
+    const others = list.filter((p) => p !== exclusive);
+    const sayOthers = () => {
+      if (others.length > 0 && !quiet) {
+        toast.message(
+          `${changeCount(others.length)} staged with it ${others.length === 1 ? 'is' : 'are'} still waiting — a page rebuild runs on its own. ` +
+            `Check ${others.length === 1 ? 'it' : 'them'} before applying: ${others.length === 1 ? 'it was' : 'they were'} written for the page as it was.`,
+        );
+      }
+    };
+    if (exclusive.kind === 'apply-layout') {
+      const reading = exclusive.layoutReading as api.LayoutReading | undefined;
+      if (!reading) {
+        // Malformed — it can never run. Dropped, and said.
+        keep(others);
+        report.refused = 1;
+        report.waiting = others.length;
+        if (!quiet) toast.error('That layout could not be applied — ask the assistant to read the image again.');
+        return report;
+      }
+      // Straight through the same store action the panel uses, and the confirm
+      // genuinely lives in there. `pageId` is set only when the user NAMED a page; the
+      // server resolved the ordinal against the real page order, so this is an id and
+      // not an index that could have drifted since the assistant answered.
+      await get().applyLayout(reading, exclusive.pageId);
+      if (layoutOutcome === 'done') {
+        keep(others);
+        report.applied = 1;
+        report.started = 'layout';
+        report.waiting = others.length;
+        sayOthers();
+      } else if (layoutOutcome === 'declined') {
+        report.declined = true;
+        report.waiting = list.length;
+      } else {
+        // It failed, and applyLayout already said why. It stays waiting — to try again
+        // once the page has settled, or to discard.
+        report.refused = 1;
+        report.waiting = list.length;
+      }
+      return report;
+    }
+    // 'copy-document-page': the page panel's "Copy a page exactly", asked for in chat.
+    // Same confirm as that panel — it cannot be undone and it re-shapes the page —
+    // naming the page it will overwrite, which may not be the one on screen.
+    const targetId = exclusive.pageId ?? forPageId;
+    if (!exclusive.docId || !exclusive.sourcePage || !get().pages.some((p) => p.id === targetId)) {
+      keep(others);
+      report.refused = 1;
+      report.waiting = others.length;
+      if (!quiet) toast.error('That copy could not be started — ask the assistant again.');
+      return report;
+    }
+    const n = pageNumberIn(get().pages, targetId);
+    const ok = window.confirm(
+      `Copy page ${exclusive.sourcePage} of that PDF onto ${n > 0 ? `page ${n}` : 'this page'}?\n\n` +
+        `That page's current contents are replaced with the PDF page's own text, pictures and colours — it cannot be undone. ` +
+        `The page also takes on the source page's shape, so it may end up a different size from the rest of the magazine.`,
+    );
+    if (!ok) {
+      report.declined = true;
+      report.waiting = list.length;
+      return report;
+    }
+    const started = await startPageCopy(set, get, exclusive.docId, exclusive.sourcePage, targetId);
+    if (!started) {
+      // Refused by the server (startPageCopy said why). Still waiting, to retry or discard.
+      report.refused = 1;
+      report.waiting = list.length;
+      return report;
+    }
+    keep(others);
+    report.applied = 1;
+    report.started = 'copy';
+    report.waiting = others.length;
+    sayOthers();
+    // Followed in the background: the copy is a worker job, and the apply must not sit
+    // "applying" for the minute it can take. The follow brings the copied page onto the
+    // canvas — before, nothing did, and later edits went to elements the copy had
+    // already replaced.
+    void followPageCopy(set, get, started.pageId, started.revBefore);
+    return report;
+  }
+
+  // Refusals are COUNTED, not just survived. Each loop keeps going after a failure
+  // (one bad proposal shouldn't strand the rest), but the result has to reflect what
+  // actually happened: a page op can legitimately be refused — a submitted page, a
+  // published draft — and reporting "Applied the assistant's changes" over a
+  // swallowed 409 tells the user their magazine changed when it did not.
+  let refused = 0;
+  let applied = 0;
+  let elementWrites = 0;
+  let pageOps = 0;
+
+  // A staged text edit carries its box's WHOLE new content, written from the words the
+  // box had when it was staged — and changes wait per page for up to 30 days. One whose
+  // box has been edited since (typed in, undone, another apply) is HELD, not written
+  // over that edit: it stays waiting, marked, and a second Apply uses it anyway.
+  const open = get().page;
+  const { apply: elementProps, held: staleHeld } = holdStaleTextChanges(
+    list.filter((p) => !isPageKind(p.kind)),
+    open && open.id === forPageId ? open.elements : [],
+  );
+  const pageProps = list.filter((p) => isPageKind(p.kind));
+
+  // ── A page build cannot start while one is running ──
+  //
+  // generatePages bails while `generating` (one build at a time), and this used to
+  // count the staged build as applied anyway: "Applied the assistant's changes", and
+  // no pages, ever. It stays waiting instead, to apply again once the running build
+  // finishes.
+  const building = get().generating || get().issue?.status === 'processing';
+  const heldBack: AgentProposal[] = building ? pageProps.filter((p) => p.kind === 'generate-pages') : [];
+  const pageRun = building ? pageProps.filter((p) => p.kind !== 'generate-pages') : pageProps;
+
+  // ── Page changes, every page pinned by ID against the list as it is NOW ──
+  // (see planPageSteps: "delete pages 3 and 4" used to delete 3 and 5).
+  const startPages = get().pages;
+  const originalIds = inOrder(startPages).map((p) => p.id);
+  const { steps } = planPageSteps(pageRun, startPages);
+
+  // ── Deleting a page cannot be undone: ask first, naming each page ──
+  //
+  // Asked BEFORE anything is written, so "no" leaves the pages and every waiting
+  // change exactly as they were.
+  const removals = steps.filter((x) => x.op === 'remove' && !!x.pageId) as { op: 'remove'; proposal: AgentProposal; pageId: string }[];
+  if (removals.length > 0) {
+    const targets = removals.map((r) => {
+      const sum = startPages.find((p) => p.id === r.pageId);
+      const open = get().page;
+      const els = open && open.id === r.pageId ? open.elements : get().thumbs[r.pageId]?.elements;
+      return { number: sum ? sum.index + 1 : 0, headline: pageHeadline(els) };
+    });
+    if (!window.confirm(removalQuestion(targets))) {
+      report.declined = true;
+      report.waiting = list.length;
+      return report;
+    }
+  }
+
+  // 1) Element edits (and the background) on this page — rev-guarded CRUD; add → id
+  // remap.
+  //
+  // The whole apply is ONE undo entry, so the user takes the assistant's turn back
+  // with the one Ctrl+Z they expect (Apply all opens one batch around every page,
+  // which this joins). Every write is judged by its RETURN VALUE, not by whether it
+  // threw: these store actions absorb their own errors (that is how a conflict
+  // reconciles instead of exploding), so they never reject.
+  //
+  // An 'add' that fails also has to STOP the proposals that depended on it: with no
+  // id in the map, a later update/delete naming the temp id would be sent to the
+  // server as if it were real, get refused for a different reason, and be counted
+  // twice. Its dependants are counted once, here, and never sent.
+  const idMap = new Map<string, string>();
+  const dead = new Set<string>();
+  /** Not tried because the page moved under the apply — these stay waiting. */
+  const untried: AgentProposal[] = [];
+  await get().batchEdits('the assistant’s changes', async () => {
+    for (const p of elementProps) {
+      if (get().currentPageId !== forPageId || get().issueId !== issueId) {
+        untried.push(p);
+        continue;
+      }
+      if (p.kind === 'add' && p.element) {
+        const newId = await get().addElement(p.element);
+        if (!newId) { refused++; if (p.tempId) dead.add(p.tempId); continue; }
+        if (p.tempId) idMap.set(p.tempId, newId);
+        applied++;
+        elementWrites++;
+      } else if (p.kind === 'update' && p.elementId && p.patch) {
+        if (dead.has(p.elementId)) { refused++; continue; }
+        if (await get().commit(idMap.get(p.elementId) ?? p.elementId, p.patch)) { applied++; elementWrites++; }
+        else refused++;
+      } else if (p.kind === 'delete' && p.elementId) {
+        if (dead.has(p.elementId)) { refused++; continue; }
+        if (await get().deleteElement(idMap.get(p.elementId) ?? p.elementId)) { applied++; elementWrites++; }
+        else refused++;
+      } else if (p.kind === 'set-background' && p.background) {
+        if (await get().setPageBackground(p.background)) { applied++; elementWrites++; }
+        else refused++;
+      } else {
+        // A change with nothing to apply (no patch, no element) — counted, not hidden.
         refused++;
       }
     }
+  });
 
-    set({ proposals: [], proposalsPageId: null });
-    // Three outcomes, not two. "Applied what I could" is the right sentence for a
-    // PARTIAL apply and the wrong one for a total refusal — where nothing was applied
-    // and there is nothing to undo, so saying otherwise sends the user to Ctrl+Z to
-    // take back a change that never happened.
-    if (refused > 0 && applied === 0) {
-      toast.error(
-        `Couldn't apply ${refused === 1 ? 'that change' : `any of those ${refused} changes`} — the page didn't accept ${refused === 1 ? 'it' : 'them'}. Nothing was altered.`,
-      );
-    } else if (refused > 0) {
-      toast.warning(
-        `Applied ${applied} change${applied === 1 ? '' : 's'} — ${refused} ${refused === 1 ? 'was' : 'were'} refused. Undo with Ctrl+Z.`,
-      );
-    } else {
-      // Say that it's reversible. The apply is one undo entry now, and users who have
-      // been burned by an assistant edit need telling that Ctrl+Z takes it all back.
-      toast.success('Applied the assistant’s changes. Undo with Ctrl+Z.');
+  // 2) Page structure: moves, then deletions, then new pages (planPageSteps). A move
+  // or a new page finds its place against the list as it is at that moment, by page
+  // id; a deletion names its page by id. Nothing is resolved against a position an
+  // earlier step has already shifted.
+  const idsNow = () => inOrder(get().pages).map((p) => p.id);
+  let deferGenerate: { proposal: AgentProposal; beforePageId: string | undefined } | null = null;
+  for (const step of steps) {
+    try {
+      if (step.op === 'reorder') {
+        const at = reorderIndices(step.proposal, idsNow());
+        if (at === null) refused++;
+        else if (at === 'in-place') applied++;
+        else {
+          const { pages } = await api.reorderPages(issueId, at.from, at.to);
+          set({ pages, editedSinceLoad: true });
+          applied++;
+          pageOps++;
+        }
+      } else if (step.op === 'remove') {
+        const target = step.pageId ? get().pages.find((x) => x.id === step.pageId) : undefined;
+        // A target that has since gone (or the last remaining page, which the server
+        // won't delete) is a refusal, not a silent skip.
+        if (!target || get().pages.length <= 1) refused++;
+        else if (target.review === 'submitted') {
+          // Deleting a SUBMITTED page is refused first time with a 409 naming who
+          // submitted it. Route it through the store's own deletePage so the owner gets
+          // that confirmation dialog instead of a silent no-op.
+          const before = get().pages.length;
+          await get().deletePage(target.id);
+          if (get().pages.length === before) refused++;
+          else { applied++; pageOps++; }
+        } else {
+          const { pages } = await api.deletePage(issueId, target.id);
+          // Same pruning as deletePage's own path — this branch skips it only because it
+          // doesn't need the submitted-page confirmation. The deleted page's own waiting
+          // changes go with it (counted in the toast below by the caller's report).
+          set((st) => ({
+            pages,
+            editedSinceLoad: true,
+            undoStack: withoutPage(st.undoStack, target.id),
+            redoStack: withoutPage(st.redoStack, target.id),
+            ...(target.id !== forPageId ? withPending(st, withoutPages(st.pending, [target.id])) : {}),
+          }));
+          if (get().currentPageId === target.id && pages[0]) await get().openPage(pages[0].id);
+          applied++;
+          pageOps++;
+        }
+      } else if (step.op === 'add-page') {
+        const { pages } = await api.addPage(issueId, insertIndexFor(step.beforePageId, idsNow(), originalIds));
+        set({ pages, editedSinceLoad: true });
+        applied++;
+        pageOps++;
+      } else if (step.op === 'generate-pages' && step.proposal.count) {
+        // One build per apply — they cannot overlap. A second staged build waits for
+        // the next press rather than being quietly merged away.
+        if (deferGenerate) heldBack.push(step.proposal);
+        else deferGenerate = { proposal: step.proposal, beforePageId: step.beforePageId };
+      }
+    } catch {
+      refused++;
     }
-    if (deferGenerate) await get().generatePages(deferGenerate.count, deferGenerate.topic, deferGenerate.atIndex);
-  },
+  }
+  // The build starts LAST, once the page list has settled, so its position is read
+  // against the final order. It is counted only if it really started.
+  if (deferGenerate) {
+    const g = deferGenerate.proposal;
+    const docIds = g.docIds && g.docIds.length > 0 ? g.docIds : g.docId ? [g.docId] : undefined;
+    if (await get().generatePages(g.count!, g.topic, insertIndexFor(deferGenerate.beforePageId, idsNow(), originalIds), docIds)) {
+      applied++;
+      pageOps++;
+    } else refused++;
+  }
 
-  discardProposals: () => set({ proposals: [], proposalsPageId: null }),
-}));
+  // Whatever could not run yet stays waiting, for this page. The check the last turn
+  // returned now describes the page itself, not changes in waiting.
+  const rest = [...staleHeld, ...heldBack, ...untried];
+  keep(rest);
+  set((st) => (st.lastCheck && st.lastCheckPageId === forPageId ? { lastCheckApplied: true } : {}));
+  Object.assign(report, { applied, refused, elementWrites, pageOps, waiting: rest.length, ...(staleHeld.length > 0 ? { stale: staleHeld.length } : {}) });
+  if (quiet) return report;
+
+  if (staleHeld.length > 0) {
+    const one = staleHeld.length === 1;
+    toast.warning(
+      `${one ? 'One text change was' : `${staleHeld.length} text changes were`} not applied: ${one ? 'its box was' : 'their boxes were'} edited after the assistant staged ${one ? 'it' : 'them'}, and applying would overwrite that edit. ` +
+        `${one ? 'It is' : 'They are'} still waiting — press “Use these changes” again to use ${one ? 'it' : 'them'} anyway, or discard.`,
+      { duration: 12_000 },
+    );
+  }
+
+  if (untried.length > 0) {
+    toast.warning(`The page changed under the apply, so ${changeCount(untried.length)} ${untried.length === 1 ? 'was' : 'were'} not tried — ${untried.length === 1 ? 'it is' : 'they are'} still waiting. Press “Use these changes” again on that page.`);
+  }
+  if (heldBack.length > 0) {
+    toast.warning(
+      building
+        ? 'A page build is still running, so the new pages were not started. Press “Use these changes” again once it finishes.'
+        : 'Only one page build can run at a time — press “Use these changes” again once this one finishes to start the next.',
+    );
+  }
+  // Three outcomes, not two. "Applied what I could" is the right sentence for a
+  // PARTIAL apply and the wrong one for a total refusal — where nothing was applied
+  // and there is nothing to undo. And "Undo with Ctrl+Z" is promised only for what the
+  // undo stack really covers: page deletions, moves and new pages are not on it.
+  if (refused > 0 && applied === 0) {
+    toast.error(
+      `Couldn't apply ${refused === 1 ? 'that change' : `any of those ${refused} changes`} — the page didn't accept ${refused === 1 ? 'it' : 'them'}. Nothing was altered.`,
+    );
+  } else if (refused > 0) {
+    toast.warning(`Applied ${applied} change${applied === 1 ? '' : 's'} — ${refused} ${refused === 1 ? 'was' : 'were'} refused.${pageOps === 0 ? ' Undo with Ctrl+Z.' : ''}`);
+  } else if (applied > 0) {
+    toast.success(appliedMessage(elementWrites, pageOps));
+  }
+  return report;
+}
 
 // ── Undo/redo replay ────────────────────────────────────────────────────────
 //
@@ -1709,6 +2723,18 @@ async function replayRemove(issueId: string, pageId: string, elementId: string, 
     selectedId: st.selectedId === elementId ? null : st.selectedId,
     editedSinceLoad: true,
   }));
+}
+
+/** Put a page's background back (or forward) to exactly what was stored. */
+async function replayBackground(issueId: string, pageId: string, target: MagazinePageV2['background'], set: any, get: any) {
+  const page = get().page as MagazinePageV2 | null;
+  if (!page || page.id !== pageId) throw new Error('page not open');
+  const { page: stored } = await api.setPageBackground(issueId, pageId, page.rev, target);
+  set((st: EditorState) => {
+    if (!st.page || st.page.id !== pageId) return { editedSinceLoad: true };
+    const next = { ...st.page, rev: typeof stored?.rev === 'number' ? stored.rev : st.page.rev, background: stored?.background ?? target };
+    return { page: next, thumbs: { ...st.thumbs, [pageId]: next }, editedSinceLoad: true };
+  });
 }
 
 /** Put a deleted element back — same id, same source (see api.addElement's
@@ -1759,7 +2785,9 @@ async function replayOps(ops: UndoOp[], dir: 'undo' | 'redo', set: any, get: any
       // undo works wherever you are rather than only on the page you're looking at.
       if (get().page?.id !== op.pageId) await get().openPage(op.pageId);
       try {
-        if (op.op === 'update') {
+        if (op.op === 'background') {
+          await replayBackground(issueId, op.pageId, dir === 'undo' ? op.before : op.after, set, get);
+        } else if (op.op === 'update') {
           await replayUpdate(issueId, op.pageId, op.elementId, dir === 'undo' ? op.before : op.after, set, get);
         } else if ((op.op === 'add') === (dir === 'undo')) {
           // Undoing an add, or redoing a delete → the element goes away again.

@@ -17,7 +17,8 @@ import { magazineDocument } from '../../../server/src/lib/magazineV2/magazineDoc
 import { convertDocxToPdf } from '../lib/docx.js';
 import { toStoredImportImage } from '../lib/image.js';
 import { mapWithConcurrency } from '../lib/pool.js';
-import { processSinglePage } from './processPage.js';
+import { processSinglePage, type ProcessedPageResult } from './processPage.js';
+import { copiedFromOf, coverAfterReplace, sourceIndexOf } from './pageWrite.js';
 
 /** DOCX mime, and a key-suffix fallback — used to convert Word docs to PDF
  *  before extraction (the pipeline downstream only understands PDF). */
@@ -98,6 +99,11 @@ export async function processIssue(payload: { issueId: string }): Promise<void> 
         status: 'pending',
         selectedForPublish: true,
         rev: 0,
+        // Which page of the source file this is. Equal to `index` today, but
+        // `index` is the page's POSITION and moves when pages are inserted or
+        // reordered; a later retry must re-extract the page it came from, not
+        // whatever source page now shares its position. See sourceIndexOf.
+        sourceIndex: i,
         createdAt: now(),
         updatedAt: now(),
       });
@@ -107,7 +113,8 @@ export async function processIssue(payload: { issueId: string }): Promise<void> 
     let coverImage = '';
     const indices = Array.from({ length: capped }, (_v, i) => i);
     await mapWithConcurrency(indices, PAGE_CONCURRENCY, async (index) => {
-      const result = await processSinglePage(doc!, index, { issueId, pageId: pageIds[index]! });
+      // A fresh import: source page N is magazine page N, so targetIndex = index.
+      const result = await processSinglePage(doc!, index, { issueId, pageId: pageIds[index]!, targetIndex: index });
       if (index === 0 && result?.backgroundUrl) coverImage = result.backgroundUrl;
       done += 1;
       await db.collection(COL.magazines).updateOne(issueId, { pagesProcessed: done });
@@ -232,11 +239,43 @@ async function processImageIssue(issue: Doc, src: { key?: string; mimeType?: str
 /** Re-run extraction for ONE page (the retry endpoint). Re-downloads + re-opens
  *  the source (the worker may have restarted since the original job). */
 export async function processPageJob(payload: { issueId: string; pageId: string; index: number }): Promise<void> {
-  const { issueId, pageId, index } = payload;
+  const { issueId, pageId } = payload;
   const issue = (await db.collection(COL.magazines).findById(issueId)) as Doc | null;
-  const src = issue?.sourceFile as { key?: string; mimeType?: string } | undefined;
-  if (!issue || !src?.key) return;
+  if (!issue) return;
+  // A magazine built with AI has no source file of its own, but a page on it copied
+  // from an attached PDF can still be retried — by copying it again (below). So the
+  // source is only required once we know the page was not a copy.
+  const src = issue.sourceFile as { key?: string; mimeType?: string } | undefined;
   const now = () => new Date().toISOString();
+
+  // The payload's `index` is the page's POSITION when the retry was asked for. The
+  // page itself knows better: which source page it was imported from, or which
+  // attached document it was copied from. The job's payload shape is unchanged —
+  // this only reads the page it was already pointed at.
+  const page = (await db.collection(COL.pages).findById(pageId)) as Doc | null;
+  if (!page) {
+    // Deleted since the retry was queued: nothing to rebuild, but the magazine's
+    // status may still be waiting on this page.
+    await reconcileAfterRetry(issue, issueId);
+    return;
+  }
+  const targetIndex = Number(page.index) || 0;
+
+  // A page made by "copy this page" is retried by copying it again. Re-extracting
+  // the magazine's own source here would put a different page's content on it.
+  const copied = copiedFromOf(page);
+  if (copied) {
+    await copyDocumentPageJob({ issueId, pageId, docId: copied.docId, sourcePage: copied.sourcePage });
+    await reconcileAfterRetry(issue, issueId);
+    return;
+  }
+  if (!src?.key) {
+    // Nothing to re-extract from. Said on the page, so a retry never leaves it
+    // spinning as 'pending' (the route has already marked it so).
+    await db.collection(COL.pages).updateOne(pageId, { status: 'failed', error: 'This magazine has no source file to re-extract this page from.', updatedAt: now() });
+    return;
+  }
+  const index = sourceIndexOf(page, payload.index);
 
   // Image issues have a single page and no MuPDF pass — a retry just rebuilds it.
   if (isImage(src)) {
@@ -256,7 +295,11 @@ export async function processPageJob(payload: { issueId: string; pageId: string;
     // original source, which may be a Word doc.
     if (isDocx(src)) buffer = await convertDocxToPdf(buffer);
     doc = openPdf(buffer);
-    await processSinglePage(doc, index, { issueId, pageId });
+    if (index >= countPages(doc)) {
+      throw new Error(`The source file has no page ${index + 1} to re-extract.`);
+    }
+    const result = await processSinglePage(doc, index, { issueId, pageId, targetIndex });
+    await followCover(issueId, targetIndex, result);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Page retry failed';
     await db.collection(COL.pages).updateOne(pageId, { status: 'failed', error: message, updatedAt: now() });
@@ -264,6 +307,13 @@ export async function processPageJob(payload: { issueId: string; pageId: string;
     doc?.destroy();
   }
 
+  await reconcileAfterRetry(issue, issueId);
+}
+
+/** After a retry: an import that was still 'processing' (or had 'failed') settles
+ *  on what its pages now say. A 'ready' magazine is left alone. */
+async function reconcileAfterRetry(issue: Doc, issueId: string): Promise<void> {
+  const now = () => new Date().toISOString();
   const all = (await db.collection(COL.pages).find({ magazineId: issueId })) as Doc[];
   const failed = all.filter((p) => p.status === 'failed').length;
   if (issue.status === 'processing' || issue.status === 'failed') {
@@ -290,7 +340,19 @@ export async function processPageJob(payload: { issueId: string; pageId: string;
  * another shape re-shapes it. That is deliberate and is what "copy this page"
  * means — a page reproduced at a different aspect is not a copy — but it does mean
  * one page of a magazine can end up a different shape from its neighbours. The
- * route's confirm says so before it is enqueued.
+ * route's confirm says so before it is enqueued, and the Download PDF prints every
+ * page on a sheet of its own size (BulletinViewer.tsx named @page rules + lib/pdf.ts
+ * preferCSSPageSize), so a differently shaped page is neither clipped nor spilled.
+ *
+ * WHERE IT LANDS vs WHERE IT COMES FROM. `sourcePage` is the attached document's
+ * page; the target page's own `index` is its place in this magazine. Media are
+ * recorded against the target, and the background is stored under a key of its
+ * own (pageWrite.ts backgroundKey) — keying it by the source page number is what
+ * once made a copy overwrite the cover's artwork and the published edition's.
+ *
+ * A PAGE WITH NO TEXT LAYER (a scan, or type converted to outlines) still copies,
+ * as a picture, and the page records `notice` ('scanned' | 'no-text') so the
+ * studio and the assistants can say why its words cannot be edited.
  *
  * Never throws for a per-page problem: the page records `failed` + the reason, the
  * same contract processPageJob follows, so a bad page is visible in the rail rather
@@ -302,11 +364,23 @@ export async function copyDocumentPageJob(payload: {
   docId: string;
   sourcePage: number;
 }): Promise<void> {
-  const { issueId, pageId, docId, sourcePage } = payload;
+  const { issueId, pageId, docId } = payload;
+  // 1-based as a person says it; the extractor indexes from 0.
+  const sourcePage = Math.max(1, Math.floor(Number(payload.sourcePage) || 1));
+  const copiedFrom = { docId: String(docId), sourcePage };
   const now = () => new Date().toISOString();
+  // A failed copy still records what was attempted, so the page's Retry re-runs
+  // THIS copy instead of re-extracting the magazine's own source onto it.
   const fail = async (message: string) => {
-    await db.collection(COL.pages).updateOne(pageId, { status: 'failed', error: message, updatedAt: now() });
+    await db.collection(COL.pages).updateOne(pageId, { status: 'failed', error: message, copiedFrom, updatedAt: now() });
   };
+
+  // The TARGET page, for its position in the magazine. `sourcePage` says where the
+  // content comes from; this says where it lands, and the two must never be mixed
+  // up again (that is how a copy once overwrote the cover's background).
+  const target = (await db.collection(COL.pages).findById(pageId)) as Doc | null;
+  if (!target) return; // the page was deleted while the job waited
+  const targetIndex = Number(target.index) || 0;
 
   // Re-resolved in the worker rather than trusted from the payload: the job may have
   // sat in the queue while the document was deleted, and this is also the scope check
@@ -321,15 +395,22 @@ export async function copyDocumentPageJob(payload: {
   try {
     const buffer = await storage.downloadObject(source.s3Key);
     doc = openPdf(buffer);
-    // 1-based as a person says it; the extractor indexes from 0.
-    const index = Math.max(1, Math.floor(sourcePage)) - 1;
+    const index = sourcePage - 1;
     const total = countPages(doc);
     if (index >= total) {
       await fail(`“${source.name}” has ${total} page${total === 1 ? '' : 's'}, so there is no page ${sourcePage} to copy.`);
       return;
     }
-    await processSinglePage(doc, index, { issueId, pageId });
-    console.log(`[magazineV2] copied page ${sourcePage} of “${source.name}” onto page ${pageId}`);
+    const result = await processSinglePage(doc, index, { issueId, pageId, targetIndex, copiedFrom });
+    if (result) {
+      await followCover(issueId, targetIndex, result);
+      console.log(
+        `[magazineV2] copied page ${sourcePage} of “${source.name}” onto page ${pageId}${result.notice ? ` (${result.notice}: no editable text)` : ''}`,
+      );
+    } else {
+      // processSinglePage recorded the failure and its reason; add the provenance.
+      await db.collection(COL.pages).updateOne(pageId, { copiedFrom });
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Copying that page failed';
     console.warn('[magazineV2] copyDocumentPage failed:', message);
@@ -343,4 +424,33 @@ export async function copyDocumentPageJob(payload: {
   // already 'ready', and flipping the magazine's status off the back of one page
   // would be wrong.
   await db.collection(COL.magazines).updateOne(issueId, { updatedAt: now() });
+}
+
+/**
+ * Keep a DERIVED cover in step when the first page gets a new background.
+ *
+ * Every background write now has its own key (pageWrite.ts backgroundKey), so the
+ * cover can no longer change by accident when page 1 is rebuilt — which also means
+ * it would not change when it SHOULD. Import set coverImage to page 1's background;
+ * if it still is that old URL, it follows the page. An explicit cover the user
+ * picked is a different URL and stays. Compare-and-set on the old value so a cover
+ * chosen while the job ran is never clobbered. Best-effort: the page is already
+ * written, and a stale thumbnail is not worth failing the job over.
+ */
+async function followCover(issueId: string, targetIndex: number, result: ProcessedPageResult | null): Promise<void> {
+  if (!result) return;
+  try {
+    const issue = (await db.collection(COL.magazines).findById(issueId)) as Doc | null;
+    const next = coverAfterReplace({
+      coverImage: issue?.coverImage,
+      targetIndex,
+      previousBackground: result.previousBackgroundUrl,
+      newBackground: result.backgroundUrl,
+    });
+    if (next && issue) {
+      await db.collection(COL.magazines).updateOneIf(issueId, { coverImage: issue.coverImage }, { coverImage: next });
+    }
+  } catch (err) {
+    console.warn('[worker] could not update the derived cover (page is written):', err instanceof Error ? err.message : err);
+  }
 }

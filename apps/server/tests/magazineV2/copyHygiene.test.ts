@@ -104,6 +104,28 @@ test('the Adjust/Fill pass cleans copy already on the page, and the model’s re
   assert.deepEqual(pageCopyEdits([t('a', 'Clean.')], []), [], 'a clean page proposes nothing');
 });
 
+test('a page copied from a PDF keeps its own numbering and lead-ins (finding C32)', () => {
+  const t = (id: string, content: string, source: MagazineElement['source'], role = 'body'): MagazineElement =>
+    ({ id, type: 'text', x: 0, y: 0, w: 400, h: 60, rotation: 0, zIndex: 1, locked: false, source, text: { content, role, fontFamily: 'Georgia', fontSize: 20, fontWeight: 400, color: '#111111', align: 'left', lineHeight: 1.3, autoFit: 'shrink' } }) as MagazineElement;
+  // A numbered list that continues from the previous PDF page, and a page-ref heading.
+  const copied = [
+    t('h', 'Page 4 — NZTROF Awards', 'extracted', 'headline'),
+    t('l5', '5. Entries close on Friday.', 'extracted'),
+    t('l6', '6. Late entries attract a fee.', 'extracted'),
+    t('l7', '7. Results are final.', 'extracted'),
+  ];
+  assert.deepEqual(pageCopyEdits(copied, []), [], 'nothing on a copied page is rewritten');
+  // Edited PDF text becomes 'manual' (extractedText.asFlowingText) — still the client's words.
+  assert.deepEqual(pageCopyEdits(copied.map((e) => ({ ...e, source: 'manual' as const })), []), []);
+  // The model's own rewrite of a crowded copied box still goes through, as written.
+  assert.deepEqual(pageCopyEdits(copied, [{ elementId: 'l6', content: '6. Late entries cost extra.' }]), [
+    { elementId: 'l6', content: '6. Late entries cost extra.' },
+  ]);
+  // Generated copy on the same page is still cleaned, judged on its own.
+  const mixed = [...copied, t('g', 'PAGE 2 — CUP WEEK: x', 'ai-agent')];
+  assert.deepEqual(pageCopyEdits(mixed, []), [{ elementId: 'g', content: 'CUP WEEK: x' }]);
+});
+
 // ── draftRules ──────────────────────────────────────────────────────────────
 
 const slot = (id: string, textRole: string, leafRole?: string): PageTemplateSlot =>

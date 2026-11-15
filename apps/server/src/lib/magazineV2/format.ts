@@ -15,6 +15,7 @@
 import { generateObject } from 'ai';
 import { z } from 'zod';
 import { getMagazineModel } from '../agent/provider.js';
+import { plainTextForMeasure } from './layout.js';
 
 /** Rough char ceiling per text role (keeps rewritten copy inside its box). */
 const CHAR_GUIDE: Record<string, number> = {
@@ -45,6 +46,17 @@ export function charGuideFor(role: string): number {
   return CHAR_GUIDE[role] ?? CHAR_GUIDE.other!;
 }
 
+/** A box's copy as the sub-editor model is shown it: visible text, with each line
+ *  break (a <br> or a newline) written as <br> so the model can keep the box's lines. */
+export function shownCopy(content: string): string {
+  return plainTextForMeasure(content ?? '')
+    .split('\n')
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .join('<br>')
+    .replace(/^(?:<br>)+|(?:<br>)+$/g, '')
+    .trim();
+}
+
 export async function formatPageText(opts: {
   mode: 'fill' | 'adjust';
   title?: string;
@@ -62,6 +74,8 @@ export async function formatPageText(opts: {
     'Rules:',
     '- Return ONE edit per box you change, keyed by its #id. Omit a box you would leave unchanged.',
     '- Stay WITHIN each box\'s char limit. Light inline HTML only (<b> <i> <u> <br>). Never emit literal \\n.',
+    '- A box shown with <br> sets one item per line (results, names, contact lines): keep it one item per line with',
+    '  <br>, and count each line as a full line of the box, so cut words rather than add lines.',
     '- Preserve every real name, figure, date and quote. Do not invent statistics as fact.',
     '- Match a consistent editorial voice. Headlines are punchy; body is real flowing sentences (never lorem).',
     '- Nothing internal ever prints: no "PAGE 2", no "SECTION:", no slot/box labels, no leading numbers unless the',
@@ -70,7 +84,9 @@ export async function formatPageText(opts: {
   ].join('\n');
 
   const lines = opts.candidates.map((c) => {
-    const plain = c.content.replace(/<[^>]+>/g, '').trim();
+    // The box's own line breaks are shown as <br>: stripping them with the other tags
+    // ran "1st Foo<br>2nd Bar" together as "1st Foo2nd Bar", so a rewrite lost the list.
+    const plain = shownCopy(c.content);
     const state = plain ? `current: "${plain.slice(0, 400)}"` : 'EMPTY';
     return `- #${c.id} (${c.role}, ≤${c.maxChars} chars) — ${state}`;
   });

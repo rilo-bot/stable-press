@@ -34,6 +34,9 @@ import type { GenPlanPage, IssueConcept } from './generate.js';
 // measured in fontMetrics.data.ts (so the layout engine fits copy with real glyph
 // advances) AND loaded by the editor + bulletin viewer (styles/theme.css and the
 // web font registry, which the PDF renders through). Anything else falls back.
+// A family added here must also get its web weights in previewHtml.ts KNOWN_WEIGHTS,
+// or the critic's proof and the Chromium page check draw it at Regular only
+// (tests/magazineV2/previewHtml.test.ts fails until it does).
 
 export const DISPLAY_FONTS = [
   'Playfair Display, Georgia, serif',

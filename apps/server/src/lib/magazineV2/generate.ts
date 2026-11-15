@@ -477,8 +477,25 @@ export async function planPages(opts: {
   existing?: string[];
   /** The issue's Creative Director concept, so new pages share its look and voice. */
   concept?: IssueConcept;
+  /**
+   * The document(s) the user asked these pages to be built FROM ("add 2 pages from
+   * this PDF"). Without it the planner chose each page's subject from a topic of at
+   * most a few hundred characters, so the pages' intents — and therefore what each
+   * page's copywriter looked for in the document — came from the theme rather than
+   * the document (findings C19/C28). Shown as the planner sees a whole issue's
+   * source: an excerpt plus a map of the document's pages.
+   */
+  source?: SourceSelector;
 }): Promise<GenPlanPage[]> {
   const count = Math.max(1, Math.min(12, Math.round(opts.count) || 1));
+  const sourceBlock = opts.source
+    ? await renderSourceFor(opts.source, {
+        maxChars: SOURCE_BUDGET.plan,
+        withMap: true,
+        ...(opts.topic?.trim() ? { intent: opts.topic.trim() } : {}),
+        task: 'plan the new pages from this document',
+      })
+    : '';
   // Distinct per-index angles so a failed planner call still yields varied,
   // ON-SUBJECT pages (not N clones, and not a preset domain) — derived from the
   // issue's own title/topic.
@@ -523,6 +540,15 @@ export async function planPages(opts: {
         'between dense ones, a feature-opener followed by its article. Each page needs a clear,',
         'specific intent, a `look` (your visual direction in a sentence) and a short section title.',
         'The pages must feel like a natural continuation of the same issue.',
+        ...(sourceBlock
+          ? [
+              '',
+              'BUILD THESE PAGES FROM THE DOCUMENT BELOW. Each page\'s `intent` names the part of the',
+              'document it covers (its section, people, results or figures), so its copywriter can find',
+              'it; together the pages cover the parts the request asks for, without overlapping.',
+              sourceBlock,
+            ]
+          : []),
       ].join('\n'),
       prompt: `Design exactly ${count} new interior page(s).`,
       temperature: 0.8,
@@ -1142,7 +1168,9 @@ async function sourcePagePhotos(
   const generate = (r: PhotoRequest, prompt: string): Promise<StoredImage | null> =>
     isImageGenConfigured()
       ? generateAndStoreImage(
-          { prompt, orientation: r.orientation, aspectRatio: nearestAspectRatio(r.boxW, r.boxH), ...(desk.photoStyle ? { style: desk.photoStyle } : {}) },
+          // The Creative Director's look goes in `photoStyle`, the field imagegen now names
+          // for it; `style` is the KIND of picture, and generation always wants a photo.
+          { prompt, orientation: r.orientation, aspectRatio: nearestAspectRatio(r.boxW, r.boxH), style: 'photo', ...(desk.photoStyle ? { photoStyle: desk.photoStyle } : {}) },
           ctx,
         )
       : Promise.resolve(null);
@@ -2207,7 +2235,23 @@ async function dedupeAddedPages(
  */
 export async function generateMorePages(
   issueId: string,
-  opts: { count: number; topic?: string; atIndex: number; prevStatus: string },
+  opts: {
+    count: number;
+    topic?: string;
+    atIndex: number;
+    prevStatus: string;
+    /**
+     * Source documents (read into chunks) the user asked these pages to be built
+     * from — "add 2 pages from this PDF". Already scoped to this magazine by the route.
+     */
+    docIds?: string[];
+    /**
+     * The stored text of chat-attached documents named in the request (those carry
+     * their text on the media row, not as chunks). Used only when no `docIds` were
+     * given: resolveSource lets docIds win and would drop the text.
+     */
+    sourceText?: string;
+  },
 ): Promise<void> {
   const restore = (['ready', 'draft', 'published'].includes(opts.prevStatus) ? opts.prevStatus : 'ready') as string;
   try {
@@ -2224,11 +2268,30 @@ export async function generateMorePages(
     //
     // Now the issue names its own documents, so a page added weeks later reads the
     // same chunks the cover did.
+    //
+    // UNLESS THE REQUEST NAMED ITS OWN. "Add 2 pages from this PDF" used to read only
+    // genSources — written once, when the issue was first generated — so a document
+    // attached later never reached the page writer, and the new pages came out of the
+    // theme while the assistant said they came from the PDF (findings C19/C28). The
+    // named documents are used INSTEAD of the original ones, not merged with them: the
+    // user asked for pages about THIS document, and an old report's chunks would
+    // compete with it for every page.
+    const requestedIds = (opts.docIds ?? []).filter((d): d is string => typeof d === 'string' && !!d);
+    const requestedText = (opts.sourceText ?? '').trim();
+    const requested: SourceSelector | undefined = requestedIds.length > 0
+      ? { docIds: requestedIds }
+      : requestedText
+        ? { text: requestedText }
+        : undefined;
     const genSources = (issue as unknown as { genSources?: unknown }).genSources;
-    const sources = Array.isArray(genSources) && genSources.length > 0
+    const sources: SourceSelector | undefined = requested ?? (Array.isArray(genSources) && genSources.length > 0
       ? { docIds: genSources.filter((d): d is string => typeof d === 'string') }
-      : undefined;
-    if (sources) console.log(`[magazineV2] add-pages: reading from ${sources.docIds.length} stored document(s)`);
+      : undefined);
+    if (requested) {
+      console.log(`[magazineV2] add-pages: building from the requested document${requestedIds.length > 1 ? 's' : ''} (${requestedIds.length || 'attached text'})`);
+    } else if (sources?.docIds) {
+      console.log(`[magazineV2] add-pages: reading from ${sources.docIds.length} stored document(s)`);
+    }
 
     let palette: GenPalette;
     let fonts: GenFonts;
@@ -2270,6 +2333,10 @@ export async function generateMorePages(
         count: opts.count,
         existing: pagesAlreadyIn(existing),
         ...(concept ? { concept } : {}),
+        // Only a document the request named plans the pages: the issue's original
+        // documents already shaped the pages it has, and planning from them again would
+        // cost a map read on every "add a page" for no new information.
+        ...(requested ? { source: requested } : {}),
       }),
     );
     const briefText = (opts.topic || gt.prompt || '').trim().slice(0, 1200);

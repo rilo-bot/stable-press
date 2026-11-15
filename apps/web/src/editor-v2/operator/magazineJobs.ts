@@ -1,5 +1,7 @@
 // ---------------------------------------------------------------------------
-// Magazine Builder v2 — the 'magazine-build' Operator background job.
+// Magazine Builder v2 — the Operator's background jobs: 'magazine-build' (below)
+// and 'magazine-page-copy' (a "Copy a page exactly" run that is still queued when
+// magazine.copyPdfPage stops waiting — see further down).
 //
 // magazine.generate (library) and magazine.addAiPages / addMorePages (studio)
 // start the build exactly as before (driving the real controls), then call
@@ -17,6 +19,8 @@
 import { getJobById, registerJobKind, startJob, type JobPollResult, type OperatorJob } from '@/agent/operator/runtime/jobs';
 import * as api from '../api';
 import { buildStatus } from '../buildStatus';
+import { copyFailureText, copyNoticeText, copyState, pageSizeNote } from '../pageCopy';
+import { showCopiedPage } from '../pageCopyWatch';
 
 export const MAGAZINE_BUILD_JOB = 'magazine-build';
 export const JOB_STARTED_NOTE =
@@ -92,6 +96,104 @@ export async function settlePreviousBuildJob(magazineId: string, signal?: AbortS
     if (signal?.aborted) throw new DOMException('The Stable Hand was stopped.', 'AbortError');
     await new Promise((r) => setTimeout(r, 250));
   }
+}
+
+// ── 'magazine-page-copy': a "Copy a page exactly" run queued behind other work ──
+//
+// magazine.copyPdfPage waits on the copy for a short while itself (it usually lands
+// in seconds). When it is still queued — the worker claims one job at a time, so a
+// copy can sit behind another client's whole magazine build — the action starts
+// this watch and returns at once, instead of sitting out a fixed wait and reporting
+// "still rebuilding" with nothing left to tell the AI when it lands. Finished =
+// the page left 'pending' (see editor-v2/pageCopy.ts for the exact rule). On
+// finishing, the studio of that magazine (if open) is refreshed and the page
+// reloaded on the canvas, so the user and the next magazine.checkPage see the copy.
+
+export const MAGAZINE_PAGE_COPY_JOB = 'magazine-page-copy';
+export const PAGE_COPY_STARTED_NOTE =
+  "The copy is queued in the background — you'll get a [job-update] message when the page is ready. Don't wait or poll; tell the user briefly and stop (or carry on with other work). After it lands, check the page with magazine.checkPage.";
+
+interface PageCopyParams {
+  magazineId: string;
+  pageId: string;
+  /** Real page number (as printed on the canvas), for the messages. */
+  pageNumber: number;
+  /** The page's rev before the copy was asked for. */
+  revBefore?: number;
+  /** The copy route answered, so the page was marked pending (see copyState). */
+  seenPending?: boolean;
+  pdf?: string;
+  docPage?: number;
+}
+
+registerJobKind(MAGAZINE_PAGE_COPY_JOB, (raw, job) => {
+  const p = raw as unknown as PageCopyParams;
+  let seenPending = !!p.seenPending;
+  return async (): Promise<JobPollResult> => {
+    const { issue, pages } = await api.getIssue(p.magazineId);
+    const summary = pages.find((pg) => pg.id === p.pageId);
+    if (summary?.status === 'pending') seenPending = true;
+    const state = copyState(summary, { rev: p.revBefore, seenPending }, Date.now() - job.startedAt);
+    const label = issue.title || undefined;
+    if (state === 'pending') {
+      return { done: 0, total: 1, finished: false, headline: `Copying onto page ${p.pageNumber}`, label };
+    }
+    // Landed (or failed): bring the open studio up to date before reporting.
+    if (state !== 'gone') await showCopiedPage(p.magazineId, p.pageId).catch(() => {});
+    const route = editorRoute(p.magazineId);
+    if (state === 'gone') {
+      return { done: 1, total: 1, finished: true, label, error: `Page ${p.pageNumber} was removed before the copy finished.`, headline: 'Copy failed' };
+    }
+    if (state === 'failed') {
+      return { done: 1, total: 1, finished: true, label, error: copyFailureText(summary, p.pageNumber), headline: 'Copy failed' };
+    }
+    const others = pages.filter((pg) => pg.id !== p.pageId);
+    const notice = copyNoticeText((summary as { notice?: unknown } | undefined)?.notice);
+    const sizeNote = summary ? pageSizeNote(summary, p.pageNumber, others) : null;
+    return {
+      done: 1,
+      total: 1,
+      finished: true,
+      label,
+      headline: `Page ${p.pageNumber} copied`,
+      summary: {
+        magazineId: p.magazineId,
+        page: p.pageNumber,
+        pdf: p.pdf,
+        docPage: p.docPage,
+        rebuilt: true,
+        elements: summary?.elementCount,
+        ...(notice ? { notice } : {}),
+        ...(sizeNote ? { sizeNote } : {}),
+        route,
+        next: `Open the magazine if needed and run magazine.checkPage { page: ${p.pageNumber} } before reporting the copy.`,
+      },
+    };
+  };
+});
+
+export const magazinePageCopyJobId = (magazineId: string, pageId: string) => `${MAGAZINE_PAGE_COPY_JOB}:${magazineId}:${pageId}`;
+
+/** Start (or re-join) the background watch of one page copy. */
+export function startPageCopyJob(opts: PageCopyParams & { title?: string }): OperatorJob {
+  const params: PageCopyParams = {
+    magazineId: opts.magazineId,
+    pageId: opts.pageId,
+    pageNumber: opts.pageNumber,
+    revBefore: opts.revBefore,
+    seenPending: opts.seenPending,
+    pdf: opts.pdf,
+    docPage: opts.docPage,
+  };
+  return startJob({
+    id: magazinePageCopyJobId(opts.magazineId, opts.pageId),
+    kind: MAGAZINE_PAGE_COPY_JOB,
+    label: opts.title?.trim() || `Page ${opts.pageNumber}`,
+    verb: `Copying a PDF page onto page ${opts.pageNumber}`,
+    href: editorRoute(opts.magazineId),
+    params: params as unknown as Record<string, unknown>,
+    intervalMs: 4000,
+  });
 }
 
 /** Start (or re-join) the background watch of a magazine's build. */

@@ -241,6 +241,21 @@ export async function loadChunks(docId: string): Promise<SourceChunk[]> {
 }
 
 /**
+ * The chunks of ONE page of a document (1-based, as the reader numbered them), in
+ * order. For "use page 4 of the report": loadChunks would pull a 500-page document
+ * into memory to keep one page of it; this asks the {docId, pageNo} index for that
+ * page alone.
+ */
+export async function loadPageChunks(docId: string, pageNo: number): Promise<SourceChunk[]> {
+  if (!Number.isInteger(pageNo) || pageNo < 1) return [];
+  const col = await rawCollection(COL.sourceChunks);
+  return (await col
+    .find({ docId: String(docId), pageNo })
+    .sort({ seq: 1 })
+    .toArray()) as unknown as SourceChunk[];
+}
+
+/**
  * Chunks spread EVENLY across a document, for a retrieval with nothing to match on.
  *
  * The fallback used to be `.sort({pageNo,seq}).limit(400)`, which is the first 400

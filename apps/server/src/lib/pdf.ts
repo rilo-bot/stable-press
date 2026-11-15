@@ -43,6 +43,7 @@ interface PptrPage {
   on(event: 'request', handler: (req: PptrRequest) => void): void
   goto(url: string, opts?: { waitUntil?: string; timeout?: number }): Promise<unknown>
   waitForSelector(selector: string, opts?: { timeout?: number }): Promise<unknown>
+  waitForNetworkIdle(opts?: { idleTime?: number; timeout?: number }): Promise<void>
   evaluate<T>(fn: () => T): Promise<T>
   pdf(opts: Record<string, unknown>): Promise<Uint8Array>
   close(): Promise<void>
@@ -265,9 +266,13 @@ const RASTER_DPI = 150
  * @param token     Optional Bearer token — forwarded ONLY to same-app `/api/` calls so
  *                  staff can export an unpublished (preview) edition the headless,
  *                  otherwise-anonymous browser couldn't fetch on its own.
- * @param sheet     The issue's page box in px. Pass the FIRST page's width/height —
- *                  `page.pdf()` takes one size for the whole document, and an issue's
- *                  pages are uniform in practice.
+ * @param sheet     A FALLBACK page box in px (the first page's, by convention). Every
+ *                  page is printed on a sheet of its OWN size: the viewer gives each
+ *                  distinct page size a named `@page` rule and `preferCSSPageSize`
+ *                  makes Chromium use them, so this box only applies to a page the
+ *                  CSS somehow did not size. Pages are NOT uniform: "copy a page" gives
+ *                  a page the source PDF's shape, and an imported Letter magazine
+ *                  gains A4 pages when pages are added.
  */
 export async function renderBulletinPdf(
   url: string,
@@ -314,18 +319,36 @@ async function renderOnce(url: string, cacheKey: string, token: string | undefin
 
     // 'load' (not 'networkidle0') + our explicit readiness marker: the viewer
     // only raises [data-bulletin-ready] after the issue, fonts AND every page
-    // image have loaded, so we don't also pay networkidle0's trailing idle window.
+    // image have reached its FINAL state — loaded, or broken with no fallback left
+    // (a direct S3 URL that 403s is retried through the API proxy, and the marker
+    // waits for that retry too). So we don't pay networkidle0's trailing idle
+    // window on every render.
     await page.goto(url, { waitUntil: 'load', timeout: 60_000 })
     await page.waitForSelector('[data-bulletin-ready="true"]', { timeout: 45_000 })
     // Belt-and-braces: ensure web fonts are fully swapped in before capture.
     await page.evaluate(() => (document as Document).fonts?.ready)
+    // Backstop for the marker: a fallback image the viewer could not see (a src
+    // swapped after its last check) would otherwise print as a blank box, and the
+    // stored PDF is what every later reader downloads. Short idle window, bounded,
+    // and never fatal — a stray long-poll must not fail the render.
+    await page.waitForNetworkIdle({ idleTime: 500, timeout: 15_000 }).catch(() => {})
 
     const pdf = await page.pdf({
       printBackground: true,
-      // Size each sheet to the page's OWN box, converted to physical inches, so one
-      // magazine page maps to exactly one sheet at exactly the size it was designed
-      // as. Naming a paper size instead (A4 in mm) makes a page's sub-pixel overflow
-      // spill onto an extra blank sheet.
+      // EACH PAGE ON A SHEET OF ITS OWN SIZE. The viewer's print CSS gives every
+      // distinct page size a named `@page` rule (sized in inches from the page's own
+      // box) and puts each page on its rule; preferCSSPageSize makes Chromium honour
+      // those instead of one sheet for the whole document. This used to print every
+      // page on the FIRST page's sheet, on the belief that an issue's pages are
+      // uniform — they are not ("copy a page" keeps the source PDF's shape), so a
+      // larger page lost its right and bottom edges or spilled onto an extra sheet
+      // and a smaller one got white bands. The width/height below remain only as
+      // the fallback for a page the CSS did not size.
+      preferCSSPageSize: true,
+      // Sized in physical inches from a page box, so one magazine page maps to
+      // exactly one sheet at exactly the size it was designed as. Naming a paper
+      // size instead (A4 in mm) makes a page's sub-pixel overflow spill onto an
+      // extra blank sheet.
       //
       // These dims come from the ISSUE. They were hard-coded to 794×1123 — the
       // retired v1 template builder's A4-at-96dpi page — which mis-sized every issue

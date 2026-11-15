@@ -9,7 +9,7 @@
 // ---------------------------------------------------------------------------
 
 import { MAX_IMAGE_BYTES } from './config.js';
-import { type StockOrientation } from './stock.js';
+import type { StockOrientation } from './stock.js';
 
 /**
  * Decode `data:<type>[;param]*[;base64],<payload>` into bytes we are willing to
@@ -97,7 +97,12 @@ export type ImageAspectRatio = (typeof IMAGE_ASPECT_RATIOS)[number];
  * frame; `fit: cover` then trims only the small difference, not half the image.
  */
 export function nearestAspectRatio(w: number, h: number): ImageAspectRatio {
-  const target = Math.log(Math.max(1, w) / Math.max(1, h));
+  return nearestToLogRatio(Math.log(Math.max(1, w) / Math.max(1, h)));
+}
+
+/** The supported ratio closest to log(width / height). nearestAspectRatio floors each
+ *  side at 1px (it is given pixel sizes); a written ratio like "0.8:1" must not be. */
+function nearestToLogRatio(target: number): ImageAspectRatio {
   let best: ImageAspectRatio = '1:1';
   let bestGap = Infinity;
   for (const ar of IMAGE_ASPECT_RATIOS) {
@@ -109,6 +114,35 @@ export function nearestAspectRatio(w: number, h: number): ImageAspectRatio {
     }
   }
   return best;
+}
+
+/**
+ * A caller's aspect ratio ("4:5", "16/10", "1075x360", or a box's own "w:h") as the
+ * nearest one the image model accepts, or undefined when it is not a ratio at all.
+ * The model rejects an unsupported `image_config.aspect_ratio` outright (and the 400
+ * retry then drops the shape altogether), so an arbitrary box ratio must be snapped to
+ * the list first rather than passed through.
+ */
+export function normalizeAspectRatio(ratio: string | undefined | null): ImageAspectRatio | undefined {
+  if (typeof ratio !== 'string') return undefined;
+  const m = /^\s*(\d+(?:\.\d+)?)\s*[:/x×]\s*(\d+(?:\.\d+)?)\s*$/i.exec(ratio);
+  if (!m) return undefined;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  if (!(a > 0) || !(b > 0)) return undefined;
+  // From the two terms themselves, not through nearestAspectRatio: that one floors
+  // each side at 1 (pixel sizes), which turned "0.8:1" into 1:1 instead of 4:5.
+  return nearestToLogRatio(Math.log(a / b));
+}
+
+/** The orientation a supported (or any "w:h") aspect ratio implies — the same buckets
+ *  orientationForBox uses — for a caller that knows the ratio but not a box. */
+export function orientationForAspectRatio(ratio: string): StockOrientation | undefined {
+  const m = /^\s*(\d+(?:\.\d+)?)\s*[:/x×]\s*(\d+(?:\.\d+)?)\s*$/i.exec(ratio);
+  if (!m) return undefined;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  return a > 0 && b > 0 ? orientationForBox(a, b) : undefined;
 }
 
 /** Box ratio → the orientation to ask for. The SAME rule the stock path uses to

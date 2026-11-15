@@ -105,6 +105,12 @@ export interface PageRaster {
    *  QR isn't needed), and the modules are kept out of lineBlocks so they
    *  don't litter the page as stray shape rules. */
   qrRegions: Rect[];
+  /** True when the page carries a picture covering (nearly) all of it. Such a
+   *  layer is never promoted to an element (see FULL_PAGE_FRACTION), so without
+   *  this flag a scanned page, which is exactly one such picture and no text
+   *  layer, would be indistinguishable from a blank one. processPage uses it to
+   *  tell the user why a copied scan has no editable words. */
+  fullPageImage: boolean;
 }
 
 function colorToHex(c: number[] | undefined): string {
@@ -401,8 +407,14 @@ function centerInside(r: Rect, box: Rect): boolean {
  * one-line elements). Image blocks come back already decoded, with their
  * placement rect, ready to re-encode and upload — no separate embedded-image
  * extraction step needed.
+ *
+ * `imagesOnly` skips drawing the page itself (backgroundPng comes back empty); the
+ * walk still runs and the embedded pictures are decoded exactly as above. It is for
+ * lifting the photos out of an attached PDF (jobs/extractDocumentImages.ts), where
+ * the whole-page raster — the costliest step, and the one that holds the most WASM
+ * memory — would only be thrown away.
  */
-export function rasterizePage(doc: ReturnType<typeof openPdf>, index: number): PageRaster {
+export function rasterizePage(doc: ReturnType<typeof openPdf>, index: number, opts: { imagesOnly?: boolean } = {}): PageRaster {
   // MuPDF objects live in the WASM heap and are NOT reclaimed by V8's GC — every
   // Page/Pixmap/StructuredText/Image created here must be explicitly destroy()'d
   // or it accumulates across every page of every issue until the heap aborts (an
@@ -412,13 +424,13 @@ export function rasterizePage(doc: ReturnType<typeof openPdf>, index: number): P
   // the whole (heavily-commented) extractor under a try.
   const page = doc.loadPage(index);
   try {
-    return extractPage(page, index);
+    return extractPage(page, index, opts.imagesOnly === true);
   } finally {
     page.destroy();
   }
 }
 
-function extractPage(page: Page, index: number): PageRaster {
+function extractPage(page: Page, index: number, imagesOnly = false): PageRaster {
   const bounds = page.getBounds(); // [x0, y0, x1, y1] in PDF points
   const wPt = bounds[2]! - bounds[0]!;
   const hPt = bounds[3]! - bounds[1]!;
@@ -432,16 +444,18 @@ function extractPage(page: Page, index: number): PageRaster {
   const pxWidth = Math.round(wPt * scale);
   const pxHeight = Math.round(hPt * scale);
 
-  const matrix = mupdf.Matrix.scale(scale, scale);
-  const pixmap = page.toPixmap(matrix, mupdf.ColorSpace.DeviceRGB, false);
   // Copy the raster into a Node Buffer, then free the WASM pixmap — in finally so
   // an asPNG()/Buffer.from failure (encode error, or a Node OOM copying a ~100MB
-  // raster) can't leak the pixmap.
-  let backgroundPng: Buffer;
-  try {
-    backgroundPng = Buffer.from(pixmap.asPNG());
-  } finally {
-    pixmap.destroy();
+  // raster) can't leak the pixmap. Not drawn at all when only the pictures are wanted.
+  let backgroundPng: Buffer = Buffer.alloc(0);
+  if (!imagesOnly) {
+    const matrix = mupdf.Matrix.scale(scale, scale);
+    const pixmap = page.toPixmap(matrix, mupdf.ColorSpace.DeviceRGB, false);
+    try {
+      backgroundPng = Buffer.from(pixmap.asPNG());
+    } finally {
+      pixmap.destroy();
+    }
   }
 
   const toPx = (x: number, y: number): [number, number] => [(x - originX) * scale, (y - originY) * scale];
@@ -454,6 +468,7 @@ function extractPage(page: Page, index: number): PageRaster {
   const rules: RoughLineBlock[] = [];
   const qrCandidates: Rect[] = [];
   let cappedVectors = false;
+  let fullPageImage = false;
 
   // Accumulated per LOGICAL run of same-formatted lines, not per MuPDF
   // "text block" — MuPDF's own block grouping can merge visually distinct
@@ -605,7 +620,10 @@ function extractPage(page: Page, index: number): PageRaster {
         // Skip full-page composite/overlay layers — extracting one as an
         // element would blanket (and hide) everything beneath it; it's
         // already in the background raster.
-        if (w >= pxWidth * FULL_PAGE_FRACTION && h >= pxHeight * FULL_PAGE_FRACTION) return;
+        if (w >= pxWidth * FULL_PAGE_FRACTION && h >= pxHeight * FULL_PAGE_FRACTION) {
+          fullPageImage = true;
+          return;
+        }
         // Bound the decode: a pathologically large embedded image would allocate
         // a multi-GB pixmap and abort the WASM heap. Past the budget, leave it in
         // the background raster rather than promote it to its own element.
@@ -725,5 +743,5 @@ function extractPage(page: Page, index: number): PageRaster {
     if (!dup) imageBlocks.push({ x: blk.x, y: blk.y, w: blk.w, h: blk.h, png: blk.png, hasAlpha: blk.hasAlpha, maskPng: blk.maskPng });
   }
 
-  return { pxWidth, pxHeight, backgroundPng, textBlocks, imageBlocks, lineBlocks, qrRegions };
+  return { pxWidth, pxHeight, backgroundPng, textBlocks, imageBlocks, lineBlocks, qrRegions, fullPageImage };
 }

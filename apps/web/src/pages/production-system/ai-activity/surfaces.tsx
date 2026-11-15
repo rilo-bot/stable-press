@@ -68,6 +68,7 @@ const FEATURE_LABELS: Record<string, string> = {
   copy: 'Copywriter',
   layout: 'Art Director',
   critic: 'Visual Critic',
+  look: 'Page look (vision)',
   photo: 'Photo Director',
   editor: 'Editor-in-Chief',
   studio: 'Studio chat',

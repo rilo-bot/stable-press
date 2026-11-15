@@ -24,6 +24,7 @@ import { actionError, quoteRef } from '@/agent/operator/runtime/humanRef';
 import type { IssueSummary } from '../api';
 import { anchor, assertEnabled, errorToasts, waitUntil, watchToasts } from './shared';
 import { JOB_STARTED_NOTE, startMagazineBuildJob } from './magazineJobs';
+import { briefWithPageCount } from '../pageCount';
 
 const HOME = '/production-system/magazine-v2';
 const editorRoute = (id: string) => `${HOME}/${id}`;
@@ -33,10 +34,24 @@ const idFromPath = (path: string) => {
   return m ? m[1]! : null;
 };
 
-/** Mirrors parsePageCount in MagazineV2Home — the composer's only page-count input
- *  is the brief itself ("… 6 pages"), so that is what the action writes into. */
-const COUNT_RE =
-  /\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen)[-\s]*pages?\b/i;
+/**
+ * The composer's only page-count input is the brief itself ("… 6 pages"), read by
+ * parsePageCount (../pageCount, the SAME function the composer calls). The action
+ * used to append the count only when the brief mentioned no page count at all, so
+ * "results across 3 pages" with pageCount 12 built 3 pages under a card that said
+ * 12. briefWithPageCount appends the count whenever the composer would read a
+ * different number, and reports a conflict when the brief names a larger one.
+ */
+function pageCountConflict(conflict: number, asked: number): Error {
+  return actionError(
+    `The brief names a ${conflict}-page magazine but ${asked} pages were asked for — nothing was built.`,
+    {
+      next:
+        `Call magazine.generate again with a brief that does not mention a page count (pass pageCount: ${asked}), ` +
+        `or with pageCount: ${conflict} if the user meant that.`,
+    },
+  );
+}
 
 interface HomeState {
   issues: IssueSummary[];
@@ -115,14 +130,22 @@ export function useMagazineHomeActions(state: HomeState): void {
         pageCount: z.number().int().min(3).max(16).optional(),
       }),
       // A new magazine is a sizeable AI build — the user approves the brief first.
-      confirm: ({ brief, pageCount }) =>
-        `Build a new ${pageCount ? `${pageCount}-page ` : ''}magazine from this brief? “${brief.trim().slice(0, 160)}${brief.trim().length > 160 ? '…' : ''}”`,
+      // The card names the count the composer WILL build (read from the final
+      // brief), not merely the one asked for; a brief that cannot say the asked-for
+      // count gets no card — run() refuses with the reason instead.
+      confirm: ({ brief, pageCount }) => {
+        const plan = briefWithPageCount(brief, pageCount);
+        if (plan.conflict) return null;
+        const n = plan.pageCount;
+        return `Build a new ${n ? `${n}-page ` : ''}magazine from this brief? “${brief.trim().slice(0, 160)}${brief.trim().length > 160 ? '…' : ''}”`;
+      },
       run: async ({ brief, pageCount }, ui) => {
         if (!live.current.mayCreate) throw new Error('Your role cannot create magazines.');
         // The composer reads the page count out of the brief; say it there, the way
-        // a person would, unless the brief already names one.
-        let text = brief.trim();
-        if (pageCount && !COUNT_RE.test(text)) text = `${text.replace(/[.\s]+$/, '')} — ${pageCount} pages.`;
+        // a person would, whenever the composer would otherwise read another number.
+        const plan = briefWithPageCount(brief, pageCount);
+        if (plan.conflict && pageCount) throw pageCountConflict(plan.conflict, pageCount);
+        const text = plan.text;
 
         ui.step('Writing the brief');
         await ui.type('mag.brief-input', text, { clear: true });
@@ -151,11 +174,13 @@ export function useMagazineHomeActions(state: HomeState): void {
         if ('error' in outcome) throw new Error(outcome.error);
         // The build runs on the server for minutes. Watch it in the background
         // (polls the server, survives navigation) instead of holding the turn open.
-        const job = startMagazineBuildJob({ magazineId: outcome.id, mode: 'new', requested: pageCount });
+        const job = startMagazineBuildJob({ magazineId: outcome.id, mode: 'new', requested: plan.pageCount });
         return {
           magazineId: outcome.id,
           route: editorRoute(outcome.id),
           brief: text,
+          // What the composer read from the brief (undefined = the AI picks the length).
+          pageCount: plan.pageCount,
           jobId: job.id,
           started: true,
           note: JOB_STARTED_NOTE,

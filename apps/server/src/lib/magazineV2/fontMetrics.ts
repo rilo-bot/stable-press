@@ -18,10 +18,61 @@
 // font of that category — widest = conservative, so an unknown family still
 // can't overflow. No name-based classification anywhere.
 //
+// Three cases are resolved to the face the browser really draws rather than to
+// that conservative guess, because the guess was wrong for them in a known way:
+//   'inherit' (or no family)  the element takes the font of the page around it —
+//                             the app's body face, Source Sans 3 (theme.css), on the
+//                             editor canvas, the public viewer and the PDF (which
+//                             prints the real route). Measured as the widest sans
+//                             (Archivo) it came out wider than it prints (about 5%
+//                             on running text, 13% on the mean glyph), so every text
+//                             box the Studio added was shrunk below what fitted.
+//   monospace                 every glyph is the same width (0.6em) — a proportional
+//                             sans measures "illicit" at half its real width, so
+//                             monospace copy from an imported PDF would overflow.
+//   metric twins              Liberation Serif / Tinos / "Times" share Times New
+//                             Roman's advances, Liberation Sans / Arimo share Arial's,
+//                             by design. They are the same widths, not a guess.
+//
 // Pure + server-safe: static data + arithmetic, no DOM, no LLM, no I/O.
 // ---------------------------------------------------------------------------
 
 import { FONT_METRICS, type FontMetricEntry, type FontMetricCategory } from './fontMetrics.data.js';
+
+/**
+ * The face a text element with no family of its own ('inherit', the model default)
+ * is drawn in: the app's body font (apps/web/src/styles/theme.css `--font-body`).
+ * Exported so the proof renderer and the Studio can give such an element the same
+ * face explicitly instead of leaving it to whatever page it is drawn inside.
+ */
+export const HOST_BODY_FONT_STACK = "'Source Sans 3', Arial, sans-serif";
+
+/** CSS-wide keywords: not a family at all. All but `initial` make an element take
+ *  its parent's font; `initial` gives the browser's default face (Times New Roman). */
+const INHERITING_KEYWORDS = new Set(['inherit', 'unset', 'revert', 'revert-layer']);
+
+/** Families whose advance widths are identical to a measured face by design. */
+const METRIC_TWINS: Record<string, string> = {
+  times: 'times new roman',
+  'liberation serif': 'times new roman',
+  tinos: 'times new roman',
+  'liberation sans': 'arial',
+  arimo: 'arial',
+};
+
+/** Monospace faces: one advance for every glyph. Courier New / Liberation Mono are
+ *  0.600em, DejaVu Sans Mono and Menlo 0.602em — the wider is used. */
+const MONO_ADVANCE_EM = 0.602;
+const MONO_FAMILIES = new Set(['courier new', 'courier', 'liberation mono', 'cousine']);
+const GENERIC_MONO = new Set(['monospace', 'ui-monospace']);
+/** An empty per-glyph table makes measureRunWidthPx use `base` for every ASCII glyph,
+ *  which is exactly a fixed advance. */
+const MONO_METRICS: FontMetricEntry = {
+  category: 'mono',
+  weights: [400, 700],
+  adv: { '400': {}, '700': {} },
+  base: { '400': MONO_ADVANCE_EM, '700': MONO_ADVANCE_EM },
+};
 
 /** A family's widest measured mean advance (across its weights) — used to rank
  *  fallbacks by "widest = most conservative". */
@@ -75,23 +126,69 @@ function splitStack(fontFamily: string): string[] {
     .filter(Boolean);
 }
 
+/** The measured family a font-family value is measured as (its key in FONT_METRICS, or
+ *  'monospace'), and how it got there — so a test or a report can say "measured as …". */
+export function fontMetricsKey(fontFamily: string | undefined): {
+  key: string;
+  via: 'named' | 'twin' | 'host' | 'generic' | 'fallback';
+} {
+  const parts = splitStack(fontFamily ?? '');
+  // The cascade: the first family the browser could draw that we can measure.
+  for (const p of parts) {
+    if (FONT_METRICS[p]) return { key: p, via: 'named' };
+    const twin = METRIC_TWINS[p];
+    if (twin && FONT_METRICS[twin]) return { key: twin, via: 'twin' };
+    if (MONO_FAMILIES.has(p)) return { key: 'monospace', via: 'named' };
+  }
+  // No family at all, or only an inheriting keyword: the element is drawn in the face
+  // of the page around it.
+  const named = parts.filter((p) => !INHERITING_KEYWORDS.has(p) && p !== 'initial');
+  if (named.length === 0) {
+    if (parts.includes('initial') && FONT_METRICS['times new roman']) return { key: 'times new roman', via: 'generic' };
+    return { key: hostBodyKey(), via: 'host' };
+  }
+  for (const p of parts) {
+    if (GENERIC_MONO.has(p)) return { key: 'monospace', via: 'generic' };
+    if (GENERIC_SERIF.has(p)) return { key: keyOf(FALLBACK_SERIF), via: 'generic' };
+    if (GENERIC_SCRIPT.has(p)) return { key: keyOf(FALLBACK_SCRIPT), via: 'generic' };
+  }
+  // 'sans-serif' / 'system-ui' / a family we have never measured → the widest sans.
+  // An unmeasured named face may be a wide system font on the reader's machine
+  // (Verdana, Tahoma), so this stays deliberately conservative.
+  return { key: keyOf(FALLBACK_SANS), via: parts.includes('sans-serif') ? 'generic' : 'fallback' };
+}
+
+function keyOf(entry: FontMetricEntry): string {
+  for (const [k, v] of Object.entries(FONT_METRICS)) if (v === entry) return k;
+  return '';
+}
+
+/** FONT_METRICS key of the host body face (its first family; widest sans if it were
+ *  ever missing from the measured table). */
+function hostBodyKey(): string {
+  const first = splitStack(HOST_BODY_FONT_STACK)[0] ?? '';
+  return FONT_METRICS[first] ? first : keyOf(FALLBACK_SANS);
+}
+
+// Every glyph run measured goes through resolveFontMetrics (once per word per trial
+// size), and a page has only a handful of distinct stacks — so resolution is memoised.
+const RESOLVED = new Map<string, FontMetricEntry>();
+
 /**
  * Resolve a CSS font-family value to a measured metric entry, honouring the
- * cascade: the first named family we have measured wins; otherwise the stack's
+ * cascade: the first named family we have measured (or its metric twin) wins;
+ * no family / 'inherit' is the host page's body face; otherwise the stack's
  * trailing generic keyword picks a conservative same-category fallback.
  */
 export function resolveFontMetrics(fontFamily: string | undefined): FontMetricEntry {
-  const parts = splitStack(fontFamily ?? '');
-  for (const p of parts) {
-    const hit = FONT_METRICS[p];
-    if (hit) return hit;
-  }
-  for (const p of parts) {
-    if (GENERIC_SERIF.has(p)) return FALLBACK_SERIF;
-    if (GENERIC_SCRIPT.has(p)) return FALLBACK_SCRIPT;
-    // 'sans-serif' / 'monospace' / 'system-ui' / unknown → widest sans (safe).
-  }
-  return FALLBACK_SANS;
+  const stack = fontFamily ?? '';
+  const hit = RESOLVED.get(stack);
+  if (hit) return hit;
+  const { key } = fontMetricsKey(stack);
+  const entry = key === 'monospace' ? MONO_METRICS : (FONT_METRICS[key] ?? FALLBACK_SANS);
+  if (RESOLVED.size > 256) RESOLVED.clear();
+  RESOLVED.set(stack, entry);
+  return entry;
 }
 
 /** East-Asian WIDE / full-width code points (CJK, kana, Hangul, full-width

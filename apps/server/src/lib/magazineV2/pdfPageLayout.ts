@@ -348,11 +348,45 @@ function alignOf(b: Block, page: { width: number }, content: { x: number; w: num
 }
 
 /**
+ * Why a measured page gave no LayoutReading — the sentence the user (or the agent
+ * relaying it) is told when layoutFromMeasure returns null.
+ *
+ * Three different situations, three different things for the user to do:
+ *
+ *   blank    nothing placed on the page at all — pick another page.
+ *   scanned  no text layer, and a picture covering the page. A scan is FULL, not
+ *            empty, so "there is not enough on page 3" was simply false and sent
+ *            people looking for a problem with their page. The honest cause is
+ *            that a scan's words are pixels, which only a picture-reading can see —
+ *            so the useful advice is to send the page as an image (the vision path,
+ *            readLayout.ts) rather than as a PDF. Rasterising here instead is not
+ *            available: the server has pdfjs without a canvas; the worker's MuPDF
+ *            renderer is the only one that draws pages.
+ *   sparse   some text or a picture, but fewer than two things to arrange.
+ */
+export function noLayoutReason(page: PdfPageMeasure, pageNo: number): string {
+  if (page.runs.length === 0 && page.images.length === 0) {
+    return `Page ${pageNo} is blank — there is no layout on it to copy.`;
+  }
+  const pageArea = page.width * page.height;
+  const coversPage =
+    pageArea > 0 && page.images.some((i) => (i.w * i.h) / pageArea >= FULL_BLEED_AREA);
+  if (page.runs.length === 0 && coversPage) {
+    return (
+      `Page ${pageNo} of that PDF is a scanned picture with no text layer, so its layout cannot be measured from the file. ` +
+      'Attach a screenshot or image of that page instead and its layout can be matched from the picture.'
+    );
+  }
+  return `There is not enough on page ${pageNo} to read as a layout. A page with a headline, some text and a picture works best.`;
+}
+
+/**
  * Turn one measured page into a LayoutReading, or null when there is not enough
  * on it to call a composition.
  *
  * Null is a real answer — the same one readLayoutImage gives for a picture it
- * could not make out — and the caller must say so rather than build from nothing.
+ * could not make out — and the caller must say so rather than build from nothing
+ * (noLayoutReason says which of the reasons it was).
  */
 export function layoutFromMeasure(page: PdfPageMeasure): LayoutReading | null {
   const { width, height } = page;

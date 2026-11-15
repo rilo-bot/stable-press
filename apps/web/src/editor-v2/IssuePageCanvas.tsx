@@ -10,10 +10,18 @@
 // is `container-type: inline-size`, element positions are % of the page dims,
 // and font-size is `cqw` (a % of the container's inline size). Resize the
 // container and every element scales together with zero re-measure.
+//
+// Every element's outer box carries `data-el-id="<element id>"`, and a text
+// element's inner (content) div carries `data-el-text` — the same markers the
+// server's proof render writes (lib/magazineV2/previewHtml.ts). They change
+// nothing on screen, in the public viewer or in the PDF; they are how the page
+// check (editor-v2/pageCheck.ts) finds each element's drawn box and lines, to
+// measure clipped text, text past the page edge, overlaps and broken pictures.
 // ---------------------------------------------------------------------------
 
 import type { CSSProperties } from 'react';
 import { pageTextHtml } from '@/lib/htmlInline';
+import { keepsPdfLines } from '@/lib/pdfLines';
 import { resolveIcon } from '@/lib/iconRegistry';
 import type { IssuePageData, MagazineElement } from './model';
 import { pctRect, pxCqw } from './geometry';
@@ -38,7 +46,11 @@ function TextElement({ el, page }: { el: MagazineElement; page: IssuePageData })
   // measured each box to fit), so it must NOT re-wrap — "pre" + visible overflow
   // lets a web-font substitute spill a few px rather than re-break a masthead.
   // GENERATED/MANUAL copy is authored to flow into its box, so it wraps + clips.
+  // Extracted text whose lines no longer fit its box (a paragraph rewritten as one
+  // line, saved before edits started converting it) wraps too — drawn "as measured"
+  // it ran off the page edge. lib/pdfLines.ts.
   const extracted = el.source === 'extracted';
+  const pdfLines = keepsPdfLines(el);
   const vAlign = el.text.vAlign ?? 'top';
   const box: CSSProperties = {
     ...elementBoxStyle(el, page),
@@ -63,14 +75,14 @@ function TextElement({ el, page }: { el: MagazineElement; page: IssuePageData })
     // Undefined when unset so the CSS default ('normal'/'none') applies.
     letterSpacing: el.text.letterSpacing ? pxCqw(el.text.letterSpacing, page.width) : undefined,
     textTransform: el.text.textTransform,
-    whiteSpace: extracted ? 'pre' : 'pre-wrap',
-    overflowWrap: extracted ? undefined : 'break-word',
+    whiteSpace: pdfLines ? 'pre' : 'pre-wrap',
+    overflowWrap: pdfLines ? undefined : 'break-word',
   };
   // Content is sanitised server-side on every write; we re-sanitise on render as
   // defense-in-depth (same trust model as the v1 read-only views).
   return (
-    <div style={box} data-role={el.text.role}>
-      <div style={textStyle} dangerouslySetInnerHTML={{ __html: pageTextHtml(el.text.content) }} />
+    <div style={box} data-el-id={el.id} data-role={el.text.role}>
+      <div style={textStyle} data-el-text="" dangerouslySetInnerHTML={{ __html: pageTextHtml(el.text.content) }} />
     </div>
   );
 }
@@ -79,13 +91,13 @@ function ShapeElement({ el, page }: { el: MagazineElement; page: IssuePageData }
   if (!el.shape) return null;
   // opacity < 1 → a translucent scrim: the photo beneath shows through while the
   // overlaid text stays legible (instead of a solid block hiding the picture).
-  return <div style={{ ...elementBoxStyle(el, page), background: el.shape.fill, opacity: el.shape.opacity ?? 1 }} />;
+  return <div style={{ ...elementBoxStyle(el, page), background: el.shape.fill, opacity: el.shape.opacity ?? 1 }} data-el-id={el.id} />;
 }
 
 function QrElement({ el, page }: { el: MagazineElement; page: IssuePageData }) {
   if (!el.qr) return null;
   return (
-    <div style={elementBoxStyle(el, page)}>
+    <div style={elementBoxStyle(el, page)} data-el-id={el.id}>
       <QrBlock qr={el.qr} linkInNewTab />
     </div>
   );
@@ -105,14 +117,14 @@ function IconElement({ el, page }: { el: MagazineElement; page: IssuePageData })
   // AI-authored icon leaves (feature rows, contact/CTA badges) actually draw.
   if (el.icon.src) {
     return (
-      <div style={wrap}>
+      <div style={wrap} data-el-id={el.id}>
         <ResilientImg src={el.icon.src} alt="" className="h-full w-full" style={{ objectFit: 'contain' }} />
       </div>
     );
   }
   const Glyph = resolveIcon(el.icon.name);
   return (
-    <div style={wrap}>
+    <div style={wrap} data-el-id={el.id}>
       <Glyph style={{ width: '100%', height: '100%' }} strokeWidth={1.6} absoluteStrokeWidth />
     </div>
   );
@@ -121,7 +133,7 @@ function IconElement({ el, page }: { el: MagazineElement; page: IssuePageData })
 function ImageElement({ el, page, lazy }: { el: MagazineElement; page: IssuePageData; lazy?: boolean }) {
   if (!el.image?.url) return null;
   return (
-    <div style={elementBoxStyle(el, page)}>
+    <div style={elementBoxStyle(el, page)} data-el-id={el.id}>
       <ResilientImg
         src={el.image.url}
         alt={el.image.alt}

@@ -29,6 +29,9 @@ import { BuildProgress, BuildBanner, ShimmerText } from './BuildProgress';
 import { SourceTrouble, readingSummary, useSourceReading } from './SourceReadingPanel';
 import { awaitingOwner, submittablePages, publishBlockedReason, readOnlyReason } from './review';
 import type { ElementType, MagazineElement } from './model';
+import { pageTextStyle, zForNew } from './addDefaults';
+import { pageNoticeText } from './pageCopy';
+import { WaitingChangesBar } from './WaitingChangesBar';
 import { useMagazineEditorActions } from './operator/useMagazineEditorActions';
 import { useMagazineDangerActions } from './operator/useMagazineDangerActions';
 
@@ -61,7 +64,13 @@ function useIsPhone(): boolean {
   return phone;
 }
 
-function newElement(kind: ElementType, page: { width: number; height: number }, topZ: number): Partial<MagazineElement> {
+/**
+ * A fresh element for the Add buttons: centred, a third of the way down, ON TOP of
+ * everything already on the page (zForNew), and — for text — in the page's OWN body
+ * typography when it has any (pageTextStyle), so a caption added beside generated
+ * copy matches it instead of arriving in a fixed 44px Georgia. See ./addDefaults.
+ */
+function newElement(kind: ElementType, page: { width: number; height: number; elements: MagazineElement[] }): Partial<MagazineElement> {
   const w = kind === 'qr' ? 200 : kind === 'icon' ? 120 : kind === 'shape' ? 320 : 440;
   const h = kind === 'qr' ? 200 : kind === 'icon' ? 120 : kind === 'text' ? 90 : 240;
   const base: Partial<MagazineElement> = {
@@ -71,11 +80,28 @@ function newElement(kind: ElementType, page: { width: number; height: number }, 
     w,
     h,
     rotation: 0,
-    zIndex: topZ + 1,
+    zIndex: zForNew(page.elements),
     locked: false,
     source: 'manual',
   };
-  if (kind === 'text') base.text = { content: 'New text', role: 'body', fontFamily: 'Georgia, serif', fontSize: 44, maxFontSize: 44, fontWeight: 400, color: '#111111', align: 'left', lineHeight: 1.3, autoFit: 'shrink' };
+  if (kind === 'text') {
+    const own = pageTextStyle(page.elements, 'body');
+    const size = own?.fontSize ?? 44;
+    base.text = {
+      content: 'New text',
+      role: 'body',
+      fontFamily: own?.fontFamily ?? 'Georgia, serif',
+      fontSize: size,
+      maxFontSize: size,
+      fontWeight: own?.fontWeight ?? 400,
+      color: own?.color ?? '#111111',
+      align: 'left',
+      lineHeight: own?.lineHeight ?? 1.3,
+      ...(own?.letterSpacing ? { letterSpacing: own.letterSpacing } : {}),
+      ...(own?.textTransform ? { textTransform: own.textTransform } : {}),
+      autoFit: 'shrink',
+    };
+  }
   if (kind === 'shape') base.shape = { fill: '#0a2342' };
   if (kind === 'image') base.image = { assetId: '', url: '', alt: '', fit: 'cover' };
   if (kind === 'qr') base.qr = { url: '', fg: '#000000', bg: '#ffffff' };
@@ -136,6 +162,17 @@ export default function MagazineEditorV2() {
      * about that click rather than a subscription).
      */
     hasPage: useEditorStore((st) => !!st.page),
+    /**
+     * The banner for an open page whose words are part of its background picture (a
+     * scanned or outlined-type PDF page, C33) — a string, not the page, for the same
+     * reason as `hasPage`: it changes only when the page or its background does.
+     */
+    pageNotice: useEditorStore((st) => {
+      const p = st.page;
+      if (!p) return '';
+      const notice = p.notice || st.pages.find((x) => x.id === p.id)?.notice;
+      return pageNoticeText(notice, p.background) ?? '';
+    }),
     currentPageId: useEditorStore((st) => st.currentPageId),
     selectedId: useEditorStore((st) => st.selectedId),
     zoomWidth: useEditorStore((st) => st.zoomWidth),
@@ -403,8 +440,7 @@ export default function MagazineEditorV2() {
     // Read the page at CLICK time rather than subscribing to it — see `hasPage`.
     const page = useEditorStore.getState().page;
     if (!page) return;
-    const topZ = page.elements.reduce((m, e) => Math.max(m, e.zIndex), 0);
-    void s.addElement(newElement(kind, page, topZ));
+    void s.addElement(newElement(kind, page));
   };
 
   // Still being built by "Build with AI" / import — pages stream in live below.
@@ -905,6 +941,26 @@ export default function MagazineEditorV2() {
               )}
             </div>
           )}
+
+          {/* A page that is one picture of a PDF page (C33). Clicking its words selects
+              nothing and the Design Helper cannot find them either; without this the
+              page simply looks broken. */}
+          {s.pageNotice && (
+            <div
+              role="note"
+              data-agent-id="mag.page-notice"
+              data-agent-label={s.pageNotice}
+              className="flex items-center gap-2 border-b border-sky-400/25 bg-sky-400/10 px-4 py-1.5 text-ui-sm text-sky-100"
+            >
+              <ImageIcon size={12} className="flex-shrink-0" />
+              <span>{s.pageNotice}</span>
+            </div>
+          )}
+
+          {/* Every page's waiting Design Helper changes, visible whether or not the
+              Design Helper panel is open. Mounting it here makes the panel's own copy
+              step aside, so it is never drawn twice. */}
+          <WaitingChangesBar where="editor" />
 
           {/* Canvas */}
           <div ref={canvasRef} className="min-h-0 flex-1 overflow-auto bg-studio-bg">

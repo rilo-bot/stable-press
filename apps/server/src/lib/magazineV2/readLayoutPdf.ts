@@ -17,7 +17,7 @@
 // ---------------------------------------------------------------------------
 
 import { openPdf } from '../agent/pdfText.js';
-import { layoutFromMeasure } from './pdfPageLayout.js';
+import { layoutFromMeasure, noLayoutReason } from './pdfPageLayout.js';
 import type { LayoutReading } from './layoutReading.js';
 
 export interface ReadLayoutPdfResult {
@@ -67,12 +67,10 @@ export async function readLayoutPdfPage(bytes: Buffer, pageNo = 1): Promise<Read
       return {
         reading: null,
         // The honest cause, not a generic failure: a page with nothing placed on it
-        // has no composition to copy, and a scan has no text layer to measure. Both
-        // are the user's to act on — a different page will work.
-        error:
-          measured.runs.length === 0 && measured.images.length === 0
-            ? `Page ${wanted} is blank — there is no layout on it to copy.`
-            : `There is not enough on page ${wanted} to read as a layout. A page with a headline, some text and a picture works best.`,
+        // has no composition to copy, and a scan has no text layer to measure (it
+        // is full, not empty — so it is told to send the page as a picture). Each
+        // is the user's to act on. See noLayoutReason.
+        error: noLayoutReason(measured, wanted),
         pageCount,
       };
     }

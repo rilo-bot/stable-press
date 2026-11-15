@@ -21,25 +21,22 @@ import { FileText } from 'lucide-react';
 import { ShimmerText } from './BuildProgress';
 import { useEditorStore } from './store';
 import * as api from './api';
+import { pdfChoices, type PdfChoice } from './pdfChoices';
 
-/** One PDF this magazine holds, from either store. */
-export interface PdfChoice {
-  docId: string;
-  name: string;
-  /**
-   * Pages, when something has counted them. 0 means UNKNOWN — a chat attachment was
-   * never read page by page — and never "empty". Mirrors magazineDocs.ts, where the
-   * same 0 carries the same meaning, so a caller must not render it as a count.
-   */
-  pages: number;
-}
+export type { PdfChoice } from './pdfChoices';
 
-const isPdf = (contentType: string): boolean => contentType === 'application/pdf';
-
-/** Every PDF attached to the open magazine, both stores, de-duplicated. `null`
- *  while loading — distinct from `[]`, which means "none attached". */
+/** Every PDF attached to the open magazine, both stores, ONE entry per file (see
+ *  pdfChoices: a PDF attached in the Design Helper is in both stores, and was listed
+ *  twice). `null` while loading — distinct from `[]`, which means "none attached".
+ *
+ *  Re-read whenever this tab stores a document (`uploadsVersion`). It used to be read
+ *  once per magazine, so a PDF sent in the Design Helper — which stores it in Uploads
+ *  — was missing from "Copy a page exactly" until a reload, and the copy looked like it
+ *  had lost the file. The previous list stays on screen while the new one loads, so a
+ *  choice in progress does not flicker back to "Looking for PDFs". */
 export function usePdfChoices(): PdfChoice[] | null {
   const issueId = useEditorStore((s) => s.issueId);
+  const uploadsVersion = useEditorStore((s) => s.uploadsVersion);
   const [docs, setDocs] = useState<PdfChoice[] | null>(null);
 
   useEffect(() => {
@@ -53,26 +50,14 @@ export function usePdfChoices(): PdfChoice[] | null {
         api.listUploads(issueId).catch(() => []),
       ]);
       if (!alive) return;
-      const seen = new Set<string>();
-      const out: PdfChoice[] = [];
       // Source documents first: attaching a file can write to both, and this is the
       // copy that knows its own length. Same precedence as magazineDocument().
-      for (const s of sources) {
-        if (!isPdf(s.contentType) || seen.has(s.id)) continue;
-        seen.add(s.id);
-        out.push({ docId: s.id, name: s.originalName, pages: s.pagesTotal || 0 });
-      }
-      for (const u of uploads) {
-        if (!isPdf(u.contentType) || seen.has(u.id)) continue;
-        seen.add(u.id);
-        out.push({ docId: u.id, name: u.originalName, pages: 0 });
-      }
-      setDocs(out);
+      setDocs(pdfChoices(sources, uploads));
     })();
     return () => {
       alive = false;
     };
-  }, [issueId]);
+  }, [issueId, uploadsVersion]);
 
   return docs;
 }
@@ -125,7 +110,11 @@ export function PdfPagePicker({
           className="min-w-0 flex-1 rounded-sm border border-studio-edge bg-studio-raise px-1.5 py-1 text-ui-sm text-studio-ink"
         >
           {docs.map((d) => (
-            <option key={d.docId} value={d.docId}>{d.name}{d.pages > 0 ? ` (${d.pages} pages)` : ''}</option>
+            // `data-alias-ids`: the other ids this one file is stored under, so The Stable
+            // Hand can find the PDF it has just saved by that upload's own id.
+            <option key={d.docId} value={d.docId} data-alias-ids={d.aliases.length > 0 ? d.aliases.join(' ') : undefined}>
+              {d.name}{d.pages > 0 ? ` (${d.pages} pages)` : ''}
+            </option>
           ))}
         </select>
       </label>

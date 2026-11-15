@@ -392,17 +392,49 @@ export async function storeStockPhoto(
 }
 
 /**
+ * The first candidate a caller has not used yet, in the provider's relevance order.
+ *
+ * "Find another photo" used to return the very same picture: the search asked for one
+ * result and the hour-long cache answered it identically every time (audit C46). The
+ * cure costs nothing — one search request already returns SEARCH_PER_PAGE results, so
+ * a caller that knows which photos it already holds simply takes the next one.
+ *
+ * `allUsed` is true when every candidate is taken; `pick` is then null and the caller
+ * decides (reuse what it has, or ask for a different query) — storing the same photo
+ * twice is never the answer.
+ */
+export function pickUnusedCandidate(
+  candidates: ReadonlyArray<StockCandidate>,
+  isUsed: (candidate: StockCandidate) => boolean,
+): { pick: StockCandidate | null; allUsed: boolean } {
+  const pick = candidates.find((c) => !isUsed(c)) ?? null;
+  return { pick, allUsed: !pick && candidates.length > 0 };
+}
+
+/**
  * Search for the best match and store it in one call — the unattended path.
  *
  * This is what `magazineV2/fetchAndStoreStock` was, minus the destination. Use it
  * where no human is going to review the choice; use `searchStockPhotos` +
  * `storeStockPhoto` where one is.
+ *
+ * `skip` (optional) passes over photos the caller already holds, so a repeat request
+ * gets the NEXT result instead of the same one. Without it the top hit is stored, as
+ * always. When every result is skipped nothing is stored and null is returned — the
+ * caller asked not to repeat itself.
  */
 export async function findAndStoreStockPhoto(
-  opts: { query: string; orientation?: StockOrientation },
+  opts: { query: string; orientation?: StockOrientation; skip?: (candidate: StockCandidate) => boolean },
   keyPrefix: string,
 ): Promise<StoredPhoto | null> {
   if (!isStockConfigured()) return null;
-  const [best] = await searchStockPhotos(opts.query, { orientation: opts.orientation, count: 1 });
-  return best ? storeStockPhoto(best, keyPrefix) : null;
+  if (!opts.skip) {
+    const [best] = await searchStockPhotos(opts.query, { orientation: opts.orientation, count: 1 });
+    return best ? storeStockPhoto(best, keyPrefix) : null;
+  }
+  // The whole page of results: the same single API request (and the same cache entry)
+  // as count 1, so variety costs no extra quota.
+  const candidates = await searchStockPhotos(opts.query, { orientation: opts.orientation, count: SEARCH_PER_PAGE });
+  const { pick } = pickUnusedCandidate(candidates, opts.skip);
+  return pick ? storeStockPhoto(pick, keyPrefix) : null;
 }

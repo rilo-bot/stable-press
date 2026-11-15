@@ -36,7 +36,7 @@ export const SURFACES: CatalogSurface[] = [
       {
         name: 'magazine.generate',
         description:
-          'Start a NEW magazine with AI: types the brief into the composer, presses Generate, waits until the new studio opens. Returns AT ONCE with { magazineId, route, jobId, started:true } — the pages keep building in the background (minutes) and a [job-update] message arrives in this chat when they finish. Do not wait or poll: tell the user it is building and end your turn (or do other work). Use this for "create a (dummy) magazine about …"; there is no blank-magazine button on this screen.',
+          'Start a NEW magazine with AI: types the brief, presses Generate, waits for the new studio. Returns AT ONCE { magazineId, route, jobId, started:true }; the pages build in the background and a [job-update] arrives when they finish (do not wait or poll). Use it for "create a (dummy) magazine about …"; there is no blank-magazine button here. A brief that names a larger page count than pageCount is refused: leave page counts out of the brief and pass pageCount.',
         args: '{ brief: string; pageCount?: number /* 3–16, written into the brief */ }',
         confirms: true,
       },
@@ -63,18 +63,18 @@ export const SURFACES: CatalogSurface[] = [
     route: '/production-system/magazine-v2/:id',
     who: "the magazine's owner (everything), collaborators it was shared with (their pages + the AI Studio), other staff view-only; every change needs Magazine edit, publishing also Magazine publish",
     purpose:
-      'Edit one magazine: page rail (thumbnails, add/duplicate/delete/reorder), the canvas (every page stacked; above EACH page a header with a "publish" tick and two AI wand buttons, Fill and Adjust), the Magazine AI Studio chat on the left that stages edits to the open page, the inspector on the right (owner: add text/photo/shape/QR/icon, style the selected element, Assets), Share (who may edit which pages), the review board, and Publish to the public Bulletins newsstand. Call magazine.status first to learn page numbers, collaborators and your role. PAGE NUMBERS everywhere are the REAL numbers printed on the canvas ("Page 3") — a contributor shared only page 3 still calls it page 3, never 1. When writing to the AI Studio, say "this page" (it works on the open page), never a page number. When the user says "fill" or "adjust" a page, use magazine.fillPage / magazine.adjustPage directly — those ARE the Fill/Adjust buttons above the page; do not route it through the AI Studio chat.',
+      'Edit one magazine: page rail (add/duplicate/delete/reorder), the canvas (every page stacked; above each a "publish" tick and the Fill and Adjust wands), the AI Studio chat (left; stages edits to the open page), the inspector (right; owner: add text/photo/shape/QR/icon, style, Assets), Share, the review board, Publish to Bulletins. Call magazine.status first. PAGE NUMBERS are the real numbers printed on the canvas ("Page 3"), for a contributor shared only page 3 too. In Studio prompts say "this page", never a magazine page number (a PDF page is fine). Fill / adjust a page = magazine.fillPage / adjustPage, not the studio.',
     actions: [
       {
         name: 'magazine.status',
         description:
-          'Title, id, your role and rights, every page (real page number as printed on the canvas, id, elements, review state, selectedForPublish), collaborators with their pages, publish state, build progress, and AI Studio state (replying / staged changes).',
+          'Title, id, your role and rights, every page (real page number as printed on the canvas, id, elements, review state, selectedForPublish), collaborators with their pages, publish state, build progress, and AI Studio state: replying, studio.pendingChanges per page [{ page, count, changes }], pendingTotal and lastTurn (proposalCount, stagedLine).',
         args: '{}',
       },
       {
         name: 'magazine.waitForGeneration',
         description:
-          'OPTIONAL — builds report back by themselves with a [job-update] message, so you normally never call this. Use it only for a quick look at a build in progress: follows the real progress ("2 of 6 pages built") for at most 60 seconds, then returns { building, done, total, jobId } (or the final status + page count if it finished). Never call it in a loop.',
+          'Optional (builds report back by themselves with a [job-update]): a quick look at a build in progress, following it for at most 60 s, then { building, done, total, jobId } or the final status. Never call it in a loop.',
         args: '{}',
       },
       {
@@ -90,8 +90,8 @@ export const SURFACES: CatalogSurface[] = [
       {
         name: 'magazine.addAiPages',
         description:
-          'Owner only. Have the AI design and append on-theme pages (optionally on a topic). The builder makes 1, 2, 3, 4 or 6 per build, so a larger or odd count starts the biggest batch that fits and the result gives remaining: after the [job-update], call again with count = remaining (the user approved them all at once, no second question). Returns AT ONCE with { jobId, started:true }; do not wait or poll.',
-        args: '{ count: number /* 1–12 */; topic?: string }',
+          'Owner only. The AI designs and appends on-theme pages, optionally on a topic, or written from a document on the magazine (doc = part of its file name; never paste its text into topic). A build makes 1, 2, 3, 4 or 6 pages, so a bigger count starts the largest batch that fits and returns remaining: after the [job-update], call again with count = remaining (no second question). Returns AT ONCE { jobId, started:true }.',
+        args: '{ count: number /* 1–12 */; topic?: string /* ≤300 chars */; doc?: string }',
         confirms: true,
       },
       {
@@ -136,26 +136,26 @@ export const SURFACES: CatalogSurface[] = [
       {
         name: 'magazine.askStudio',
         description:
-          'Owner or collaborator. Type a request into the Magazine AI Studio chat (optionally opening a page first) and send it like a person; it then waits the WHOLE turn — attachment upload/reading (can take a minute), then the reply (up to 10 min). The studio only STAGES changes: when the user asked for the change to be made (e.g. "use this image as the background", "make the headline bigger") pass apply:true so it presses "Use these changes" and the change is really on the page. Attach a user image first with upload on mag.ai-attach. With apply:true, staged page deletions / a layout rebuild / an AI page build ask the user first.',
+          'Owner or collaborator. Send a request to the AI Studio chat (optionally opening a page first) and wait for the whole turn (up to 10 min). It only STAGES changes: pass apply:true when the user wants them made (presses "Use these changes"; page deletions, a layout rebuild or an AI page build ask the user first). Attach a user image first with upload on mag.ai-attach; a document already on the magazine needs no re-upload, just name its file. Trust proposalCount and stagedLine (what this turn REALLY staged; 0 = nothing changed) over the reply; pendingChanges covers every page. The studio can do anything the Page & Element panel can (charts, background, clear a page, picture fit and shape, fonts, alignment, rotate, front/back, duplicate, QR and icon colours, arrange boxes) except the page\'s publish tick (magazine.setPageInPublish).',
         args: '{ prompt: string /* ≤4000 chars */; page?: number; apply?: boolean }',
       },
       {
         name: 'magazine.waitForStudio',
         description:
-          'The studio is still working (reading an attachment or replying) or has finished with changes waiting: wait for it (up to 10 min), then with apply:true press "Use these changes". Use this instead of telling the user "the studio is still working".',
+          'The studio is still working (reading an attachment or replying) or has changes waiting: wait for it (up to 10 min), then with apply:true press "Use these changes". Use it instead of telling the user "the studio is still working".',
         args: '{ apply?: boolean }',
       },
       {
         name: 'magazine.applyStudioChanges',
         description:
-          "Press \"Use these changes\" on the changes the AI Studio has staged (undoable with Ctrl+Z, except page deletions and a layout rebuild). Asks the user first only when the staged changes delete pages, rebuild a page's layout, or start an AI page build.",
-        args: '{}',
+          'Apply EVERY page\'s waiting AI Studio changes in page order (the "Apply all" bar), or only that page\'s with page. Ctrl+Z undoes it, except page deletions, a layout rebuild and a PDF page copy (those and an AI page build ask the user first); changes waiting on pages other than the latest request\'s get a card listing every page and its count. A text edit whose box was edited after staging is held back and stays waiting (perPage heldBecauseEditedSinceStaged): apply it again only if the user says so. Returns perPage, line, stillWaiting and the pages measured afterwards (pageCheck, pageChecks).',
+        args: '{ page?: number }',
         confirms: true,
       },
       {
         name: 'magazine.discardStudioChanges',
-        description: 'Press "Don\'t use these" to dismiss the AI Studio\'s staged changes.',
-        args: '{}',
+        description: 'Discard EVERY page\'s waiting AI Studio changes (the bar\'s Discard), or only that page\'s with page; nothing on the pages changes, and the user is offered Bring back for a few seconds.',
+        args: '{ page?: number }',
       },
       {
         name: 'magazine.publish',
@@ -173,14 +173,49 @@ export const SURFACES: CatalogSurface[] = [
       {
         name: 'magazine.fillPage',
         description:
-          'Owner or collaborator. Press the Fill wand above that page on the canvas (the per-page AI button): it writes copy into EMPTY text boxes and tightens crowded text, then waits for the pass. Use it directly whenever the user says "fill page N" / "fill the empty boxes". Returns textBlocksChanged + before/after of each changed block, element counts, and the toast text. Undoable as one step (magazine.undo).',
+          'Owner or collaborator. Press the Fill wand above that page: writes copy into EMPTY text boxes and tightens crowded text, then waits for the pass. Use it directly for "fill page N" / "fill the empty boxes". Returns the before/after of each changed block and the toast text. Undoable (magazine.undo).',
         args: '{ page: number }',
       },
       {
         name: 'magazine.adjustPage',
         description:
-          'Owner or collaborator. Press the Adjust wand above that page on the canvas: tightens crowded / overflowing text and re-balances an AI-built layout (box sizes, empty bands, sliver photos); no new copy in empty boxes. Use it directly when the user says "adjust page N" / "fix the overflowing text". Returns what changed + the toast text. Undoable (magazine.undo).',
+          'Owner or collaborator. Press the Adjust wand above that page: tightens crowded or overflowing text and re-balances an AI-built layout (box sizes, empty bands, sliver photos); writes no new copy. Use it for "adjust page N" / "fix the overflowing text". Returns what changed + the toast text. Undoable (magazine.undo).',
         args: '{ page: number }',
+      },
+      // Seeing the page, charts and magazine-wide find-and-replace (C15/C37/C48).
+      // Kept to 200 characters each: the fuller wording lives in the web
+      // useAgentAction descriptions, which readScreen lists live. ChartSpec in
+      // addChart mirrors the server's chartSpecSchema (lib/magazineV2/chartSpec.ts).
+      {
+        name: 'magazine.checkPage',
+        description:
+          'Measure a page as drawn in the browser (default: the open page): pageCheck { ok, issues, each with element id, measured px and a fix } plus its elements (id, label, box). Use after every page change.',
+        args: '{ page?: number }',
+      },
+      {
+        name: 'magazine.lookAtPage',
+        description:
+          'Visual review of the SAVED page: a vision model lists the problems in a render (with element ids), plus pageCheck. Use after a new picture, chart or layout, or if it LOOKS wrong; focus narrows it.',
+        args: '{ page?: number; focus?: string }',
+      },
+      {
+        name: 'magazine.addChart',
+        description:
+          'Draw a chart from the EXACT numbers (one value per category, in order) onto the page, or in place of element id replace; barh for long names, pie/donut one series. Returns dataEcho + pageCheck.',
+        args: "{ page?: number; chart: { type: 'bar'|'barh'|'line'|'pie'|'donut'|'table'; title?, subtitle?, source?: string; categories: string[]; series: { name: string; values: number[] }[]; unit?: { prefix?, suffix?: string }; decimals?: 0|1|2; showValues?, stacked?: boolean; highlight?: string /* a category */ }; replace?: string }",
+      },
+      {
+        name: 'magazine.editChart',
+        description:
+          'Change a chart addChart drew (elementId from checkPage): changes.setValues for single numbers ("2023 is 14"), or any chart field to replace it; an empty title removes it. Returns dataEcho + pageCheck.',
+        args: '{ page?: number; elementId: string; changes: { setValues?: { category: string; series?: string; value: number }[] /* or any chart field */ } }',
+      },
+      {
+        name: 'magazine.replaceText',
+        description:
+          'Swap a word or name in the text of EVERY page you may edit, exactly (nothing is retyped); the user OKs a count per page first. matchCase defaults to true. Ctrl+Z cannot undo it: swap back to reverse.',
+        args: '{ find: string; replace: string; matchCase?: boolean; wholeWord?: boolean }',
+        confirms: true,
       },
       {
         name: 'magazine.setPageInPublish',
@@ -225,8 +260,8 @@ export const SURFACES: CatalogSurface[] = [
       {
         name: 'magazine.addMorePages',
         description:
-          'Owner only. Press "Add more pages" (the gold banner after a first build, else the rail\'s AI button) to open the add-AI-pages popover; with count (batched like magazine.addAiPages) and optional topic it also starts the build and returns AT ONCE with { jobId, started:true } — a [job-update] message arrives when the pages are done.',
-        args: '{ count?: number /* 1–12 */; topic?: string }',
+          'Owner only. Press "Add more pages" (the gold banner after a first build, else the rail\'s AI button); with count (batched like addAiPages), and topic or doc as there, it also starts the build and returns AT ONCE { jobId, started:true }.',
+        args: '{ count?: number /* 1–12 */; topic?: string /* ≤300 chars */; doc?: string }',
         confirms: true,
       },
       // Danger actions — web twin: apps/web/src/editor-v2/operator/useMagazineDangerActions.ts.
@@ -246,17 +281,22 @@ export const SURFACES: CatalogSurface[] = [
         args: '{}',
         confirms: true,
       },
+      // copyPdfPage takes the PDF the user sent in THIS chat as "attachment" and
+      // stores it on the magazine itself. The old hint (upload on mag.ai-attach)
+      // only staged the file in the studio composer, which the Copy panel never
+      // reads, so the copy failed and its own error sent the model round the same
+      // loop, or silently copied another PDF already on the magazine (C18/C26).
       {
         name: 'magazine.copyPdfPage',
         description:
-          'Owner only. "Copy a page exactly": reproduce page docPage of a PDF already attached to this magazine (its own words, pictures, colours) onto page (default: the open page), replacing everything there; the page takes the PDF page\'s shape. Cannot be undone. doc = part of the PDF file name when several are attached. To use a PDF the user sent in this chat, first attach it to the magazine: upload { agentId: "mag.ai-attach" }. For a layout only (fresh copy), use magazine.applyLayout.',
-        args: '{ page?: number; docPage: number; doc?: string }',
+          'Owner only. "Copy a page exactly": reproduce page docPage of a PDF (its words, pictures and colours; a scan comes over as one picture) onto page (default: the open page), replacing everything there, in the PDF page\'s shape. Cannot be undone. A PDF sent in THIS chat: attachment (0 = the newest, or its file name), stored on the magazine first; doc = part of the file name of one already on it. Layout only (fresh copy): applyLayout.',
+        args: '{ page?: number; docPage: number; doc?: string; attachment?: number | string }',
         confirms: true,
       },
       {
         name: 'magazine.applyLayout',
         description:
-          'Owner only. "Match a layout": rebuild page (default: the open page) in the ARRANGEMENT of a reference picture the user sent — fresh copy is written, nothing is copied from it. fit "exact" = every box where the reference had it; "adapt" = re-composed around this page\'s content. Replaces everything on the page; cannot be undone. Flow: call it once (opens the page + panel), then upload { agentId: "mag.layout-upload", attachment } with the user\'s image, then call it again (waits for the reading, asks the user, rebuilds, returns the measured verdict).',
+          'Owner only. "Match a layout": rebuild page (default: the open page) in the ARRANGEMENT of a reference picture the user sent, with fresh copy (nothing copied). fit "exact" = boxes where the reference had them; "adapt" = re-composed around this page\'s content. Replaces everything; cannot be undone. Flow: call once (opens page + panel), upload { agentId: "mag.layout-upload", attachment } with the image, call again (asks the user, rebuilds, returns the measured verdict).',
         args: "{ page?: number; fit: 'exact' | 'adapt' }",
         confirms: true,
       },
@@ -369,7 +409,10 @@ export const SURFACES: CatalogSurface[] = [
       'mag.stock-search',
       'mag.stock-result-<photoId>',
       'mag.imagegen-prompt',
+      'mag.imagegen-style',
+      'mag.imagegen-decorative',
       'mag.imagegen-submit',
+      'mag.imagegen-chart-refused',
       'mag.layout-pdf-doc',
       'mag.layout-pdf-page',
       'mag.layout-pdf-go',
@@ -380,6 +423,7 @@ export const SURFACES: CatalogSurface[] = [
       'mag.copy-pdf-doc',
       'mag.copy-pdf-page',
       'mag.copy-pdf-go',
+      'mag.copy-pdf-status',
       'mag.preview-close',
       // AI Studio extras
       'mag.ai-threads',

@@ -19,10 +19,12 @@ import { startQueueLoop, type JobHandlers } from './queue.js';
 import { processIssue, processPageJob, copyDocumentPageJob } from './jobs/processIssue.js';
 import { generateMagazineIssue, generateMorePages } from '../../server/src/lib/magazineV2/generate.js';
 import { readSourceDoc, chainIfReady, type ReadSourceDocPayload } from '../../server/src/lib/magazineV2/readSourceDoc.js';
-import { enqueueJob } from '../../server/src/lib/magazineV2/jobs.js';
+import { enqueueJob, type JobPayloads } from '../../server/src/lib/magazineV2/jobs.js';
 import { renderIssuePdfJob } from './jobs/renderIssuePdf.js';
+import { extractDocumentImagesJob } from './jobs/extractDocumentImages.js';
 import { installAiUsageStore } from '../../server/src/lib/agent/aiUsageStore.js';
 import { meteredJob } from './jobUsage.js';
+import { markRenderHost } from '../../server/src/lib/magazineV2/renderPreview.js';
 
 const handlers: JobHandlers = {
   // Digitize a freshly-uploaded PDF into pages + editable elements.
@@ -57,9 +59,18 @@ const handlers: JobHandlers = {
     );
   },
   // Design + insert N on-theme pages into an existing issue.
+  // The documents the user named ("add 2 pages from this PDF") travel with the job;
+  // without them the new pages are written from the magazine's own sources only.
   generatePages: (payload) => {
-    const p = payload as { issueId: string; count: number; topic?: string; atIndex: number; prevStatus: string };
-    return generateMorePages(p.issueId, { count: p.count, topic: p.topic, atIndex: p.atIndex, prevStatus: p.prevStatus });
+    const p = payload as JobPayloads['generatePages'];
+    return generateMorePages(p.issueId, {
+      count: p.count,
+      topic: p.topic,
+      atIndex: p.atIndex,
+      prevStatus: p.prevStatus,
+      docIds: Array.isArray(p.docIds) ? p.docIds.filter((d): d is string => typeof d === 'string') : undefined,
+      sourceText: typeof p.sourceText === 'string' ? p.sourceText : undefined,
+    });
   },
   // Read one uploaded document into the source store, then CHAIN whatever was
   // waiting on it. The chain is the point: this worker claims one job at a time,
@@ -90,6 +101,11 @@ const handlers: JobHandlers = {
   // watchdog must be able to tell "rendering" from "died".
   renderIssuePdf: (payload, ctx) =>
     renderIssuePdfJob(payload as { publishedIssueId: string }, ctx.beat),
+  // Lift the pictures out of a PDF attached to a magazine into its media library, so
+  // the Studio can place "the photo from page 2 of the PDF" (C45). No model calls,
+  // so it is not metered; beats once per page.
+  extractDocumentImages: (payload, ctx) =>
+    extractDocumentImagesJob(payload as JobPayloads['extractDocumentImages'], ctx),
 
   // Harmless heartbeat / liveness + smoke-test handler.
   noop: async () => {
@@ -101,6 +117,10 @@ const handlers: JobHandlers = {
 // attributed to the Magazine Builder + the magazine + its requester, with the job
 // id as the session (see ./jobUsage.ts). renderIssuePdf and noop make no AI calls.
 installAiUsageStore();
+// Rendering belongs to this process: the generator's Visual Critic previews keep
+// working whatever MAGAZINE_V2_API_RENDERING (the API's own switch) says in the env
+// file the two processes share.
+markRenderHost();
 for (const type of ['processIssue', 'processPage', 'copyDocumentPage', 'generateIssue', 'generatePages', 'readSourceDoc']) {
   const handler = handlers[type];
   if (handler) handlers[type] = meteredJob(type, handler);

@@ -46,7 +46,9 @@ import { renumberFolios, syncContentsNumbers } from '../../lib/magazineV2/renumb
 import { FURNITURE_IDS, type RefurnishContext } from '../../lib/magazineV2/pageFurniture.js';
 import { isDropCapPiece } from '../../lib/magazineV2/dropCap.js';
 import type { GenFonts, GenPalette } from '../../lib/magazineV2/templates.js';
-import { runPageAgent } from '../../lib/magazineV2/agent.js';
+import { runPageAgent, type AttachedImage } from '../../lib/magazineV2/agent.js';
+import { backgroundUrlAllowed, parseBackgroundAsk, plausibleSize, storedBackground } from '../../lib/magazineV2/agentPanelPure.js';
+import { pendingFromWire, type AttachedDocState } from '../../lib/magazineV2/agentTurnGuard.js';
 import { formatPageText, charGuideFor } from '../../lib/magazineV2/format.js';
 import { pageCopyEdits, type CopyContext } from '../../lib/magazineV2/copyHygiene.js';
 import { adjustPageLayout, type RelayoutResult } from '../../lib/magazineV2/relayoutPage.js';
@@ -56,13 +58,53 @@ import { aspectMismatch, normalizeLayoutReading, type LayoutReading } from '../.
 // layout-reference route for why both live behind one endpoint.
 import { readLayoutPdfPage } from '../../lib/magazineV2/readLayoutPdf.js';
 import { applyReadingToPage, themeForPage, tightSummary, unfilledSlots, type ExtraContent, type LayoutFit } from '../../lib/magazineV2/applyLayout.js';
-import { isPlaceableMedia, rankMediaForPage, type RankableMediaRow } from '../../lib/magazineV2/media.js';
+import { chooseImageSize, imageDimensions, isPlaceableMedia, mediaOrigin, rankMediaForPage, sizedPictures, type RankableMediaRow } from '../../lib/magazineV2/media.js';
 // The two ways a picture nobody uploaded gets into the library: found, or made.
 import { getStockPhoto, isStockConfigured, searchStockPhotos, storeStockPhoto, type StockOrientation } from '../../lib/stock.js';
-import { generateAndStoreImage, isImageGenConfigured } from '../../lib/magazineV2/imagegen.js';
+import { generateImageAsset, isImageGenConfigured } from '../../lib/magazineV2/imagegen.js';
+import { imageBriefLimit, imageFailureHttpStatus, isImageStyle } from '../../lib/magazineV2/imagePrompt.js';
 import { draftReferenceFill } from '../../lib/magazineV2/referenceFill.js';
-import { createSourceDoc, listSourceDocs } from '../../lib/magazineV2/sourceDocsDb.js';
-import { canCopyLayout, magazineDocument } from '../../lib/magazineV2/magazineDocs.js';
+import { createSourceDoc, getSourceDoc, listSourceDocs } from '../../lib/magazineV2/sourceDocsDb.js';
+import { isReadable, type SourceDocStatus } from '../../lib/magazineV2/sourceStore.js';
+import { canCopyLayout, fetchLayoutPdf, linkedSourceDocId, magazineDocument, mediaDocumentText, registerAttachedDocument } from '../../lib/magazineV2/magazineDocs.js';
+// Seeing a page: the deterministic check (estimated, or measured on a render) and the look.
+import { checkPage, checkPageFromMeasurements, type PageCheck } from '../../lib/magazineV2/pageCheck.js';
+import { measurePagePreview, previewRendererAvailable, type PreviewPage } from '../../lib/magazineV2/renderPreview.js';
+import { lookAtPage } from '../../lib/magazineV2/pageLook.js';
+// Charts drawn exactly from numbers, placed like any picture.
+import {
+  applyChartChanges,
+  CHART_GUARD_USER_MESSAGE,
+  chartRequestBlocked,
+  chartSlot,
+  preferredChartAspect,
+  topZ,
+  validateChartSpec,
+  type ChartSpec,
+} from '../../lib/magazineV2/chartSpec.js';
+import { chartTheme } from '../../lib/magazineV2/chartTheme.js';
+import { loadChartAsset, renderAndStoreChart } from '../../lib/magazineV2/charts.js';
+import { planPageReplace, replaceReport, type ReplacePageReport } from '../../lib/magazineV2/replaceAcross.js';
+import {
+  addedElementSource,
+  attachedDocsTag,
+  clampBoxToPage,
+  historyEntry,
+  imageFailureUserText,
+  joinDocumentTexts,
+  latestAttachedDoc,
+  pageStoryLine,
+  parseAttachedDocs,
+  parseDocIds,
+  parsePendingProposals,
+  parseReplaceTextBody,
+  previewBackground,
+  refersToDocument,
+  withStagedOutcome,
+  zIndexForAdd,
+  type AttachedDoc,
+} from '../../lib/magazineV2/studioRequests.js';
+import type { JobPayloads } from '../../lib/magazineV2/jobs.js';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Doc = { _id: string; [k: string]: any };
@@ -224,6 +266,11 @@ async function pageSummariesFor(magazineId: string): Promise<Doc[]> {
         reviewNote: 1,
         submittedBy: 1,
         submittedAt: 1,
+        // Why a page failed to build, and what an extraction could not keep editable —
+        // the rail and The Stable Hand report these instead of a generic sentence.
+        error: 1,
+        notice: 1,
+        copiedFrom: 1,
         // The ONE thing anybody wanted the elements for. `$isArray` rather than a
         // bare `$size` because `$size` throws on a non-array, which would fail the
         // whole read for one malformed page — the JS it replaces just returned 0.
@@ -398,6 +445,16 @@ function pageSummary(p: Doc, issue?: Doc) {
     // per-page user lookup would be N+1 on a route that returns every page.
     submittedBy: typeof p.submittedBy === 'string' ? p.submittedBy : null,
     submittedAt: typeof p.submittedAt === 'string' ? p.submittedAt : null,
+    // A failed copy or extraction used to show only an icon, and only when no thumbnail
+    // was cached; the operator could say no more than "could not be rebuilt" (C25).
+    error: typeof p.error === 'string' ? p.error : '',
+    // '' | 'scanned' | 'no-text': the page's words are part of a picture (worker, C33).
+    notice: p.notice === 'scanned' || p.notice === 'no-text' ? p.notice : '',
+    // Which attached document page this one was copied from, when it was.
+    copiedFrom:
+      p.copiedFrom && typeof p.copiedFrom === 'object' && typeof p.copiedFrom.docId === 'string'
+        ? { docId: String(p.copiedFrom.docId), sourcePage: Number(p.copiedFrom.sourcePage) || 1 }
+        : null,
   };
 }
 
@@ -966,20 +1023,53 @@ router.post('/issues/:id/pages/:pageId/retry', async (req, res) => {
     res.status(403).json({ error: 'Only the owner can retry a page.' });
     return;
   }
-  const src = doc.sourceFile as { key?: string } | undefined;
-  if (!src?.key) {
-    res.status(400).json({ error: 'This issue has no source file to re-extract from.' });
-    return;
-  }
   const page = await pageById(req.params.pageId);
   if (!page || page.magazineId !== doc._id) {
     res.status(404).json({ error: 'Page not found' });
     return;
   }
-  await db.collection(COL.pages).updateOne(page._id, { status: 'pending', error: '', updatedAt: new Date().toISOString() });
+  // A page copied from an attached PDF is retried by copying it again (the worker reads
+  // copiedFrom), so it needs no source file of the magazine's own — an AI-built
+  // magazine has none, and its failed copies used to be refused here.
+  const src = doc.sourceFile as { key?: string } | undefined;
+  const copied = page.copiedFrom as { docId?: unknown; sourcePage?: unknown } | null | undefined;
+  const isCopy = !!copied && typeof copied.docId === 'string' && !!copied.docId && Number(copied.sourcePage) > 0;
+  if (!src?.key && !isCopy) {
+    res.status(400).json({ error: 'This issue has no source file to re-extract from.' });
+    return;
+  }
+  if (!(await markPagePending(page))) {
+    const fresh = await pageById(page._id);
+    res.status(409).json({ error: 'This page changed since you loaded it.', page: fresh ? project(fresh) : null });
+    return;
+  }
   await enqueueJob('processPage', { issueId: doc._id, pageId: page._id, index: Number(page.index) || 0 });
   res.status(202).json({ ok: true });
 });
+
+/**
+ * Mark a page 'pending' for a background rebuild (retry, copy a document page) AND
+ * move its `rev`, compare-and-set on the rev it had.
+ *
+ * The rebuild replaces every element. With the rev left where it was, the editor's
+ * copy of the page still held a valid rev, so an edit made while the job ran was
+ * accepted and then silently wiped, and an edit made after it "succeeded" against
+ * element ids that no longer existed (finding C25). Moving the rev here — and again
+ * when the worker writes the new elements — turns both into the ordinary 409 the
+ * editor already handles by adopting the fresh page.
+ *
+ * `rev: null` in the condition matches a page that has never had one (Mongo's null
+ * matches a missing field), so an old page is not refused for lacking a counter.
+ */
+async function markPagePending(page: Doc): Promise<boolean> {
+  const cur = typeof page.rev === 'number' && Number.isFinite(page.rev) ? page.rev : null;
+  return db.collection(COL.pages).updateOneIf(page._id, { rev: cur }, {
+    status: 'pending',
+    error: '',
+    rev: (cur ?? 0) + 1,
+    updatedAt: new Date().toISOString(),
+  });
+}
 
 // list the issue's media library (extracted photos/graphics + stock/uploads)
 router.get('/issues/:id/media', async (req, res) => {
@@ -1006,7 +1096,26 @@ router.get('/issues/:id/media', async (req, res) => {
     (a) => isPlaceableMedia(a as { kind?: string; url?: string }),
   );
   res.json({
-    assets: assets.map((a) => ({ id: a._id, url: a.url, alt: a.alt, kind: a.kind, pageIndex: a.pageIndex, contentType: a.contentType, size: a.size })),
+    assets: assets.map((a) => ({
+      id: a._id,
+      url: a.url,
+      alt: a.alt,
+      kind: a.kind,
+      pageIndex: a.pageIndex,
+      contentType: a.contentType,
+      size: a.size,
+      // Where it came from, in words ("from “Results.pdf”, page 2", "a chart drawn from
+      // data"), so a picture lifted out of an attached document can be found by the
+      // document it came from (finding C45). Charts say so, so the panel can offer an edit.
+      source: typeof a.source === 'string' ? a.source : undefined,
+      origin: mediaOrigin(a as Parameters<typeof mediaOrigin>[0]) || undefined,
+      ...(typeof a.docName === 'string' ? { docName: a.docName, ...(typeof a.docPage === 'number' ? { docPage: a.docPage } : {}) } : {}),
+      // The picture's own pixel size, when recorded — so a box can be made its shape.
+      ...(plausibleSize(a.width, a.height) ? { width: Number(a.width), height: Number(a.height) } : {}),
+      // A drawn chart's numbers, so it can be redrawn with one value changed in a later
+      // session (magazine.editChart) without anyone re-typing the data.
+      ...(a.source === 'chart' && a.chart && typeof a.chart === 'object' ? { chart: a.chart } : {}),
+    })),
   });
 });
 
@@ -1043,16 +1152,35 @@ router.get('/issues/:id/uploads', async (req, res) => {
   }
   const docs = ((await db.collection(COL.media).find({ magazineId: doc._id })) as Doc[]).filter((a) => a.kind === 'doc');
   docs.sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')));
+  // The page-by-page read of each chat attachment (its linked source document), which
+  // GET /sources no longer lists separately: a scan has no browser text, and its read
+  // pages are what make it usable.
+  const linkedStatus = new Map<string, SourceDocStatus>();
+  if (docs.some((a) => typeof a.sourceDocId === 'string' && a.sourceDocId)) {
+    for (const s of await listSourceDocs(String(doc._id))) linkedStatus.set(String(s._id), s.status);
+  }
   res.json({
-    uploads: docs.map((a) => ({
-      id: a._id,
-      url: a.url,
-      originalName: a.originalName ?? a.alt ?? 'document',
-      contentType: a.contentType,
-      size: a.size,
-      hasText: !!(a.sourceText && String(a.sourceText).trim()),
-      createdAt: a.createdAt,
-    })),
+    uploads: docs.map((a) => {
+      const hasText = !!(a.sourceText && String(a.sourceText).trim());
+      const linked = typeof a.sourceDocId === 'string' && a.sourceDocId ? a.sourceDocId : '';
+      const status = linked ? linkedStatus.get(linked) : undefined;
+      return {
+        id: a._id,
+        url: a.url,
+        originalName: a.originalName ?? a.alt ?? 'document',
+        contentType: a.contentType,
+        size: a.size,
+        hasText,
+        // The source document registered over the same file for a page-by-page read
+        // (a chat attachment): GET /sources leaves it out, and this row stands for both.
+        ...(linked && status !== undefined ? { sourceDocId: linked } : {}),
+        // Can pages be written from it: its own text, or its finished page-by-page read
+        // (POST /pages/generate follows the link). `reading` while that read runs.
+        readable: hasText || (status !== undefined && isReadable(status)),
+        ...(status === 'queued' || status === 'reading' ? { reading: true } : {}),
+        createdAt: a.createdAt,
+      };
+    }),
   });
 });
 
@@ -1129,7 +1257,24 @@ router.post('/issues/:id/uploads', rateLimit('mag2-write', 300, 60_000), async (
     createdAt: now,
     updatedAt: now,
   });
-  res.status(201).json({ upload: { id: String(assetId), url, originalName, contentType: head.contentType, size: head.contentLength, hasText: !!sourceText.trim(), createdAt: now } });
+  // A PDF's pictures are lifted into the media library in the background, each
+  // labelled with the document and page it came from, so "use the horse photo from
+  // page 2 of the PDF" can place the client's own picture instead of a stock one
+  // (C45). Best-effort: the document is stored either way, and a failed enqueue only
+  // means its pictures are not offered.
+  let extractingPictures = false;
+  if (head.contentType === 'application/pdf') {
+    try {
+      await enqueueJob('extractDocumentImages', { magazineId: String(doc._id), docId: String(assetId) });
+      extractingPictures = true;
+    } catch (err) {
+      console.warn('[magazineV2] could not queue picture extraction for an upload:', err instanceof Error ? err.message : err);
+    }
+  }
+  res.status(201).json({
+    upload: { id: String(assetId), url, originalName, contentType: head.contentType, size: head.contentLength, hasText: !!sourceText.trim(), createdAt: now },
+    ...(extractingPictures ? { extractingPictures: true } : {}),
+  });
 });
 
 // fetch one uploaded document's stored text (for preview / fill-from-this).
@@ -1260,7 +1405,18 @@ router.get('/issues/:id/sources', async (req, res) => {
     res.status(404).json({ error: 'Not found' });
     return;
   }
-  const docs = await listSourceDocs(String(doc._id));
+  // A PDF attached in the chat is ALSO registered as a source document over the same
+  // stored file (magazineDocs.registerAttachedDocument), so later turns can read it
+  // page by page. That second row is an implementation detail of the attachment, not a
+  // build source the user added: listed here it showed the same file twice in the
+  // page pickers (which also list /uploads) and in the Sources panel. Its upload row
+  // names it (sourceDocId), and the upload is the one shown.
+  const linked = new Set(
+    ((await db.collection(COL.media).find({ magazineId: doc._id })) as Doc[])
+      .filter((m) => m.kind === 'doc' && typeof m.sourceDocId === 'string' && m.sourceDocId)
+      .map((m) => String(m.sourceDocId)),
+  );
+  const docs = (await listSourceDocs(String(doc._id))).filter((d) => !linked.has(String(d._id)));
   res.json({
     sources: docs.map((d) => ({
       id: String(d._id),
@@ -1348,6 +1504,11 @@ router.post('/issues/:id/media', rateLimit('mag2-write', 300, 60_000), async (re
   // in particular would hide an image inside the documents library.
   const kind = req.body?.kind === 'reference' ? 'reference' : 'upload';
   const url = storage.publicUrl(key);
+  // The picture's own pixel size, read off the stored file's first bytes (the browser's
+  // measurement, sent as width/height, settles a quarter-turned photo and stands in when
+  // the bytes cannot be read). It lets the assistant make a box exactly the picture's
+  // shape instead of guessing — see media.imageDimensions.
+  const dims = chooseImageSize(imageDimensions((await readObjectHead(key)) ?? Buffer.alloc(0)), { width: req.body?.width, height: req.body?.height });
   const now = new Date().toISOString();
   const assetId = await db.collection(COL.media).insertOne({
     magazineId: doc._id,
@@ -1359,11 +1520,54 @@ router.post('/issues/:id/media', rateLimit('mag2-write', 300, 60_000), async (re
     alt,
     kind,
     source: 'upload',
+    ...(dims ? { width: dims.width, height: dims.height } : {}),
     createdAt: now,
     updatedAt: now,
   });
-  res.status(201).json({ asset: { id: String(assetId), url, alt, kind, pageIndex: null, contentType: head.contentType, size: head.contentLength } });
+  res.status(201).json({
+    asset: { id: String(assetId), url, alt, kind, pageIndex: null, contentType: head.contentType, size: head.contentLength, ...(dims ? { width: dims.width, height: dims.height } : {}) },
+  });
 });
+
+/** How much of a stored image is read to find its pixel size. Every accepted format
+ *  keeps the size in its header; a JPEG's can sit behind a long EXIF block. */
+const IMAGE_HEAD_BYTES = 256 * 1024;
+
+/** The first bytes of a stored object, or null when it cannot be read. Stops reading
+ *  (and closes the stream) once it has enough. */
+async function readObjectHead(key: string, max = IMAGE_HEAD_BYTES): Promise<Buffer | null> {
+  try {
+    const obj = await storage.getObject(key);
+    const chunks: Buffer[] = [];
+    let got = 0;
+    for await (const chunk of obj.body as AsyncIterable<Uint8Array>) {
+      const b = Buffer.from(chunk);
+      chunks.push(b);
+      got += b.length;
+      if (got >= max) break;
+    }
+    (obj.body as { destroy?: () => void }).destroy?.();
+    return Buffer.concat(chunks).subarray(0, max);
+  } catch {
+    return null;
+  }
+}
+
+/** The magazine's pictures whose own pixel size is recorded (for the Studio). Only
+ *  the fields that matter are read — a document row carries its whole text. */
+async function mediaImageSizes(magazineId: string): Promise<ReturnType<typeof sizedPictures>> {
+  try {
+    const rows = await db.collection(COL.media).aggregate([
+      { $match: { magazineId, deletedAt: null, kind: { $ne: 'doc' } } },
+      { $project: { url: 1, kind: 1, width: 1, height: 1, chartBox: 1 } },
+      { $limit: 2000 },
+    ]);
+    return sizedPictures(rows);
+  } catch (err) {
+    console.warn('[magazineV2] could not read picture sizes:', err instanceof Error ? err.message : err);
+    return [];
+  }
+}
 
 // ── Pictures the user did not take: FIND one, or MAKE one ────────────────────
 //
@@ -1477,6 +1681,8 @@ router.post('/issues/:id/media/stock', rateLimit('mag2-write', 300, 60_000), asy
     ...(stored.provider ? { stockProvider: stored.provider } : {}),
     ...(stored.providerId ? { stockId: stored.providerId } : {}),
     ...(stored.sourceUrl ? { sourceUrl: stored.sourceUrl } : {}),
+    // The provider reports the photo's size: its shape is what a box is fitted to.
+    ...(plausibleSize(stored.width, stored.height) ? { width: Number(stored.width), height: Number(stored.height) } : {}),
     createdAt: now,
     updatedAt: now,
   });
@@ -1509,20 +1715,53 @@ router.post('/issues/:id/media/generate', rateLimit('mag2-imagegen', 10, 60_000)
     res.status(503).json({ error: 'AI image generation is not set up on this server.' });
     return;
   }
-  const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim().slice(0, 600) : '';
+  // The KIND of picture: 'photo' (the default — a text-free editorial photograph, as
+  // this button always made), or 'illustration' | 'graphic' | 'poster', which may carry
+  // the words the description asks for. Anything else is ignored rather than refused,
+  // so an older client keeps getting a photo.
+  const style = isImageStyle(req.body?.style) ? req.body.style : 'photo';
+  const decorative = req.body?.decorative === true;
+  // A design brief (poster, graphic) carries its words and layout, so it gets more room
+  // than a photo's subject and setting.
+  const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt.trim().slice(0, imageBriefLimit(style)) : '';
   if (!prompt) {
     res.status(400).json({ error: 'Describe the image you want.' });
     return;
   }
+  // A chart is DRAWN from the numbers, never generated: the image model would invent
+  // the bars and the labels. Refused before any money is spent, with a hint the client
+  // can turn into "ask the Design Helper for a chart" — unless the caller says it is a
+  // purely decorative illustration that shows no real data.
+  if (chartRequestBlocked(prompt, { style, decorative })) {
+    res.status(400).json({ error: CHART_GUARD_USER_MESSAGE, hint: 'chart' });
+    return;
+  }
+  // The exact frame, when the caller knows the box it is for ("4:5"); imagegen snaps
+  // it to a ratio the model supports. Without an explicit orientation the frame's own
+  // shape decides it, so a 4:5 request is never described to the model as landscape.
+  const aspectRatio = typeof req.body?.aspectRatio === 'string' ? req.body.aspectRatio.trim().slice(0, 12) : '';
   const o = req.body?.orientation;
-  const orientation: StockOrientation = o === 'portrait' || o === 'square' ? o : 'landscape';
-  const stored = await generateAndStoreImage({ prompt, orientation }, { magazineId: doc._id, pageIndex: null });
-  if (!stored) {
-    res.status(502).json({ error: 'The image model did not return a picture. Try again, or reword the description.' });
+  const orientation: StockOrientation | undefined =
+    o === 'portrait' || o === 'square' || o === 'landscape' ? o : aspectRatio ? undefined : 'landscape';
+  const out = await generateImageAsset(
+    {
+      prompt,
+      style,
+      ...(orientation ? { orientation } : {}),
+      ...(aspectRatio ? { aspectRatio } : {}),
+      ...(decorative ? { decorative: true } : {}),
+    },
+    { magazineId: doc._id, pageIndex: null },
+  );
+  if (!out.ok) {
+    // The REASON, in words for the person who pressed the button: a refusal needs a
+    // different subject, credit and rate limits need waiting, only an unexplained
+    // failure is worth a retry. Each used to be "try again, or reword it" (C42).
+    res.status(imageFailureHttpStatus(out.reason)).json({ error: imageFailureUserText(out.reason, out.detail), reason: out.reason });
     return;
   }
   res.status(201).json({
-    asset: { id: stored.assetId, url: stored.url, alt: stored.alt, kind: 'photo', pageIndex: null, source: 'ai-image' },
+    asset: { id: out.assetId, url: out.url, alt: out.alt, kind: out.kind, pageIndex: null, source: 'ai-image', style: out.style },
   });
 });
 
@@ -1576,15 +1815,14 @@ router.post('/issues/:id/layout-reference', rateLimit('mag2-layout-read', 10, 60
     }
     const pn = Number(req.body?.pageNo);
     const pageNo = Number.isInteger(pn) && pn > 0 ? pn : 1;
-    let bytes: Buffer;
-    try {
-      bytes = await storage.downloadObject(source.s3Key);
-    } catch (e) {
-      console.warn('[magazineV2] layout reference: could not fetch the document', e instanceof Error ? e.message : e);
-      res.status(502).json({ error: 'I could not fetch that document just now — please try again.' });
+    // Size-checked BEFORE it is downloaded: the whole PDF is parsed in this process,
+    // and one 150 MB print file could take the API down with it (C34).
+    const fetched = await fetchLayoutPdf(source);
+    if (!fetched.ok) {
+      res.status(fetched.status).json({ error: fetched.error });
       return;
     }
-    const out = await readLayoutPdfPage(bytes, pageNo);
+    const out = await readLayoutPdfPage(fetched.bytes, pageNo);
     reading = out.reading;
     error = out.error;
     from = { docId: source.docId, originalName: source.name, pageNo, pageCount: out.pageCount };
@@ -2901,11 +3139,86 @@ router.post('/issues/:id/pages/generate', rateLimit('mag2-generate', 10, 60_000)
     });
     return;
   }
-  const prevStatus = String(doc.status);
+  // ── "Add 2 pages from this PDF" ──
+  //
+  // The documents the new pages are built FROM, by id (`docIds`, or one `docId`), from
+  // either store. Before this, no add-pages path could carry a document: the worker read
+  // only the documents the issue was first generated from, so a PDF attached later never
+  // reached the page writer and the pages came out of the theme (findings C19/C28).
+  //
+  // THE MAGAZINE IS THE ALLOW-LIST: each id is resolved through magazineDocument, which
+  // only ever answers for this magazine's own documents. A source document goes to the
+  // job by id (the worker retrieves its chunks per page); a chat attachment has no
+  // chunks, so its stored text goes instead. One kind per build — the source resolver
+  // lets ids win over text — so when both are named the read source documents are used
+  // and the response says which were left out.
+  const requestedDocs = parseDocIds(req.body);
+  const sourceDocIds: string[] = [];
+  const attachedTexts: { name: string; text: string }[] = [];
+  const skippedDocs: string[] = [];
+  for (const id of requestedDocs) {
+    const found = await magazineDocument(String(doc._id), id);
+    if (!found) {
+      res.status(404).json({ error: 'That document is not in this magazine.', docId: id });
+      return;
+    }
+    if (found.store === 'source') {
+      // A document still being read has no chunks yet: building now would quietly write
+      // the pages without it, which is the very thing this door exists to stop.
+      const read = await getSourceDoc(found.docId);
+      if (read && (read.status === 'queued' || read.status === 'reading')) {
+        res.status(409).json({ error: `“${found.name}” is still being read — add the pages once it has finished (it shows as ready in Sources).` });
+        return;
+      }
+      if (read && isReadable(read.status)) sourceDocIds.push(found.docId);
+      else skippedDocs.push(found.name);
+      continue;
+    }
+    const text = (await mediaDocumentText(String(doc._id), found.docId)).trim();
+    if (text) {
+      attachedTexts.push({ name: found.name, text });
+      continue;
+    }
+    // A chat attachment the browser could not read (a scan) is still read page by page
+    // through the source document registered over the same file. GET /sources no
+    // longer lists that second row (it showed the file twice), so the attachment's own
+    // id must reach its read pages.
+    const linkedId = await linkedSourceDocId(String(doc._id), found.docId);
+    const read = linkedId ? await getSourceDoc(linkedId) : null;
+    if (read && (read.status === 'queued' || read.status === 'reading')) {
+      res.status(409).json({ error: `“${found.name}” is still being read — add the pages once it has finished.` });
+      return;
+    }
+    if (linkedId && read && isReadable(read.status)) sourceDocIds.push(linkedId);
+    else skippedDocs.push(found.name);
+  }
+  if (requestedDocs.length > 0 && sourceDocIds.length === 0 && attachedTexts.length === 0) {
+    res.status(422).json({
+      error: `${skippedDocs.length === 1 ? `“${skippedDocs[0]}” has` : 'Those documents have'} no readable text stored (a scan, or a picture of text), so no pages can be written from ${skippedDocs.length === 1 ? 'it' : 'them'}. Attach a PDF with selectable text, or describe the pages in the topic.`,
+    });
+    return;
+  }
+  if (sourceDocIds.length > 0) skippedDocs.push(...attachedTexts.map((d) => d.name));
+  const sourceText = sourceDocIds.length === 0 && attachedTexts.length > 0 ? joinDocumentTexts(attachedTexts) : '';
+  // The worker hands the document fields to generateMorePages (apps/worker/src/index.ts).
+  const payload: JobPayloads['generatePages'] = {
+    issueId: doc._id,
+    count,
+    topic,
+    atIndex,
+    prevStatus: String(doc.status),
+    ...(sourceDocIds.length > 0 ? { docIds: sourceDocIds } : {}),
+    ...(sourceText ? { sourceText } : {}),
+  };
   await db.collection(COL.magazines).updateOne(doc._id, { status: 'processing', stage: 'Designing pages', updatedAt: new Date().toISOString() });
-  await enqueueJob('generatePages', { issueId: doc._id, count, topic, atIndex, prevStatus });
+  await enqueueJob('generatePages', payload);
   const fresh = await loadIssue(doc._id);
-  res.status(202).json({ issue: fresh ? withViewer(fresh, req.account!.id) : { id: doc._id } });
+  res.status(202).json({
+    issue: fresh ? withViewer(fresh, req.account!.id) : { id: doc._id },
+    ...(requestedDocs.length > 0
+      ? { fromDocuments: { used: sourceDocIds.length + (sourceText ? attachedTexts.length : 0), ...(skippedDocs.length ? { skipped: skippedDocs } : {}) } }
+      : {}),
+  });
 });
 
 // ── Page content + elements (owner or assigned collaborator) ────────────────
@@ -3016,14 +3329,26 @@ router.post('/issues/:id/pages/:pageId/elements', async (req, res) => {
   // It can only ever CREATE: an id already on the page is refused, so this can't be
   // used to overwrite an existing element. Everything else still goes through
   // normalizeElements, so the geometry/sanitising guardrails are unchanged.
+  //
+  // `source`: an element the AI placed (a staged proposal the user applied, a chart
+  // The Stable Hand added) keeps 'ai-agent' when the client says so; anything else is
+  // 'manual', and nothing added here can claim 'extracted'. Forcing every add to
+  // 'manual' made one applied suggestion switch Adjust off for the whole page, since
+  // Adjust leaves hand-placed layouts alone (C51 / B5).
+  //
+  // `zIndex`: a body that names none goes ON TOP of the page. It used to default to 0,
+  // the bottom of a generated page's stack, where a new photo or caption is drawn under
+  // the panels and pictures it overlaps. A body that names one keeps it (undo restores
+  // and deliberate layering).
   const raw = (req.body?.element && typeof req.body.element === 'object' ? req.body.element : {}) as Record<string, unknown>;
   const restoreId = req.body?.restore === true && typeof raw.id === 'string' && raw.id ? raw.id.slice(0, 64) : null;
   if (restoreId && els.some((e) => e.id === restoreId)) {
     res.status(409).json({ error: 'That element is already on the page.', page: project(page) });
     return;
   }
+  const onTop = restoreId ? undefined : zIndexForAdd(raw.zIndex, els);
   const [created] = normalizeElements(
-    [{ ...raw, id: restoreId ?? undefined, source: restoreId ? raw.source : 'manual' }],
+    [{ ...raw, id: restoreId ?? undefined, source: addedElementSource(raw.source, !!restoreId), ...(onTop !== undefined ? { zIndex: onTop } : {}) }],
     pageDims(page),
   );
   if (!created) {
@@ -3113,6 +3438,83 @@ router.delete('/issues/:id/pages/:pageId/elements/:elementId', async (req, res) 
   res.json({ ok: true, rev: rev + 1 });
 });
 
+/**
+ * The page-background allow-list for one stored page, as a predicate: the magazine's
+ * library is read once, then agentPanelPure.backgroundUrlAllowed decides each url. Used
+ * by the background PATCH and by the agent route for a staged background the client
+ * sends back (which the server's Chromium would otherwise render from any address).
+ */
+async function backgroundAllowList(page: Doc): Promise<(url: string) => boolean> {
+  const library = ((await db.collection(COL.media).find({ magazineId: page.magazineId })) as Doc[])
+    .filter((m) => isPlaceableMedia(m as { kind?: string; url?: string }) && typeof m.url === 'string')
+    .map((m) => String(m.url));
+  const onPage = (Array.isArray(page.elements) ? (page.elements as { type?: string; image?: { url?: unknown } }[]) : [])
+    .filter((e) => e?.type === 'image' && typeof e.image?.url === 'string')
+    .map((e) => String(e.image!.url));
+  const current = page.background && typeof page.background === 'object' ? (page.background as { type?: string; value?: string }) : null;
+  return (url: string) =>
+    backgroundUrlAllowed(url, {
+      magazineId: String(page.magazineId),
+      current,
+      libraryUrls: library,
+      pageImageUrls: onPage,
+      keyOf: (u) => storage.keyFromUrl(u),
+    }) !== null;
+}
+
+// set one page's BACKGROUND (atomic CAS on page rev) — the paper behind every element.
+//
+// The panel could always change it; neither assistant could, so "make pages 7 to 16
+// blank" left the beige ground on every page the user had emptied ("the background is
+// a separate setting that I can't change"). The Studio stages a 'set-background'
+// change and the web applies it here, through the same edit gate and rev guard as
+// every element write.
+//
+// Body: { rev, background: { type: 'color', value: '#rrggbb' } | { type: 'image', value:
+// <a picture of THIS magazine> } | { type: 'none' } } → { page }. 'none' is plain white.
+router.patch('/issues/:id/pages/:pageId/background', async (req, res) => {
+  const ctx = await loadEditablePage(req, res);
+  if (!ctx) return;
+  const rev = requireRev(req, res);
+  if (rev === null) return;
+  const { page } = ctx;
+  if ((page.rev ?? 0) !== rev) {
+    res.status(409).json({ error: 'This page changed since you loaded it.', page: project(page) });
+    return;
+  }
+  const ask = parseBackgroundAsk(req.body?.background);
+  if (!ask) {
+    res.status(400).json({
+      error: 'A background is { type: "color", value: "#rrggbb" }, { type: "image", value: a picture url from this magazine } or { type: "none" }.',
+    });
+    return;
+  }
+  if (ask.type === 'image') {
+    // THE MAGAZINE IS THE ALLOW-LIST. A page background is drawn by the PDF export on
+    // the server, so it must be a public picture this magazine already holds — never an
+    // arbitrary url. One rule shared with the Studio (agentPanelPure.backgroundUrlAllowed):
+    // the page's current picture, a library picture, a picture already on this page, or
+    // one of this magazine's own page-background rasters. The last is what makes UNDO
+    // work on an imported or copied PDF page: its artwork is the worker's raster, never a
+    // media row, so putting it back after "clear the background" used to be refused.
+    const allowed = await backgroundAllowList(page);
+    if (!allowed(ask.value ?? '')) {
+      res.status(400).json({ error: 'That picture is not in this magazine’s media library.' });
+      return;
+    }
+  }
+  const background = storedBackground(ask);
+  const now = new Date().toISOString();
+  const ok = await db.collection(COL.pages).updateOneIf(page._id, { rev }, { background, rev: rev + 1, updatedAt: now });
+  if (!ok) {
+    const fresh = await pageById(page._id);
+    res.status(409).json({ error: 'This page changed since you loaded it.', page: fresh ? project(fresh) : null });
+    return;
+  }
+  const fresh = await pageById(page._id);
+  res.json({ page: project(fresh ?? { ...page, background, rev: rev + 1, updatedAt: now }) });
+});
+
 // AI editing agent for one page — the model calls tools that STAGE proposals
 // (never writes); returns { reply, proposals }. The client applies each proposal
 // through the element CRUD above (rev-guarded), so the same guardrails apply.
@@ -3134,13 +3536,45 @@ router.post('/issues/:id/pages/:pageId/agent', rateLimit('mag2-agent', 20, 60_00
   // Images the user attached this turn (already persisted to the media library by
   // the client). Prompt context only — the placement tools re-validate every url
   // against the media library, so a bogus url here can never reach a page.
-  const attachedImages = (Array.isArray(req.body?.attachedImages) ? req.body.attachedImages : [])
-    .filter((a: unknown): a is { url: string; name?: string } => !!a && typeof (a as { url?: unknown }).url === 'string')
+  // Each keeps the pixel size the browser measured and whether it looked like a designed
+  // picture (a chart, a logo), so the assistant can place it whole in a box of its own
+  // shape. Hints only: a size that is not two plausible whole numbers is dropped.
+  const attachedImages: AttachedImage[] = (Array.isArray(req.body?.attachedImages) ? req.body.attachedImages : [])
+    .filter((a: unknown): a is { url: string; name?: string; width?: unknown; height?: unknown; graphic?: unknown } => !!a && typeof (a as { url?: unknown }).url === 'string')
     .slice(0, 6)
-    .map((a: { url: string; name?: string }) => ({
-      url: a.url.slice(0, 2000),
-      name: typeof a.name === 'string' ? a.name.slice(0, 200) : 'image',
-    }));
+    .map((a: { url: string; name?: string; width?: unknown; height?: unknown; graphic?: unknown }) => {
+      const size = plausibleSize(a.width, a.height);
+      return {
+        url: a.url.slice(0, 2000),
+        name: typeof a.name === 'string' ? a.name.slice(0, 200) : 'image',
+        ...(size ? { width: size.width, height: size.height } : {}),
+        ...(a.graphic === true ? { graphic: true } : {}),
+      };
+    });
+  // Documents the user attached this turn (already uploaded to the magazine's library
+  // by the client). Each id is checked against THIS magazine's documents; one that does
+  // not resolve is dropped, not trusted. They are stored on the user's chat row and
+  // tagged into the model's view of the turn, so on a later turn "the PDF" still names
+  // a document the assistant can read (C12/C27).
+  const attachedDocs: AttachedDoc[] = [];
+  for (const d of parseAttachedDocs(req.body?.attachedDocs)) {
+    const found = await magazineDocument(String(page.magazineId), d.id);
+    if (found) attachedDocs.push({ id: found.docId, name: found.name });
+  }
+  // Changes an earlier turn staged and the user has not applied yet. The agent replays
+  // them onto its working copy so this turn builds on them, and returns them with its
+  // own — the client's tray used to be REPLACED by each turn's list, losing them (C05).
+  // pendingFromWire puts back what the shared parser does not keep yet: a staged
+  // background change, a reorder's destination page and a change's group. A staged
+  // background PICTURE must pass the same allow-list as the background PATCH: the turn
+  // renders the working page in the server's Chromium (check_page, look_at_page), so an
+  // unchecked url here would be a server-side fetch of any address the client named.
+  const rawPending: unknown = req.body?.pendingProposals;
+  const pendingParsed = parsePendingProposals(rawPending, { normalizeReading: normalizeLayoutReading });
+  const allowBackground = pendingParsed.some((p) => p.kind === 'set-background') || (Array.isArray(rawPending) && rawPending.some((p) => (p as { kind?: unknown })?.kind === 'set-background'))
+    ? await backgroundAllowList(page)
+    : () => false;
+  const pendingProposals = pendingFromWire(pendingParsed, rawPending, { allowImage: allowBackground });
   // ── The thread this turn belongs to ──
   //
   // HISTORY COMES FROM THE THREAD, NOT FROM THE CLIENT. The client used to post its
@@ -3211,12 +3645,33 @@ router.post('/issues/:id/pages/:pageId/agent', rateLimit('mag2-agent', 20, 60_00
     { $limit: 30 },
   ])) as Doc[];
   const thisPageIndex = Number(page.index) || 0;
-  const history = priorRows.reverse().map((m): { role: 'user' | 'assistant'; content: string } => {
-    const idx = typeof m.pageIndex === 'number' ? m.pageIndex : thisPageIndex;
-    const role = m.role === 'assistant' ? ('assistant' as const) : ('user' as const);
-    const tag = role === 'user' && idx !== thisPageIndex ? `[page ${idx + 1}] ` : '';
-    return { role, content: `${tag}${String(m.content ?? '')}` };
-  });
+  const priorOldestFirst = priorRows.reverse();
+  // A user turn that attached documents carries "[attached document “X.pdf” (docId …)]",
+  // so "it" and "the PDF" on a later turn still resolve to a document id. And when the
+  // last turn staged changes here that are no longer waiting, history says so (C05).
+  const history = withStagedOutcome(
+    priorOldestFirst.map((m) => historyEntry(m, thisPageIndex)),
+    priorOldestFirst,
+    { pageId: String(page._id), pendingCount: pendingProposals.length },
+  );
+
+  // ── The document this turn is about, when it attached none ──
+  //
+  // A document's text used to ride along ONLY with the message it was attached to, so
+  // "now add the race results from the PDF" on the next turn had nothing to work from
+  // (C27). When this turn sent no text but names a document ("the PDF", "the report",
+  // "the figures"), the text of the document attached most recently in THIS thread is
+  // read back from the library — a chat attachment keeps the text the browser
+  // extracted on its media row. A turn that never mentions a document does not pay for
+  // one; the Studio's read_document tool covers everything else.
+  let turnSourceText = sourceText;
+  if (!turnSourceText) {
+    const named = attachedDocs[0] ?? (refersToDocument(newUserText) ? latestAttachedDoc(priorOldestFirst) : null);
+    if (named) {
+      const text = (await mediaDocumentText(String(page.magazineId), named.id)).trim();
+      if (text) turnSourceText = text.slice(0, 60_000);
+    }
+  }
 
   // ── What the assistant knows about the WHOLE magazine ──
   //
@@ -3235,19 +3690,61 @@ router.post('/issues/:id/pages/:pageId/agent', rateLimit('mag2-agent', 20, 60_00
     return `Page ${(Number(p.index) || 0) + 1}: ${line || '(no headline yet)'}`;
   });
 
+  // The new message as the model sees it: the user's words plus the tag of any document
+  // attached with them, so the docId is in front of the model on THIS turn as well
+  // (read_document, add_content_pages from a document). The thread stores the words
+  // and the attachments separately, so the transcript shows what the user typed.
+  const docTag = attachedDocsTag(attachedDocs);
+  const turnText = docTag ? `${newUserText}${newUserText ? ' ' : ''}${docTag}` : newUserText;
+
+  // The pictures whose own pixel size the library records (uploads since sizes were
+  // kept, drawn charts), so the assistant can make a box exactly a picture's shape —
+  // "resize each image box to its own ratio" used to be guessed. Only the fields that
+  // matter are read: document rows carry their whole text.
+  const imageSizes = await mediaImageSizes(String(page.magazineId));
+
+  // Each attached document REGISTERED as one of the magazine's readable documents: a
+  // PDF attached in the chat is also queued to be read page by page, so a later message
+  // can read it by page and a scan gets read at all. The assistant then confirms it is
+  // saved — it used to answer "I can't store or attach files myself" about a file that
+  // was already stored (2026-11-15). Done here, after the thread checks above (which
+  // can refuse the turn), so a refused turn registers nothing; never a reason to fail it.
+  const attachedDocStates: AttachedDocState[] = [];
+  for (const d of attachedDocs) {
+    let state = { readable: false, reading: false };
+    try {
+      state = await registerAttachedDocument(String(page.magazineId), d.id, uid);
+    } catch (err) {
+      console.warn('[magazineV2] registering an attached document failed:', err instanceof Error ? err.message : err);
+    }
+    attachedDocStates.push({ docId: d.id, name: d.name, readable: state.readable, reading: state.reading });
+  }
+
   try {
-    const turn = await runPageAgent({
-      messages: [...history, { role: 'user', content: newUserText }],
+    const agentOpts: Parameters<typeof runPageAgent>[0] = {
+      messages: [...history, { role: 'user' as const, content: turnText }],
       page: {
         width: Number(page.width) || PAGE_W,
         height: Number(page.height) || PAGE_H,
-        elements: Array.isArray(page.elements) ? page.elements : [],
+        elements: Array.isArray(page.elements) ? (page.elements as MagazineElement[]) : [],
         index: Number(page.index) || 0,
+        // The page's own ground — the look renders it, and the check judges text
+        // contrast against it.
+        background: previewBackground(page.background),
+        // A copied scan's words are part of its background picture (C33): the agent
+        // says so instead of claiming the page has no text or editing nothing.
+        ...(page.notice === 'scanned' || page.notice === 'no-text' ? { notice: page.notice as string } : {}),
       },
+      // The issue's palette and fonts, so a chart (or new text) is drawn in the
+      // magazine's own look.
+      theme: (ctx.issue as { genTheme?: unknown }).genTheme,
+      pendingProposals,
       magazineId: page.magazineId,
       selectedElementId,
-      sourceText,
+      sourceText: turnSourceText,
       attachedImages: attachedImages.length > 0 ? attachedImages : undefined,
+      attachedDocs: attachedDocStates,
+      imageSizes,
       pageCount: allPages.length,
       issue: {
         title: String(ctx.issue.title || issueTheme.title || 'Untitled Magazine'),
@@ -3261,7 +3758,12 @@ router.post('/issues/:id/pages/:pageId/agent', rateLimit('mag2-agent', 20, 60_00
       // client's keep-going `catch` swallows the 403 — "Applied the assistant's
       // changes", nothing changed.
       canEditStructure: isOwner(roleOnMagazine(ctx.issue, req.account!.id)),
-    });
+    };
+    // The reply carries `check` (the page check's NEW errors after the turn's changes,
+    // only when there are any), `pendingMerged` / `pendingDropped` (the waiting changes
+    // it was sent, replayed) and `staged` (what waits for Apply, counted from the
+    // proposals) straight through the spread below.
+    const turn = await runPageAgent(agentOpts);
     // Persist both turns INTO THIS THREAD (page-tagged) so the conversation
     // survives reloads. Best-effort: a persistence hiccup must not fail a reply the
     // user already received.
@@ -3277,8 +3779,15 @@ router.post('/issues/:id/pages/:pageId/agent', rateLimit('mag2-agent', 20, 60_00
           pageIndex: thisPageIndex,
           role: 'user',
           content: newUserText.slice(0, 8000),
-          ...(attachedImages.length > 0
-            ? { attachments: attachedImages.map((a: { url: string; name: string }) => ({ name: a.name, isImage: true, url: a.url })) }
+          // Images AND documents: a document row keeps its docId, which is what lets a
+          // later turn's history name it and the transcript's chip survive a reload.
+          ...(attachedImages.length > 0 || attachedDocs.length > 0
+            ? {
+                attachments: [
+                  ...attachedImages.map((a: { url: string; name: string }) => ({ name: a.name, isImage: true, url: a.url })),
+                  ...attachedDocs.map((d) => ({ name: d.name, isImage: false, docId: d.id })),
+                ],
+              }
             : {}),
           deletedAt: null,
           createdAt: new Date(t0).toISOString(),
@@ -3293,6 +3802,10 @@ router.post('/issues/:id/pages/:pageId/agent', rateLimit('mag2-agent', 20, 60_00
         pageIndex: thisPageIndex,
         role: 'assistant',
         content: String(turn.reply ?? '').slice(0, 20000),
+        // How many changes this turn left waiting for Apply — so the NEXT turn can tell
+        // the model they were applied or discarded once the client stops sending them
+        // back (withStagedOutcome). Not shown in the transcript.
+        staged: Array.isArray(turn.proposals) ? turn.proposals.length : 0,
         deletedAt: null,
         createdAt: new Date(t0 + 1).toISOString(), // +1ms so it sorts AFTER the user turn
       });
@@ -3625,18 +4138,29 @@ router.post('/issues/:id/pages/:pageId/apply-layout', rateLimit('mag2-agent', 20
         // everything else newest-first (uploads carry no pageIndex, so recency is the
         // only signal they have), and drops what may never be placed — a reference or
         // a doc — so neither can be reintroduced here. See media.ts.
+        // forPhotoSlots: a drawn chart, a picture lifted out of an attached PDF (a logo,
+        // a form header) or an AI illustration is placed only when someone asks for it
+        // — never dropped into an empty photo slot because it is the newest row.
         const media = (await db.collection(COL.media).find({ magazineId: issue._id })) as Doc[];
-        for (const m of rankMediaForPage(media as unknown as RankableMediaRow[], Number(page.index) || 0)) {
+        for (const m of rankMediaForPage(media as unknown as RankableMediaRow[], Number(page.index) || 0, { forPhotoSlots: true })) {
           take(String(m.url), String(m._id), typeof m.alt === 'string' ? m.alt : '');
         }
       }
     }
     let extraTexts: { role: string; text: string }[] = [];
     if (missing.texts.length > 0 && isAgentConfigured()) {
+      // The page's current story goes in as its SUBJECT, so the fresh copy stays on what
+      // this page was about rather than drifting to the magazine's brief at large. Not as
+      // `existingText`: that list is "already on the page, do not repeat", and the page
+      // is being cleared — passing it there would steer the drafts AWAY from the story.
+      // The words themselves are still replaced (the rebuild is a recreate; see above).
+      const story = pageStoryLine(pageShape.elements);
+      const brief = genTheme?.prompt ? String(genTheme.prompt) : '';
+      const subject = [story ? `This page's own story (stay on it): ${story}` : '', brief].filter(Boolean).join(' | ');
       extraTexts = await draftReferenceFill({
         title: String(issue.title || genTheme?.title || 'Untitled Magazine'),
         subtitle: genTheme?.subtitle ? String(genTheme.subtitle) : undefined,
-        subject: genTheme?.prompt ? String(genTheme.prompt) : undefined,
+        subject: subject || undefined,
         existingText: [],
         slots: missing.texts,
       });
@@ -3770,9 +4294,10 @@ router.post('/issues/:id/pages/:pageId/format', rateLimit('mag2-agent', 20, 60_0
       ? await formatPageText({ mode, title: String(issue.title ?? ''), candidates })
       : { edits: [] as { elementId: string; content: string }[], note: '' };
     // DETERMINISTIC, and run on every pass whether or not the model was asked anything:
-    //  1. copy hygiene over the WHOLE page — strips printed plumbing ("PAGE 2 —", a page
-    //     number repeated down a list, a line that re-states the headline) from the
-    //     model's rewrites AND from copy already on the page (copyHygiene.ts);
+    //  1. copy hygiene over the page's GENERATED copy — strips printed plumbing ("PAGE 2 —",
+    //     a page number repeated down a list, a line that re-states the headline) from
+    //     copy the generator wrote; text copied from a PDF or typed by a person is the
+    //     client's own and is left as it is (copyHygiene.ts, C32);
     //  2. a re-balance of the page's geometry against that final copy — text boxes hug
     //     their type, the space they wasted goes to the photographs or is anchored by the
     //     layout's intent, sliver photos are re-flowed or dropped (relayoutPage.ts).
@@ -3793,7 +4318,10 @@ router.post('/issues/:id/pages/:pageId/format', rateLimit('mag2-agent', 20, 60_0
       res.json({ edits: [], note: adjusted.reason || (mode === 'fill' ? 'No empty or crowded text to fill.' : 'No crowded text to adjust.') });
       return;
     }
-    res.json({ edits, note: out.note || layout?.summary || adjusted.reason || '', ...(layout ? { layout } : {}) });
+    // With text edits to apply, the refusal sentence ("…so Adjust left its layout exactly
+    // as it is") read as if nothing had happened while the words did change. Say both.
+    const keptLayout = !layout && adjusted.reason ? `Updated ${edits.length} text box${edits.length === 1 ? '' : 'es'}; the layout itself was left as it is.` : '';
+    res.json({ edits, note: out.note || layout?.summary || keptLayout, ...(layout ? { layout } : {}) });
   } catch (err) {
     console.error('[magazineV2] format error:', err instanceof Error ? err.message : err);
     res.status(500).json({ error: 'The text pass hit a snag. Please try again.' });
@@ -3862,7 +4390,14 @@ router.post('/issues/:id/pages/:pageId/copy-document-page', rateLimit('mag2-gene
     return;
   }
   const now = new Date().toISOString();
-  await db.collection(COL.pages).updateOne(page._id, { status: 'pending', error: '', updatedAt: now });
+  // Pending AND a new rev: an edit made from the editor's copy while the job runs is
+  // refused (and reconciled) instead of saved and then silently replaced, and the
+  // operator's "has it changed?" check sees the change (C25).
+  if (!(await markPagePending(page))) {
+    const fresh = await pageById(page._id);
+    res.status(409).json({ error: 'This page changed since you loaded it.', page: fresh ? project(fresh) : null });
+    return;
+  }
   await enqueueJob('copyDocumentPage', {
     issueId: String(issue._id),
     pageId: String(page._id),
@@ -3870,7 +4405,336 @@ router.post('/issues/:id/pages/:pageId/copy-document-page', rateLimit('mag2-gene
     sourcePage,
   });
   await db.collection(COL.magazines).updateOne(String(issue._id), { updatedAt: now });
-  res.status(202).json({ ok: true, from: { name: source.name, sourcePage, pageCount: source.pages } });
+  // `rev` is the page's rev while it is pending; the worker moves it again when the copy
+  // lands, so a poller can treat "no longer pending" as done.
+  res.status(202).json({
+    ok: true,
+    from: { name: source.name, sourcePage, pageCount: source.pages },
+    rev: (typeof page.rev === 'number' && Number.isFinite(page.rev) ? page.rev : 0) + 1,
+  });
+});
+
+// ── Seeing a page: the check and the look ────────────────────────────────────
+//
+// The AI that edits a page used to have no way to see it, so it said so — "I can't see
+// the page" — and guessed at fixes. Two ways to see a STORED page, for The Stable Hand
+// after an apply and for anything else that needs a second pair of eyes:
+//
+//   the CHECK  deterministic: cut-off or overflowing text, text past the edge, overlaps,
+//              hidden or empty pictures, tiny or low-contrast type (pageCheck.ts) —
+//              measured on a render of the page when the shared Chromium can, else
+//              estimated from the element data. Always returned.
+//   the LOOK   one vision call on a render (pageLook.ts): what a reader would notice that
+//              no rule measures. May be unavailable (switched off, renderer busy, time
+//              short) — then `seen: false` with the reason, and the check still stands,
+//              so the caller is never blind.
+
+/** A stored page as the renderer takes it. */
+function storedPreviewPage(page: Doc): PreviewPage {
+  const dims = pageDims(page);
+  return {
+    width: dims.width,
+    height: dims.height,
+    background: previewBackground(page.background),
+    elements: Array.isArray(page.elements) ? (page.elements as MagazineElement[]) : [],
+  };
+}
+
+/** The page check for a stored page: Chromium-measured when the renderer answers in
+ *  time (real fonts, real wrapping), else the estimate. Never throws. */
+async function checkStoredPage(preview: PreviewPage, pageNumber: number): Promise<PageCheck> {
+  const ground = { width: preview.width, height: preview.height, background: preview.background };
+  const measured = await measurePagePreview(preview, { timeoutMs: 6_000, queueMs: 3_000 }).catch(() => null);
+  return measured
+    ? checkPageFromMeasurements(measured, preview.elements, ground, { pageNumber, measuredBy: 'chromium' })
+    : checkPage(preview.elements, ground, { pageNumber });
+}
+
+// The read gate is GET /pages/:pageId's (canViewPage): a collaborator can still have
+// their own submitted page looked at. It renders what is STORED, so it sees the result
+// of an apply, not the editor's unsaved state.
+router.post('/issues/:id/pages/:pageId/look', rateLimit('mag2-look', 10, 60_000), async (req, res) => {
+  const uid = req.account!.id;
+  const issue = await loadIssue(String(req.params.id));
+  if (!issue || !roleOnMagazine(issue, uid)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const page = await pageById(String(req.params.pageId));
+  if (!page || page.magazineId !== issue._id || !canViewPage(issue, uid, page._id)) {
+    res.status(404).json({ error: 'Page not found' });
+    return;
+  }
+  const request = typeof req.body?.request === 'string' ? req.body.request.trim().slice(0, 1000) : '';
+  const focus = typeof req.body?.focus === 'string' ? req.body.focus.trim().slice(0, 300) : '';
+  const preview = storedPreviewPage(page);
+  const pageNumber = (Number(page.index) || 0) + 1;
+  const check = await checkStoredPage(preview, pageNumber);
+  const look = await lookAtPage({
+    page: preview,
+    elements: preview.elements,
+    ...(request ? { request } : {}),
+    ...(focus ? { focus } : {}),
+    pageNumber,
+    check,
+    timeoutMs: 40_000,
+  });
+  res.json({ seen: look.seen, findings: look.findings, ...(look.reason ? { reason: look.reason } : {}), check });
+});
+
+// ── Charts, drawn from the numbers ───────────────────────────────────────────
+//
+// A chart is DRAWN — deterministic SVG rasterised by the shared Chromium — never
+// generated: the image model would invent the bars and the labels. The PNG is stored
+// as a media asset (kind 'graphic', source 'chart', its spec kept for edits) and placed
+// like any picture, fit 'contain' so nothing is cropped.
+//
+// The element is NOT saved here. The client adds it through the element CRUD (one
+// undoable step, the same rev guard as any add), so a chart is undone like anything
+// else. Three ways in:
+//
+//   { chart }                       a new chart: in the given `box`, else in the largest
+//                                   free space (or an empty picture box) on the page.
+//   { chart, replaceElementId }     a new chart in the place of an element on the page.
+//   { editElementId, changes }      re-draw an existing chart with changed numbers
+//                                   ("change 2023 to 14") from the spec stored with it.
+//
+// When the chart takes an existing element's place the response names it
+// (`replaceElementId`) and, when that element is a picture, carries the `patch` that
+// turns it into the chart in place; otherwise the client removes it and adds `element`.
+
+/** The chart's frame on the page and the element it takes the place of, if any. */
+type ChartPlacement = { box: { x: number; y: number; w: number; h: number }; zIndex: number; replaces?: MagazineElement };
+
+router.post('/issues/:id/pages/:pageId/chart', rateLimit('mag2-chart', 20, 60_000), async (req, res) => {
+  const ctx = await loadEditablePage(req, res);
+  if (!ctx) return;
+  const { issue, page } = ctx;
+  const elements: MagazineElement[] = Array.isArray(page.elements) ? page.elements : [];
+  const dims = pageDims(page);
+  const background = previewBackground(page.background);
+  const byId = (id: unknown) => (typeof id === 'string' && id ? elements.find((e) => e.id === id.slice(0, 64)) : undefined);
+
+  // ── what to draw ──
+  let spec: ChartSpec;
+  let placement: ChartPlacement | null = null;
+  const editId = typeof req.body?.editElementId === 'string' ? req.body.editElementId.trim() : '';
+  if (editId) {
+    const target = byId(editId);
+    if (!target) {
+      res.status(404).json({ error: 'That element is not on this page.' });
+      return;
+    }
+    const assetId = target.type === 'image' ? String(target.image?.assetId ?? '') : '';
+    const stored = assetId ? await loadChartAsset(assetId, String(issue._id)) : null;
+    if (!stored) {
+      res.status(400).json({ error: 'That picture is not a chart drawn from data, so it has no numbers to change. Add a new chart instead.' });
+      return;
+    }
+    const changed = applyChartChanges(stored.spec, req.body?.changes);
+    if (!changed.ok) {
+      res.status(400).json({ error: changed.error });
+      return;
+    }
+    spec = changed.spec;
+    placement = { box: { x: target.x, y: target.y, w: target.w, h: target.h }, zIndex: target.zIndex, replaces: target };
+  } else {
+    const checked = validateChartSpec(req.body?.chart);
+    if (!checked.ok) {
+      res.status(400).json({ error: checked.error });
+      return;
+    }
+    spec = checked.spec;
+  }
+
+  // ── where it goes ──
+  if (!placement && req.body?.replaceElementId !== undefined) {
+    const target = byId(req.body.replaceElementId);
+    if (!target) {
+      res.status(404).json({ error: 'The element to replace is not on this page.' });
+      return;
+    }
+    // Keeps the replaced element's layer: it was visible where it stood.
+    placement = { box: { x: target.x, y: target.y, w: target.w, h: target.h }, zIndex: target.zIndex, replaces: target };
+  }
+  if (!placement && req.body?.box !== undefined) {
+    const box = clampBoxToPage(req.body.box, dims);
+    if (!box) {
+      res.status(400).json({ error: 'The box must be { x, y, w, h } in page pixels.' });
+      return;
+    }
+    placement = { box, zIndex: Math.min(9999, topZ(elements) + 1) };
+  }
+  if (!placement) {
+    const slot = chartSlot(elements, dims, preferredChartAspect(spec));
+    if (!slot) {
+      res.status(409).json({
+        error: 'There is no free space on this page for a chart. Name an element for it to replace, or give it a box.',
+        reason: 'no-space',
+      });
+      return;
+    }
+    const empty = slot.emptySlotId ? byId(slot.emptySlotId) : undefined;
+    placement = { box: slot.box, zIndex: Math.min(9999, topZ(elements) + 1), ...(empty ? { replaces: empty } : {}) };
+  }
+  if (placement.replaces?.locked === true) {
+    res.status(403).json({ error: 'That element is locked. Unlock it first.' });
+    return;
+  }
+  const { box } = placement;
+  if (box.w < 60 || box.h < 40) {
+    res.status(400).json({ error: 'That space is too small to draw a readable chart in — it needs at least 60 × 40 px (ideally 400 × 260 or more).' });
+    return;
+  }
+
+  // ── draw and store ──
+  const theme = chartTheme((issue as { genTheme?: unknown }).genTheme, elements, { background });
+  const out = await renderAndStoreChart(spec, theme, { w: box.w, h: box.h }, { magazineId: String(issue._id), pageIndex: Number(page.index) || 0 });
+  if (!out.ok) {
+    const down = !previewRendererAvailable() || !storage.isConfigured();
+    res.status(down ? 503 : 502).json({ error: out.error });
+    return;
+  }
+  const image = { url: out.url, assetId: out.assetId, alt: out.alt, fit: 'contain' as const };
+  const element: Partial<MagazineElement> = {
+    type: 'image',
+    x: box.x,
+    y: box.y,
+    w: box.w,
+    h: box.h,
+    rotation: 0,
+    zIndex: placement.zIndex,
+    source: 'ai-agent',
+    image,
+  };
+  const replaces = placement.replaces;
+  res.status(201).json({
+    asset: { id: out.assetId, url: out.url, alt: out.alt },
+    element,
+    dataEcho: out.dataEcho,
+    // The spec as stored (validated, trimmed), so a caller can confirm the numbers.
+    chart: spec,
+    ...(replaces
+      ? {
+          replaceElementId: replaces.id,
+          ...(replaces.type === 'image' ? { patch: { image, ...(placement.zIndex !== replaces.zIndex ? { zIndex: placement.zIndex } : {}) } } : {}),
+        }
+      : {}),
+  });
+});
+
+// ── Replace a word or a name across the magazine ─────────────────────────────
+//
+// "Change NZTROF to NOG everywhere." Deterministic, never a model: only the matched
+// words of each text box change (textReplace.replaceInHtml), every other byte of the
+// client's copy stays as it was, and each changed box goes through the same write
+// pipeline as a typed edit (refit from its ceiling; copied PDF text becomes flowing
+// text once its words change).
+//
+// SCOPE IS EDIT ACCESS: only pages the caller may edit right now. A page-scoped
+// collaborator's other pages are never searched (or counted); a page that is submitted
+// or approved is counted under `blocked`, not changed. Locked boxes are never edited;
+// their matches are counted (`skippedLocked`) so nobody is surprised later. A box the
+// longer text would push past the stored-text limit is left whole and counted
+// (`skippedTooLong`) — writing it would cut the end of the client's copy off.
+//
+// `dryRun: true` counts per page and writes nothing — the confirm card shows that
+// before the real call. A real call writes each page with a compare-and-set on its rev,
+// re-planning once from the fresh page if someone edited it in between.
+router.post('/issues/:id/replace-text', rateLimit('mag2-replace', 20, 60_000), async (req, res) => {
+  const uid = req.account!.id;
+  const issue = await loadIssue(String(req.params.id));
+  if (!issue || !roleOnMagazine(issue, uid)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  const body = parseReplaceTextBody(req.body);
+  if (!body.ok) {
+    res.status(400).json({ error: body.error });
+    return;
+  }
+  // Pages being inserted by a running build would be missed, so wait for it.
+  if (isBusy(issue)) {
+    res.status(409).json({ error: 'That magazine is still being built — try again once it finishes.' });
+    return;
+  }
+  const opts = { matchCase: body.matchCase, wholeWord: body.wholeWord };
+  const pages = await pagesFor(String(issue._id));
+  const rows: ReplacePageReport[] = [];
+  const blocked: { pageId: string; pageNumber: number; count: number; reason: string }[] = [];
+  const conflicts: { pageId: string; pageNumber: number }[] = [];
+  const written: { pageId: string; rev: number; elementIds: string[] }[] = [];
+  const now = new Date().toISOString();
+
+  for (const p of pages) {
+    const pageId = String(p._id);
+    const pageNumber = (Number(p.index) || 0) + 1;
+    const block = pageEditBlock(issue, uid, pageId, p);
+    if (block === 'not-assigned') continue; // not this caller's page: never searched
+    let plan = planPageReplace(Array.isArray(p.elements) ? p.elements : [], pageDims(p), body.find, body.replace, opts);
+    const found = (pl: typeof plan) => pl.count + pl.skippedLocked + pl.skippedTooLong;
+    // A page a background job is rebuilding (a retry, a copied PDF page) is about to have
+    // every element replaced: an edit now would be lost, and would race the job's write.
+    const rebuilding = p.status === 'pending' ? 'page-rebuilding' : null;
+    if (block || rebuilding) {
+      if (found(plan) > 0) blocked.push({ pageId, pageNumber, count: found(plan), reason: (block ?? rebuilding)! });
+      continue;
+    }
+    if (body.dryRun || !plan.elements) {
+      rows.push({ pageId, pageNumber, count: plan.count, skippedLocked: plan.skippedLocked, skippedTooLong: plan.skippedTooLong });
+      continue;
+    }
+    // Compare-and-set on the rev the plan was made from; once more from the fresh page.
+    let current: Doc = p;
+    let landed: number | null = null;
+    let nowRebuilding = false;
+    for (let attempt = 0; attempt < 2 && plan.elements; attempt++) {
+      const cur = typeof current.rev === 'number' && Number.isFinite(current.rev) ? current.rev : null;
+      const ok = await db.collection(COL.pages).updateOneIf(pageId, { rev: cur }, { elements: plan.elements, rev: (cur ?? 0) + 1, updatedAt: now });
+      if (ok) {
+        landed = (cur ?? 0) + 1;
+        break;
+      }
+      const fresh = await pageById(pageId);
+      // The fresh page gets the SAME gates as the first read. A retry or a page copy
+      // started between the read and the write marks the page pending (and bumps its
+      // rev, which is why the write missed): writing it now would be overwritten by the
+      // job's own write a moment later, so the replacement would be lost while this
+      // route reported it as made. It is reported as rebuilding instead.
+      if (!fresh || pageEditBlock(issue, uid, pageId, fresh)) break;
+      if (fresh.status === 'pending') {
+        nowRebuilding = true;
+        const again = planPageReplace(Array.isArray(fresh.elements) ? fresh.elements : [], pageDims(fresh), body.find, body.replace, opts);
+        blocked.push({ pageId, pageNumber, count: Math.max(found(again), found(plan)), reason: 'page-rebuilding' });
+        break;
+      }
+      current = fresh;
+      plan = planPageReplace(Array.isArray(fresh.elements) ? fresh.elements : [], pageDims(fresh), body.find, body.replace, opts);
+    }
+    if (nowRebuilding) continue; // counted under `blocked`, never as replaced or as a conflict
+    if (landed !== null) {
+      rows.push({ pageId, pageNumber, count: plan.count, skippedLocked: plan.skippedLocked, skippedTooLong: plan.skippedTooLong });
+      written.push({ pageId, rev: landed, elementIds: plan.changedIds });
+    } else if (plan.elements) {
+      // Edited twice under us: left as it is, and said so.
+      conflicts.push({ pageId, pageNumber });
+      rows.push({ pageId, pageNumber, count: 0, skippedLocked: plan.skippedLocked, skippedTooLong: plan.skippedTooLong });
+    } else {
+      // The fresh page no longer had anything to change.
+      rows.push({ pageId, pageNumber, count: 0, skippedLocked: plan.skippedLocked, skippedTooLong: plan.skippedTooLong });
+    }
+  }
+  if (written.length > 0) await db.collection(COL.magazines).updateOne(String(issue._id), { updatedAt: now });
+
+  const report = replaceReport(rows);
+  res.json({
+    ...report,
+    applied: !body.dryRun && written.length > 0,
+    // For the client to refresh exactly what changed (the open page by its new rev).
+    ...(written.length ? { written } : {}),
+    ...(blocked.length ? { blocked } : {}),
+    ...(conflicts.length ? { conflicts } : {}),
+  });
 });
 
 export default router;

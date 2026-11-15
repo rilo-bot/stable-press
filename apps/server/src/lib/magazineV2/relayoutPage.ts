@@ -72,8 +72,7 @@
 // ---------------------------------------------------------------------------
 
 import type { MagazineElement } from './model.js';
-import { estimateTextHeight, fitFontSize, refitText } from './layout.js';
-import { measureRunWidthPx } from './fontMetrics.js';
+import { estimateTextHeight, fitFontSize, plainTextForMeasure, refitText, widestLineWidthPx } from './layout.js';
 import { balanceLayout, type BalanceResult } from './balanceLayout.js';
 import { FURNITURE_IDS } from './pageFurniture.js';
 import { validatePageLayout, pageQuality, type PageQuality } from './layoutValidate.js';
@@ -729,7 +728,9 @@ function elementMeasure(byId: Map<string, MagazineElement>, paras: Map<string, D
     }
     if (el.type !== 'text' || !el.text) return null;
     const t = el.text;
-    if (!t.content.replace(/<[^>]+>/g, '').trim()) return null;
+    // The estimator's own reading of the copy (entities decoded, <br> as a line break),
+    // not a bare tag strip — "&nbsp;" alone is an empty box, not one word.
+    if (!plainTextForMeasure(t.content).trim()) return null;
     const p = paras.get(el.id);
     if (p && axis === 'col') return paraHeight(p, crossLen);
     const fontSize = typeof t.maxFontSize === 'number' ? t.maxFontSize : t.fontSize;
@@ -742,8 +743,19 @@ function elementMeasure(byId: Map<string, MagazineElement>, paras: Map<string, D
         letterSpacing: t.letterSpacing, textTransform: t.textTransform,
       });
     }
-    const plain = t.content.replace(/<[^>]+>/g, '');
-    return measureRunWidthPx(t.textTransform === 'uppercase' ? plain.toUpperCase() : plain, t.fontFamily, t.fontWeight, fontSize, t.letterSpacing ?? 0) / WRAP_SAFETY;
+    // Across a row, the copy needs its WIDEST line, not the whole run joined: a two-line
+    // label ("NEW<br>SEASON") used to be measured as "NEWSEASON" on one line. Bold runs
+    // are measured as bold and the case transform per run (layout.widestLineWidthPx).
+    return (
+      widestLineWidthPx({
+        text: t.content,
+        fontSize,
+        fontFamily: t.fontFamily,
+        fontWeight: t.fontWeight,
+        letterSpacing: t.letterSpacing ?? 0,
+        ...(t.textTransform ? { textTransform: t.textTransform } : {}),
+      }) / WRAP_SAFETY
+    );
   };
 }
 

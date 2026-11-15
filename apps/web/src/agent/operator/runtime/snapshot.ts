@@ -12,6 +12,13 @@
 // the model never "sees" — and then tries to act on — its own chrome. `text` is
 // user content and is labelled UNTRUSTED in the contract; the server prompt
 // must treat it as data, never instructions.
+//
+// Text order: open dialogs, then regions a screen marks data-operator-read-first
+// (the magazine studio's open page), then the rest. Subtrees the app marks
+// aria-hidden (decorative copies such as page-rail thumbnails) are skipped. `note`
+// is OUR guidance for the model about the screen (e.g. "measure a magazine page
+// with magazine.checkPage") — kept out of `text` so it is never mistaken for, or
+// mixed with, page content.
 // ---------------------------------------------------------------------------
 
 import type { ScreenSnapshot } from '../contracts';
@@ -141,6 +148,22 @@ export function pageTitle(): string {
 
 const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'NAV', 'SVG', 'IFRAME']);
 
+/**
+ * A subtree the app itself marked decorative (aria-hidden="true") — e.g. the
+ * magazine studio's page-rail thumbnails, which draw every page in full and used
+ * to eat the whole text budget before the open page was reached.
+ *
+ * NOT a subtree a modal hid: Radix dialogs hide everything outside themselves with
+ * the aria-hidden package, which also stamps `data-aria-hidden`. Those are read
+ * after the dialog as before (the dialog is read first anyway).
+ */
+function decorative(el: Element): boolean {
+  return el.getAttribute('aria-hidden') === 'true' && !el.hasAttribute('data-aria-hidden');
+}
+
+/** A region the screen asks to be read FIRST, with its label (see readFirstRegions). */
+const READ_FIRST_ATTR = 'data-operator-read-first';
+
 /** Visible text under `root`, skipping nav / scripts / Operator chrome / hidden
  *  subtrees. Stops early once `budget` chars are collected so huge pages stay
  *  cheap. */
@@ -154,6 +177,7 @@ function visibleText(root: Element, budget: number, exclude: Element[] = []): st
       if (SKIP_TAGS.has(el.tagName.toUpperCase())) return NodeFilter.FILTER_REJECT;
       if (exclude.includes(el)) return NodeFilter.FILTER_REJECT;
       if (el.matches(OPERATOR_UI_SEL) || el.hasAttribute('hidden')) return NodeFilter.FILTER_REJECT;
+      if (decorative(el)) return NodeFilter.FILTER_REJECT;
       const cs = window.getComputedStyle(el);
       if (cs.display === 'none') return NodeFilter.FILTER_REJECT;
       // visibility is inherited but can be re-enabled on a child: skip only
@@ -173,7 +197,41 @@ function visibleText(root: Element, budget: number, exclude: Element[] = []): st
   return parts.join(' ');
 }
 
-/** Structured description of what the user can see right now. */
+/**
+ * Regions a screen marked with data-operator-read-first="<label>" — read right after
+ * any open dialog, before the rest of the page, each prefixed with its label. The
+ * magazine studio marks the OPEN page: in DOM order it comes after the assistant's
+ * transcript and the page rail, so with a 1,500-character budget readScreen
+ * usually never reached it.
+ */
+function readFirstRegions(): HTMLElement[] {
+  return Array.from(document.querySelectorAll<HTMLElement>(`[${READ_FIRST_ATTR}]`)).filter(
+    (el) => !isOperatorUi(el) && isVisible(el) && !el.closest('[aria-hidden="true"]:not([data-aria-hidden])'),
+  );
+}
+
+/**
+ * A screen-specific hint for the model, outside the untrusted `text`.
+ *
+ * On a magazine page readScreen is the wrong tool for checking the page: it reads
+ * words only — no boxes, sizes or pictures — and words cut off by their box still
+ * read as present. That is how The Stable Hand once reported a clipped paragraph as
+ * done, or told the user it could not see the page. When the studio offers a
+ * measuring action, say so here, every time the model looks.
+ */
+function screenNote(actionNames: Set<string>): string | undefined {
+  if (!actionNames.has('magazine.checkPage')) return undefined;
+  const look = actionNames.has('magazine.lookAtPage') ? ' magazine.lookAtPage adds a visual review of a render.' : '';
+  return (
+    'Magazine page: this text is NOT a check of the page — it has no layout, no pictures, and words cut off by their box still appear in it. ' +
+    'To verify a page, run magazine.checkPage: it measures the page as drawn (cut-off or overflowing text, text past the edge, overlaps, hidden, empty or broken pictures, tiny or low-contrast text).' +
+    look +
+    ' Never tell the user you cannot see the page.'
+  );
+}
+
+/** Structured description of what the user can see right now. `note`, when
+ *  present, is guidance for the model about this screen (not page content). */
 export function readScreen(opts: { full?: boolean } = {}): ScreenSnapshot {
   const MAX = opts.full ? MAX_TEXT_FULL : MAX_TEXT;
   const anchored = visibleAgentEls(MAX_ELEMENTS).map((el) => describe(el));
@@ -212,17 +270,28 @@ export function readScreen(opts: { full?: boolean } = {}): ScreenSnapshot {
     if (text.length >= MAX) break;
     text += (text ? ' ' : '') + visibleText(d, MAX - text.length);
   }
+  // Then the regions the screen asked to be read first (the open magazine page),
+  // unless a dialog already covers them.
+  const first = readFirstRegions().filter((r) => !dialogs.some((d) => d.contains(r)));
+  for (const r of first) {
+    if (text.length >= MAX) break;
+    const label = truncate(collapse(r.getAttribute(READ_FIRST_ATTR)), 60);
+    const body = visibleText(r, MAX - text.length, dialogs);
+    if (body) text += (text ? ' · ' : '') + (label ? `[${label}] ` : '') + body;
+  }
   const main = document.querySelector('main');
   const root = main && !isOperatorUi(main) ? main : document.body;
   if (text.length < MAX) {
-    // Exclude the dialogs already read, in case one lives inside <main>.
-    const rest = visibleText(root, MAX - text.length, dialogs);
+    // Exclude the dialogs and regions already read, in case they live inside <main>.
+    const rest = visibleText(root, MAX - text.length, [...dialogs, ...first]);
     if (rest) text += (text ? ' · ' : '') + rest;
   }
 
+  const note = screenNote(new Set(actions.map((a) => a.name)));
   return {
     path: window.location.pathname + window.location.search,
     title: pageTitle(),
+    ...(note ? { note } : {}),
     actions,
     elements,
     dialogs: dialogs.map(dialogTitle),

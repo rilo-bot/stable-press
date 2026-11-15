@@ -74,17 +74,25 @@ export async function renderIssuePdfJob(
   const version = typeof doc.version === 'number' ? doc.version : 1;
   const pages = Array.isArray(doc.pages) ? (doc.pages as PublishedPage[]) : [];
   const first = pages[0] ?? null;
-  // One size for the whole document, taken from the FIRST page — page.pdf() accepts
-  // a single sheet size and an issue's pages are uniform in practice. Undefined
-  // lets lib/pdf.ts apply its canonical default.
+  // Only a FALLBACK sheet. An issue's pages are NOT uniform — "copy a page" keeps
+  // the source PDF's shape, and pages added to an imported Letter magazine are A4 —
+  // so every page is printed on a sheet of its own size by the viewer's named
+  // @page rules (BulletinViewer.tsx) with preferCSSPageSize (lib/pdf.ts). This box
+  // applies only to a page that CSS did not size. Undefined lets lib/pdf.ts apply
+  // its canonical default.
   const sheet =
     dim(first?.width) && dim(first?.height)
       ? { width: dim(first?.width), height: dim(first?.height) }
       : undefined;
+  // For the log only: a mixed-size edition is the case that used to print wrongly,
+  // so it is worth seeing at a glance when a reader reports an odd PDF.
+  const sizes = new Set(pages.map((p) => `${dim(p.width)}x${dim(p.height)}`));
 
   await beat?.();
   const url = `${WEB_PUBLIC_URL}/bulletins/${id}`;
-  console.log(`[worker] renderIssuePdf ${id} v${version}: rendering ${url}`);
+  console.log(
+    `[worker] renderIssuePdf ${id} v${version}: rendering ${url} (${pages.length} page(s), ${sizes.size} sheet size(s))`,
+  );
 
   // Cache key '' bypasses lib/pdf.ts's in-process cache deliberately. S3 IS the
   // cache now, and holding a second copy in the worker's heap would recreate the

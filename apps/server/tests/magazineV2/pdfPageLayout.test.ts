@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 
 import { openPdf } from '../../src/lib/agent/pdfText.js';
-import { blocksFrom, bodySizeOf, columnsOf, layoutFromMeasure, marginToken, rolesFor } from '../../src/lib/magazineV2/pdfPageLayout.js';
+import { blocksFrom, bodySizeOf, columnsOf, layoutFromMeasure, marginToken, noLayoutReason, rolesFor } from '../../src/lib/magazineV2/pdfPageLayout.js';
 import { readLayoutPdfPage } from '../../src/lib/magazineV2/readLayoutPdf.js';
 
 const W = 600;
@@ -240,4 +240,45 @@ test('the page asked for is the page measured', async () => {
   const said = out.reading!.regions.map((r) => r.text ?? '').join(' ');
   assert.match(said, /TWO/);
   assert.doesNotMatch(said, /ONE|THREE/, 'a page must not carry its neighbours');
+});
+
+// ── a scan is full, not empty ───────────────────────────────────────────────
+//
+// A scanned page has no text layer: one picture covering the page. It used to be
+// told "there is not enough on page 3 to read as a layout", which is false (the
+// page is full) and sent people looking for a problem with their page. The honest
+// cause is that a scan's words are pixels; the useful advice is to send the page
+// as a picture, which the vision path can read.
+
+test('a scanned page (one page-covering picture, no text layer) says so and how to proceed', async () => {
+  const doc = await PDFDocument.create();
+  const png = await doc.embedPng(
+    Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==',
+      'base64',
+    ),
+  );
+  doc.addPage([W, H]).drawImage(png, { x: 0, y: 0, width: W, height: H });
+  const out = await readLayoutPdfPage(Buffer.from(await doc.save()), 1);
+  assert.equal(out.reading, null);
+  assert.match(out.error, /scanned picture with no text layer/);
+  assert.match(out.error, /screenshot or image of that page/);
+  assert.doesNotMatch(out.error, /not enough/);
+});
+
+test('noLayoutReason: blank, scanned and sparse pages each get their own sentence', () => {
+  const page = (runs: number, images: Array<{ x: number; y: number; w: number; h: number }>) => ({
+    width: W,
+    height: H,
+    runs: Array.from({ length: runs }, (_v, i) => ({ x: 60, y: 100 + i * 20, w: 200, size: 12, text: 'Words', font: 'Helvetica' })),
+    images,
+  });
+  assert.match(noLayoutReason(page(0, []), 3), /^Page 3 is blank/);
+  // Covering the page (>= 85% of it) with no words: a scan.
+  assert.match(noLayoutReason(page(0, [{ x: 0, y: 0, w: W, h: H }]), 3), /^Page 3 of that PDF is a scanned picture/);
+  assert.match(noLayoutReason(page(0, [{ x: 20, y: 20, w: W - 40, h: H - 40 }]), 3), /scanned picture/);
+  // One small picture and nothing else is sparse, not a scan.
+  assert.match(noLayoutReason(page(0, [{ x: 60, y: 60, w: 200, h: 150 }]), 3), /^There is not enough on page 3/);
+  // A scan WITH a text layer (OCR'd) is not described as having none.
+  assert.match(noLayoutReason(page(1, [{ x: 0, y: 0, w: W, h: H }]), 3), /^There is not enough on page 3/);
 });

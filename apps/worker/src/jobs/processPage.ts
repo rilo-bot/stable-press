@@ -20,6 +20,7 @@ import type { TextRole } from '../../../server/src/lib/magazineV2/model.js';
 import { rasterizePage, type PageRaster, type openPdf } from '../lib/pdf.js';
 import { toStoredJpeg, toStoredImage, toVisionJpeg, eraseTextRegions, cropRegion, applyAlphaMask } from '../lib/image.js';
 import { classifyPage, type GraphicKind, type ClassifiedGraphic } from '../lib/ai.js';
+import { backgroundKey, pageNotice, revBump, type CopiedFrom, type PageNotice } from './pageWrite.js';
 
 const GRAPHIC_LABEL: Record<GraphicKind, string> = { icon: 'Icon', qr: 'QR code', logo: 'Logo' };
 const MIN_GRAPHIC_PX = 8; // below this, a "graphic" crop is unusable noise
@@ -43,6 +44,31 @@ export interface ProcessedPageResult {
   pxWidth: number;
   pxHeight: number;
   backgroundUrl: string;
+  /** The page's background URL before this write ('' when it had none), so a
+   *  caller can tell whether the magazine's cover was derived from it. */
+  previousBackgroundUrl: string;
+  /** Why the page has no editable words, if it has none. See pageWrite.ts. */
+  notice: PageNotice;
+}
+
+/**
+ * Where the page being written stands, beyond the source page `index`.
+ *
+ * `index` is the page of the OPENED PDF to extract. It is not the magazine page:
+ * a copy takes page 1 of another document onto page 6, and a retry runs after
+ * pages may have been inserted. Mixing the two up is what made a copy overwrite
+ * the cover's background, so the target is named separately:
+ *
+ *   targetIndex  the magazine page's own index (media ranking uses it). Defaults
+ *                to `index`, which is right only for a fresh import.
+ *   copiedFrom   set by "copy this page"; recorded so a retry re-runs the copy
+ *                rather than re-extracting the magazine's own source file.
+ */
+export interface PageWriteContext {
+  issueId: string;
+  pageId: string;
+  targetIndex?: number;
+  copiedFrom?: CopiedFrom;
 }
 
 /** Rasterize, extract, (optionally) classify, and persist ONE page. Never
@@ -50,7 +76,7 @@ export interface ProcessedPageResult {
 export async function processSinglePage(
   doc: ReturnType<typeof openPdf>,
   index: number,
-  ctx: { issueId: string; pageId: string },
+  ctx: PageWriteContext,
 ): Promise<ProcessedPageResult | null> {
   const now = () => new Date().toISOString();
   try {
@@ -59,22 +85,40 @@ export async function processSinglePage(
     // background — erase MuPDF's own rendered glyphs first, or the original and
     // reconstructed text both show at once (doubled/garbled).
     const cleanBackgroundPng = await eraseTextRegions(raster.backgroundPng, raster.textBlocks);
-    const backgroundUrl = await uploadBackground(cleanBackgroundPng, ctx.issueId, index);
-    const rawElements = await buildRawElements(raster, ctx.issueId, index);
+    const backgroundUrl = await uploadBackground(cleanBackgroundPng, ctx.issueId, ctx.pageId);
+    const rawElements = await buildRawElements(raster, ctx.issueId, index, ctx.targetIndex ?? index);
     // The single write pipeline: validate → sanitize → refit (refit is a no-op
     // for extracted text, which carries no maxFontSize, so measured sizes stay).
     const elements = normalizeElements(rawElements, { width: raster.pxWidth, height: raster.pxHeight });
+    const notice = pageNotice({ textBlockCount: raster.textBlocks.length, fullPageImage: raster.fullPageImage });
+    if (notice) {
+      console.log(`[worker] page ${index} of issue ${ctx.issueId} has no text layer (${notice}) — copied as a picture.`);
+    }
 
-    await db.collection(COL.pages).updateOne(ctx.pageId, {
+    const previous = await writeReplacedPage(ctx.pageId, {
       width: raster.pxWidth,
       height: raster.pxHeight,
       background: { type: 'image', value: backgroundUrl },
       elements,
       status: 'extracted',
       error: '',
+      // Rewritten on every extraction so a re-copy of a text page clears the
+      // notice an earlier scan left behind.
+      notice,
+      // Provenance, so a retry knows what to re-run (see sourceIndexOf /
+      // copiedFromOf). A copy is no longer the magazine's own source page.
+      ...(ctx.copiedFrom
+        ? { copiedFrom: ctx.copiedFrom, sourceIndex: null }
+        : { sourceIndex: index, copiedFrom: null }),
       updatedAt: now(),
     });
-    return { pxWidth: raster.pxWidth, pxHeight: raster.pxHeight, backgroundUrl };
+    return {
+      pxWidth: raster.pxWidth,
+      pxHeight: raster.pxHeight,
+      backgroundUrl,
+      previousBackgroundUrl: previous,
+      notice,
+    };
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Page processing failed';
     console.error(`[worker] page ${index} of issue ${ctx.issueId} failed:`, message);
@@ -83,18 +127,66 @@ export async function processSinglePage(
   }
 }
 
-async function uploadBackground(png: Buffer, issueId: string, index: number): Promise<string> {
+/** How many times the rev compare-and-set is retried before writing regardless. */
+const REV_CAS_ATTEMPTS = 3;
+
+/**
+ * Replace a page wholesale AND move its rev, returning its previous background URL.
+ *
+ * The rev is the point. The editor guards every write with the rev it loaded; a
+ * rebuild that swaps every element but leaves the rev alone lets a stale canvas
+ * keep "succeeding" — the agent's patches land on the new elements while the
+ * canvas maps them onto old ids it still shows, and manual edits 404. With the rev
+ * moved, the stale canvas gets the 409 it already knows how to recover from (it
+ * adopts the fresh page), and The Stable Hand's rev check sees the copy land.
+ *
+ * Compare-and-set so a concurrent edit is never silently undone by OUR rev
+ * arithmetic. On contention it re-reads and tries again; the copy still wins in
+ * the end, because replacing the page is exactly what was asked for — what must
+ * not happen is the editor's next write passing against a rev that no longer
+ * describes the page.
+ */
+async function writeReplacedPage(pageId: string, fields: Record<string, unknown>): Promise<string> {
+  const pages = db.collection(COL.pages);
+  const bgOf = (p: Record<string, unknown> | null): string => {
+    const bg = p?.background as { type?: unknown; value?: unknown } | undefined;
+    return bg?.type === 'image' && typeof bg.value === 'string' ? bg.value : '';
+  };
+  for (let attempt = 0; attempt < REV_CAS_ATTEMPTS; attempt++) {
+    const cur = (await pages.findById(pageId)) as Record<string, unknown> | null;
+    // Deleted while the job ran: nothing to write onto (the plain updateOne this
+    // replaced was a no-op on a deleted page too).
+    if (!cur) return '';
+    const { condition, rev } = revBump(cur.rev);
+    if (await pages.updateOneIf(pageId, condition, { ...fields, rev })) return bgOf(cur);
+  }
+  const cur = (await pages.findById(pageId)) as Record<string, unknown> | null;
+  if (!cur) return '';
+  console.warn(`[worker] page ${pageId} kept changing during the rebuild — writing it with a fresh rev regardless.`);
+  // One past whatever is there, so even a write that lands between this read and
+  // the update leaves the editor's rev behind the page's.
+  await pages.updateOne(pageId, { ...fields, rev: revBump(cur.rev).rev + 1 });
+  return bgOf(cur);
+}
+
+async function uploadBackground(png: Buffer, issueId: string, pageId: string): Promise<string> {
   const jpeg = await toStoredJpeg(png, { quality: 82 });
   // Images live under `public/` so the bucket's public-read rule serves them
   // directly (S3_PUBLIC_BASE_URL). Source docs stay OUTSIDE `public/` (private).
-  const key = `public/magazinesV2/${issueId}/pages/${index}/background.jpg`;
+  //
+  // A NEW key for every write, keyed by the target page — never by the source page
+  // number, which is what let one page's copy overwrite another page's (often the
+  // cover's) background, and the published edition's with it. See backgroundKey.
+  const key = backgroundKey({ prefix: storage.PUBLIC_PREFIX, issueId, pageId });
   await storage.uploadObject({ key, contentType: 'image/jpeg', body: jpeg });
   return storage.publicUrl(key);
 }
 
 async function insertMedia(opts: {
   issueId: string;
-  index: number;
+  /** The MAGAZINE page the asset lands on (rankMediaForPage ranks by it), not the
+   *  source PDF's page number. */
+  pageIndex: number;
   key: string;
   url: string;
   contentType: string;
@@ -105,7 +197,7 @@ async function insertMedia(opts: {
   const now = new Date().toISOString();
   return db.collection(COL.media).insertOne({
     magazineId: opts.issueId,
-    pageIndex: opts.index,
+    pageIndex: opts.pageIndex,
     key: opts.key,
     url: opts.url,
     contentType: opts.contentType,
@@ -118,7 +210,9 @@ async function insertMedia(opts: {
   });
 }
 
-async function buildRawElements(raster: PageRaster, issueId: string, index: number): Promise<unknown[]> {
+/** `index` is the source PDF page (log lines, key hints); `pageIndex` is the
+ *  magazine page the extracted media is recorded against. */
+async function buildRawElements(raster: PageRaster, issueId: string, index: number, pageIndex: number): Promise<unknown[]> {
   const elements: unknown[] = [];
 
   // Text: layout/typography ALWAYS from MuPDF (pixel-exact). The vision model,
@@ -183,7 +277,7 @@ async function buildRawElements(raster: PageRaster, issueId: string, index: numb
       const key = `public/magazinesV2/${issueId}/${crypto.randomUUID()}-p${index}-${n}.${stored.ext}`;
       await storage.uploadObject({ key, contentType: stored.contentType, body: stored.buffer });
       const url = storage.publicUrl(key);
-      const assetId = await insertMedia({ issueId, index, key, url, contentType: stored.contentType, size: stored.buffer.length, alt: '', kind: 'photo' });
+      const assetId = await insertMedia({ issueId, pageIndex, key, url, contentType: stored.contentType, size: stored.buffer.length, alt: '', kind: 'photo' });
       elements.push({
         type: 'image',
         x: img.x,
@@ -244,7 +338,7 @@ async function buildRawElements(raster: PageRaster, issueId: string, index: numb
       await storage.uploadObject({ key, contentType: 'image/jpeg', body: jpeg });
       const url = storage.publicUrl(key);
       const label = GRAPHIC_LABEL[g.kind];
-      const assetId = await insertMedia({ issueId, index, key, url, contentType: 'image/jpeg', size: jpeg.length, alt: label, kind: 'graphic' });
+      const assetId = await insertMedia({ issueId, pageIndex, key, url, contentType: 'image/jpeg', size: jpeg.length, alt: label, kind: 'graphic' });
       elements.push({
         type: 'image',
         x: boxPx.x,

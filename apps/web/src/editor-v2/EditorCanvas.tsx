@@ -16,6 +16,7 @@ import React, { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { Move, Wand2, WandSparkles } from 'lucide-react';
 import { pageTextHtml } from '@/lib/htmlInline';
 import { useEditorStore } from './store';
+import { useOperator } from '@/agent/operator/operatorStore';
 import { ShimmerText } from './BuildProgress';
 import { IssuePageCanvas } from './IssuePageCanvas';
 import { pctRect, clampRect } from './geometry';
@@ -401,7 +402,18 @@ function ActivePageLayer() {
     // top-level stacking context and paints over popovers/modals that open across the
     // canvas — making them unclickable. The page block itself stays at normal flow
     // order, safely below those popups.
-    <div style={{ width: zoomWidth }} className="relative isolate shrink-0">
+    //
+    // data-active-page marks THE open page's layer (the rail thumbnails and the
+    // other pages' previews draw the same IssuePageCanvas), so measuring code — the
+    // Inspector's fit hint — finds the one being edited. data-operator-read-first
+    // has readScreen read this page's words before the assistant transcript and
+    // the other pages, which otherwise used up its text budget first.
+    <div
+      style={{ width: zoomWidth }}
+      className="relative isolate shrink-0"
+      data-active-page={page.id}
+      data-operator-read-first={`Open page ${page.index + 1}`}
+    >
       {/* Base: the real published renderer (hide the element being edited in place) */}
       <IssuePageCanvas page={page} hideElementId={editingId ?? undefined} />
         {/* Interaction overlay (same box via inset-0). An explicit high z-index is
@@ -576,12 +588,26 @@ export function EditorCanvas() {
   // user has scrolled to — no need to click a tab first. Settle-debounced (fires
   // after scrolling stops, not mid-scroll) and suppressed while the user is typing
   // into a field/text box, so it can never yank focus out of an edit.
+  //
+  // ALSO HELD STILL WHILE THE STABLE HAND IS WORKING OR ASKING. Its page actions
+  // open the page they mean, ask the user on a confirm card, and then press a
+  // button that acts on "the open page" (Copy a page exactly, Match a layout).
+  // Scrolling to look at the page while the card was up used to move the open
+  // page to a neighbour ~120ms later, and the irreversible rebuild then landed
+  // there. While a run is working (not paused by a takeover) or a card is up, the
+  // open page stays put; one pick runs when it ends, so a scroll made meanwhile
+  // still takes effect.
   useEffect(() => {
     const content = rootRef.current;
     const scroller = content?.parentElement;
     if (!content || !scroller) return;
     let timer: number | undefined;
+    const operatorBusy = () => {
+      const op = useOperator.getState();
+      return op.status === 'working' || !!op.pendingConfirm;
+    };
     const pick = () => {
+      if (operatorBusy()) return;
       const ae = document.activeElement as HTMLElement | null;
       if (ae && (ae.isContentEditable || ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA')) return;
       const vr = scroller.getBoundingClientRect();
@@ -597,7 +623,14 @@ export function EditorCanvas() {
     };
     const onScroll = () => { window.clearTimeout(timer); timer = window.setTimeout(pick, 120); };
     scroller.addEventListener('scroll', onScroll, { passive: true });
-    return () => { scroller.removeEventListener('scroll', onScroll); window.clearTimeout(timer); };
+    // When the Operator stops working / the card closes, settle once on whatever
+    // page is in view now.
+    const unsubOperator = useOperator.subscribe((op, prev) => {
+      const busyNow = op.status === 'working' || !!op.pendingConfirm;
+      const busyBefore = prev.status === 'working' || !!prev.pendingConfirm;
+      if (busyBefore && !busyNow) { window.clearTimeout(timer); timer = window.setTimeout(pick, 120); }
+    });
+    return () => { scroller.removeEventListener('scroll', onScroll); window.clearTimeout(timer); unsubOperator(); };
   }, [openPage, pages.length]);
 
   if (!pages.length) {

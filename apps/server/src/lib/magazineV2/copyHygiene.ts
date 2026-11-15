@@ -23,8 +23,9 @@
 //   3. drop a lead-in that just repeats the page's own headline or section title.
 //
 // Applied to the copywriter's draft (generation and "add pages"), and by the per-page
-// Adjust/Fill pass to both the model's rewrites and the copy already on the page — which
-// is how an issue generated before this existed gets cleaned.
+// Adjust/Fill pass to the GENERATED copy already on the page — which is how an issue
+// generated before this existed gets cleaned. Copy taken from a PDF, or typed by a
+// person, is theirs and is never rewritten by these rules (see pageCopyEdits).
 //
 // Inline HTML is preserved: only words are removed, never a tag. Pure — no DOM, no LLM.
 // ---------------------------------------------------------------------------
@@ -189,6 +190,15 @@ export interface TextEdit {
  * of copy generated before these rules existed, and a Fill can never write them back in.
  * Furniture (running head, folio) is the page's chrome and is never touched. Only edits
  * that actually change a stored text are returned.
+ *
+ * THE HYGIENE PASS ONLY TOUCHES COPY THE GENERATOR WROTE (`source: 'ai-agent'`). The
+ * plumbing it strips is the copywriter's; on a page copied from a PDF the same shapes
+ * are the client's real words. A numbered list that continues from the previous page
+ * ("5. Entries close…", "6. …", "7. …") is not 1..n and lost every number, and a heading
+ * "Page 4 — NZTROF Awards" became "NZTROF Awards" (finding C32). Copied text, and text a
+ * person typed or edited (an edited PDF block becomes 'manual'), is left exactly as it
+ * is — the same scope Adjust's re-balance already keeps (relayoutPage.ts). The model's
+ * own rewrites of crowded or empty boxes still go through for any box.
  */
 export function pageCopyEdits(
   elements: MagazineElement[],
@@ -199,11 +209,14 @@ export function pageCopyEdits(
   const proposed = new Map<string, string>();
   for (const e of modelEdits) if (texts.some((t) => t.id === e.elementId)) proposed.set(e.elementId, e.content);
   const current = (e: MagazineElement) => proposed.get(e.id) ?? e.text!.content;
-  const headline = texts
+  // Only generated copy is judged — the numbered-run and the echo checks included, so a
+  // copied list on the same page cannot make a generated one look like a broken run.
+  const ours = texts.filter((e) => e.source === 'ai-agent');
+  const headline = ours
     .filter((e) => e.text!.role === 'headline')
     .sort((a, b) => b.text!.fontSize - a.text!.fontSize)[0];
   const cleaned = cleanPageCopy(
-    texts.map((e) => ({ id: e.id, text: current(e), role: e.text!.role })),
+    ours.map((e) => ({ id: e.id, text: current(e), role: e.text!.role })),
     { ...ctx, ...(headline ? { headline: plain(current(headline)) } : {}) },
   );
   for (const [id, text] of cleaned) proposed.set(id, text);

@@ -38,6 +38,7 @@ import { filesFromClipboard, isPasteImage } from '@/agent/attachments/clipboard'
 import { fullTimestamp, relativeTime, shortDate } from '@/lib/relativeTime';
 import { useCan } from '@/lib/permissions';
 import { ShimmerText } from './BuildProgress';
+import { parsePageCount } from './pageCount';
 import { useMagazineHomeActions } from './operator/useMagazineHomeActions';
 
 /**
@@ -420,39 +421,9 @@ function maxBytesFor(f: File, slot: Slot): number {
   return MAX_SOURCE_BYTES;
 }
 
-const WORD_NUMS: Record<string, number> = {
-  one: 1,
-  two: 2,
-  three: 3,
-  four: 4,
-  five: 5,
-  six: 6,
-  seven: 7,
-  eight: 8,
-  nine: 9,
-  ten: 10,
-  eleven: 11,
-  twelve: 12,
-  thirteen: 13,
-  fourteen: 14,
-  fifteen: 15,
-  sixteen: 16,
-};
-
-/** The page count the user explicitly asked for, if any — the LARGEST "N page(s)"
- *  mention in the brief ("two pages of a 16 page bulletin" → 16: the issue size,
- *  not the spread within it). undefined when no usable count is named; the server
- *  only honors 3–16 and ignores anything else, matching its own clamp. */
-function parsePageCount(brief: string): number | undefined {
-  let best: number | undefined;
-  const re =
-    /\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen)[-\s]*pages?\b/gi;
-  for (let m = re.exec(brief); m; m = re.exec(brief)) {
-    const n = WORD_NUMS[m[1]!.toLowerCase()] ?? Number(m[1]);
-    if (Number.isInteger(n) && (best === undefined || n > best)) best = n;
-  }
-  return best !== undefined && best >= 3 && best <= 16 ? best : undefined;
-}
+// The page count a brief asks for (parsePageCount) lives in ./pageCount. The Stable
+// Hand's magazine.generate checks the brief it types with that SAME rule, so the
+// count on its confirm card is the count this composer actually sends.
 
 export default function MagazineV2Home() {
   const navigate = useNavigate();

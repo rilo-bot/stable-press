@@ -7,7 +7,11 @@
 
 import { authFetch, authFetchRetry } from '@/lib/api';
 import { relayUpload } from '@/lib/storageRelay';
-import type { MagazineElement, MagazinePageV2, AgentProposal } from './model';
+import type { MagazineElement, MagazinePageV2, AgentProposal, PageCheck, LookFinding, ChartSpec, ImageStyle, PageBackgroundInput } from './model';
+
+// The report and chart shapes these routes carry, re-exported so a caller of the
+// routes below needs one import. They are defined (once) in ./model.
+export type { PageCheck, PageCheckIssue, CheckKind, LookFinding, ChartSpec, ChartType, ImageStyle, PageBackgroundInput } from './model';
 
 const BASE = '/api/magazinesV2';
 
@@ -77,6 +81,18 @@ export interface PageSummary {
   /** userId — resolve the name against `IssueMeta.collaborators`. */
   submittedBy?: string | null;
   submittedAt?: string | null;
+  /** Why the page's last extraction or PDF copy failed, in words for a person. Absent
+   *  from older servers; '' when nothing failed. */
+  error?: string;
+  /**
+   * 'scanned' or 'no-text' when the page's words are part of a PICTURE: it came from a
+   * PDF page with no text layer (a scan, or type drawn as shapes), so it was copied as
+   * one image and nothing on it can be edited as text. '' otherwise; absent from older
+   * servers.
+   */
+  notice?: '' | 'scanned' | 'no-text';
+  /** The attached document page this page was copied from, when it was. */
+  copiedFrom?: { docId: string; sourcePage: number } | null;
 }
 
 export interface IssueMeta {
@@ -344,8 +360,26 @@ export const reorderPages = (id: string, from: number, to: number) =>
   authFetch(`${BASE}/issues/${id}/pages/reorder`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ from, to }) }).then(parse<{ pages: PageSummary[] }>);
 // Add on-theme AI pages (matches the issue's saved palette/fonts). Returns 202;
 // the issue goes 'processing' — poll getIssue until it settles.
-export const generatePages = (id: string, count: number, topic?: string, atIndex?: number) =>
-  authFetch(`${BASE}/issues/${id}/pages/generate`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ count, topic, atIndex }) }).then(parse<{ issue: IssueMeta }>);
+// `docIds` names documents already in the magazine (Uploads or its sources) to write
+// the new pages FROM. Without it the pages come from the magazine's theme and a short
+// topic only, which is how "add 2 pages from this PDF" produced invented content.
+export const generatePages = (id: string, count: number, topic?: string, atIndex?: number, docIds?: string[]) =>
+  authFetch(`${BASE}/issues/${id}/pages/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ count, topic, atIndex, ...(docIds && docIds.length > 0 ? { docIds } : {}) }),
+  }).then(parse<{ issue: IssueMeta; fromDocuments?: BuildSources }>);
+
+/**
+ * What a build asked to write FROM documents was actually given (present only when
+ * `docIds` were sent): `used` documents with readable text, and the names of any it
+ * had to leave out (no stored text yet — a scan, or still being read). A request whose
+ * documents were ALL unreadable is refused with a 400 instead, so `used` is ≥ 1 here.
+ */
+export interface BuildSources {
+  used: number;
+  skipped?: string[];
+}
 
 // ── Elements (rev-guarded) ──
 /** `restore` re-creates a deleted element with its ORIGINAL id and source — the
@@ -356,6 +390,22 @@ export const patchElement = (id: string, pageId: string, elementId: string, rev:
   authFetch(`${BASE}/issues/${id}/pages/${pageId}/elements/${elementId}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rev, patch }) }).then(parse<{ element: MagazineElement; rev: number }>);
 export const deleteElement = (id: string, pageId: string, elementId: string, rev: number) =>
   authFetch(`${BASE}/issues/${id}/pages/${pageId}/elements/${elementId}`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rev }) }).then(parse<{ ok: boolean; rev: number }>);
+
+/**
+ * Set a page's own background: a colour, a picture from this magazine's library, or
+ * none (the plain page). A page write like any other, so it carries the page `rev`
+ * and a 409 hands back the page as it is now. Returns the stored page.
+ *
+ * There was no way to do this at all — not by hand, not by the assistant — so a page
+ * cleared to "blank" kept its beige ground, and the assistant could only say it
+ * "can't change" the background.
+ */
+export const setPageBackground = (id: string, pageId: string, rev: number, background: PageBackgroundInput) =>
+  authFetch(`${BASE}/issues/${id}/pages/${pageId}/background`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ rev, background }),
+  }).then(parse<{ page: MagazinePageV2 }>);
 
 // Per-page Fill/Adjust — returns text edits the client auto-applies (undoable), plus an
 // optional deterministic re-balance of the page's geometry (`layout`): boxes to move,
@@ -381,7 +431,86 @@ export const formatPage = (id: string, pageId: string, mode: 'fill' | 'adjust') 
 export interface AttachedImage {
   url: string;
   name: string;
+  /**
+   * The picture's own pixel size, measured in the browser before upload.
+   *
+   * Without it the assistant picked a box shape blind and placed the picture with
+   * `cover`, so a wide chart in a squarer box lost its axis labels and legend. With
+   * the ratio it can size the box to the picture, and then nothing is cropped.
+   */
+  width?: number;
+  height?: number;
+  /**
+   * The panel's guess that this is a GRAPHIC — a chart, logo, diagram, screenshot or
+   * cut-out (it has transparent pixels, or its file name says so) — rather than a
+   * photograph. A graphic must be placed whole (`fit: 'contain'`); cropping it cuts
+   * off words and edges. A hint only: the assistant still sees the picture's name.
+   */
+  graphic?: boolean;
 }
+
+/** A document the user attached to this turn, already stored in the magazine's
+ *  Uploads. Saved with the message so later turns know which file "the PDF" is, and
+ *  can read it again by id instead of losing it after one turn. */
+export interface AttachedDoc {
+  docId: string;
+  name: string;
+}
+
+/** What one Design Helper turn returns. */
+export interface AgentTurn {
+  reply: string;
+  proposals: AgentProposal[];
+  threadId: string;
+  /**
+   * The page check after this turn's changes, when they leave NEW errors behind
+   * (text cut off, text past the edge, a hidden or empty picture…). Absent when the
+   * changes are clean, and from older servers.
+   */
+  check?: PageCheck;
+  /**
+   * True when the server replayed the `pendingProposals` this turn was sent with and
+   * the returned list is the COMBINED set (the earlier staged changes plus this
+   * turn's). Absent from servers that do not replay; the store then works it out
+   * from the list itself.
+   */
+  pendingMerged?: boolean;
+  /**
+   * What waits for Apply, counted by the server from the proposals themselves and
+   * NEVER from the model's words: `newCount` staged by this turn, `total` waiting on
+   * this page in all, and `line`, the sentence the reply already ends with ("Waiting
+   * for Apply: 6 changes — …" / "Nothing was changed."). The panel shows the line
+   * under the reply, so a reply can never claim work that was not staged. Absent
+   * from older servers; the panel then builds the same kind of line itself
+   * (pendingChanges.stagedLine).
+   */
+  staged?: { newCount: number; total: number; line: string };
+  /**
+   * Earlier waiting changes the server could not keep when it replayed them (their
+   * element is gone, or now locked), each with the reason in words. Present only
+   * when there are any; the reply says so too.
+   */
+  pendingDropped?: { id: string; summary: string; reason: string }[];
+  /**
+   * @deprecated An earlier name for `staged.line`, never sent by the server that
+   * shipped; still read as a fallback so nothing breaks if a build sends it.
+   */
+  stagedLine?: string;
+}
+
+/** Extras one turn can carry beyond the message itself. */
+export interface ChatTurnExtras {
+  /**
+   * Changes staged by earlier turns on this page and not applied yet. The server
+   * replays them onto its working copy, so the new turn builds ON them instead of
+   * starting from the stored page — before this, asking a second thing silently
+   * threw the first staged change away.
+   */
+  pendingProposals?: AgentProposal[];
+  /** Documents attached this turn (see AttachedDoc). */
+  attachedDocs?: AttachedDoc[];
+}
+
 /**
  * Send one turn.
  *
@@ -400,10 +529,133 @@ export const chatAgent = (
   sourceText?: string,
   attachedImages?: AttachedImage[],
   threadId?: string,
+  extras?: ChatTurnExtras,
 ) =>
-  authFetch(`${BASE}/issues/${id}/pages/${pageId}/agent`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages, selectedElementId, sourceText, attachedImages, threadId }) }).then(
-    parse<{ reply: string; proposals: AgentProposal[]; threadId: string }>,
-  );
+  authFetch(`${BASE}/issues/${id}/pages/${pageId}/agent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messages,
+      selectedElementId,
+      sourceText,
+      attachedImages,
+      threadId,
+      ...(extras?.pendingProposals && extras.pendingProposals.length > 0 ? { pendingProposals: extras.pendingProposals } : {}),
+      ...(extras?.attachedDocs && extras.attachedDocs.length > 0 ? { attachedDocs: extras.attachedDocs } : {}),
+    }),
+  }).then(parse<AgentTurn>);
+
+// ── Seeing the page: the vision "look" (POST …/pages/:pageId/look) ──
+/** What a look at the STORED page returns. `seen` is false when no picture could be
+ *  made (no renderer, out of time, switched off) — the measured `check` still comes
+ *  back, so the caller is never blind. */
+export interface PageLookResult {
+  seen: boolean;
+  findings: LookFinding[];
+  reason?: string;
+  check: PageCheck;
+}
+/**
+ * Render the stored page and have a vision model look at it.
+ *
+ * `request` is what the user asked for (so the look judges against it); `focus`
+ * narrows it to one area ("the headline"). Rate limited server-side, and slow (a
+ * render plus a model call) — callers show progress.
+ */
+export const lookAtPage = (id: string, pageId: string, body: { request?: string; focus?: string } = {}) =>
+  authFetch(`${BASE}/issues/${id}/pages/${pageId}/look`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then(parse<PageLookResult>);
+
+// ── Charts drawn from numbers (POST …/pages/:pageId/chart) ──
+export interface ChartResult {
+  asset: { id: string; url: string; alt: string };
+  /**
+   * The image element to place — NOT saved. The caller adds it through the store's
+   * addElement so it is one undoable, rev-guarded step like any other add (or patches
+   * `replaceElementId` with it when replacing).
+   */
+  element: Partial<MagazineElement>;
+  /** Every number as drawn ("2021 = 12, 2022 = 15…"), to confirm against what the user gave. */
+  dataEcho: string;
+  /** The chart as the server stored it (validated, trimmed) — what an edit starts from. */
+  chart?: ChartSpec;
+  /**
+   * Set when the chart takes an EXISTING element's place: the one the caller named, the
+   * chart being edited, or an empty picture slot the server chose by itself. The caller
+   * must not leave that element under the new chart.
+   */
+  replaceElementId?: string;
+  /**
+   * Present when the replaced element is a picture: patch it with this (same id, so
+   * whatever names it still finds it). Without `patch`, the replaced element is not a
+   * picture — add `element` and delete `replaceElementId`.
+   */
+  patch?: Partial<MagazineElement>;
+}
+/**
+ * Draw a chart from exact numbers and store it as a picture.
+ *
+ * `box` is where it should go, in page px; without it the server finds an empty
+ * picture slot or the largest free area. `replaceElementId` takes the place of an
+ * existing element. `editElementId` + `changes` instead redraws a chart already on
+ * the page from the numbers the server stored with it (changes as in the chart edit:
+ * any field, or `setValues` for single numbers) — no one has to re-type the data. A
+ * 400 means the numbers did not make a chart (its message says which part to fix); a
+ * 409 with reason 'no-space' means name an element or give a box; a 503 means the
+ * server cannot draw right now.
+ */
+export const createChart = (
+  id: string,
+  pageId: string,
+  body:
+    | { chart: ChartSpec; box?: { x: number; y: number; w: number; h: number }; replaceElementId?: string }
+    | { editElementId: string; changes: Record<string, unknown> },
+) =>
+  authFetch(`${BASE}/issues/${id}/pages/${pageId}/chart`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then(parse<ChartResult>);
+
+// ── Find and replace across the magazine (POST …/replace-text) ──
+export interface ReplaceTextResult {
+  /** Per page: how many matches (dry run) or replacements. Only pages the caller may
+   *  edit; `skippedLocked` counts matches in locked elements, left alone;
+   *  `skippedTooLong` counts matches left alone because the longer text would push
+   *  that box past the stored-HTML limit (writing it would cut the end of the copy). */
+  pages: { pageId: string; pageNumber: number; count: number; skippedLocked?: number; skippedTooLong?: number }[];
+  total: number;
+  /** False on a dry run, or when nothing matched. */
+  applied: boolean;
+  /** Applied run: each page written, with its new rev and the elements that changed. */
+  written?: { pageId: string; rev: number; elementIds: string[] }[];
+  /** Matches on pages that cannot be edited right now — counted, not changed. The
+   *  reason is 'page-submitted' | 'page-approved' | 'page-rebuilding'; the last can
+   *  come from the first read OR from the write retry (the page started rebuilding
+   *  between the count and the write). */
+  blocked?: { pageId: string; pageNumber: number; count: number; reason: string }[];
+  /** Pages edited by someone else twice during the replace — left as they were. */
+  conflicts?: { pageId: string; pageNumber: number }[];
+}
+/**
+ * Replace a word or name in every page the caller can edit.
+ *
+ * Run it with `dryRun: true` first and show the counts — a magazine-wide replace
+ * touches pages the user is not looking at, so they must see what it will do. Match
+ * case defaults to on (server-side), whole word to off.
+ */
+export const replaceText = (
+  id: string,
+  body: { find: string; replace: string; matchCase?: boolean; wholeWord?: boolean; dryRun?: boolean },
+) =>
+  authFetch(`${BASE}/issues/${id}/replace-text`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then(parse<ReplaceTextResult>);
 
 // ── Chat threads ──
 // One conversation per thread, listed newest-activity-first. A contributor sees
@@ -428,7 +680,8 @@ export interface ChatMsgDto {
   role: 'user' | 'assistant';
   content: string;
   pageIndex: number | null;
-  attachments?: { name: string; isImage: boolean; url?: string }[];
+  /** `docId` on a document chip: the stored upload, so it can be read again later. */
+  attachments?: { name: string; isImage: boolean; url?: string; docId?: string }[];
   createdAt: string;
 }
 export const listThreads = (id: string) =>
@@ -460,6 +713,22 @@ export interface MediaAsset {
   pageIndex: number | null;
   contentType: string;
   size: number;
+  /** Where it came from ('upload', 'stock', 'ai-image', 'chart', 'extracted'…), when
+   *  the server says. */
+  source?: string;
+  /** Where it came from in words ("from “Results.pdf”, page 2", "a chart drawn from
+   *  data"), when the server can say. */
+  origin?: string;
+  /** Pixel size, when it was recorded (newer uploads, generated pictures, charts). */
+  width?: number;
+  height?: number;
+  /** A picture taken out of an attached PDF: which document, and its 1-based page. */
+  docId?: string;
+  docName?: string;
+  docPage?: number;
+  /** A chart drawn from data (source 'chart'): the numbers it was drawn from, so it
+   *  can be redrawn with one value changed in a later session. */
+  chart?: ChartSpec;
 }
 
 /** 1) Create an 'uploading' issue and get a presigned S3 PUT for its source PDF. */
@@ -572,8 +841,18 @@ export const listMedia = (id: string) => authFetchRetry(`${BASE}/issues/${id}/me
  *
  *  `kind: 'reference'` stores a LAYOUT REFERENCE — read by the AI, and deliberately
  *  hidden from the photo picker so nobody can place someone else's page into their
- *  own magazine. */
-export async function uploadMediaImage(id: string, file: File, alt?: string, kind?: 'upload' | 'reference'): Promise<MediaAsset> {
+ *  own magazine.
+ *
+ *  `dims` is the picture's pixel size as the browser measured it. Stored with the
+ *  row so the assistant can size a box to the picture's own shape instead of
+ *  guessing one and cropping the picture to fit it. */
+export async function uploadMediaImage(
+  id: string,
+  file: File,
+  alt?: string,
+  kind?: 'upload' | 'reference',
+  dims?: { width: number; height: number },
+): Promise<MediaAsset> {
   const { uploadUrl, key } = await authFetch(`${BASE}/issues/${id}/media/upload-url`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -583,7 +862,7 @@ export async function uploadMediaImage(id: string, file: File, alt?: string, kin
   return authFetch(`${BASE}/issues/${id}/media`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, alt: alt ?? '', kind: kind ?? 'upload' }),
+    body: JSON.stringify({ key, alt: alt ?? '', kind: kind ?? 'upload', ...(dims ? { width: dims.width, height: dims.height } : {}) }),
   }).then(parse<{ asset: MediaAsset }>).then((r) => r.asset);
 }
 
@@ -629,13 +908,42 @@ export const addStockPhoto = (id: string, photoId: string, alt?: string) =>
   }).then(parse<{ asset: MediaAsset }>).then((r) => r.asset);
 
 /** Generate an image into the library. Slow (an image-model call) — callers
- *  should show progress rather than a blocked button. */
-export const generateMediaImage = (id: string, prompt: string, orientation?: 'portrait' | 'landscape' | 'square') =>
+ *  should show progress rather than a blocked button.
+ *
+ *  `style` picks the look: 'photo' (the default, a text-free photograph),
+ *  'illustration', 'graphic' or 'poster' (which may carry the words asked for).
+ *  A prompt that asks for a CHART is refused with a 400 whose body carries
+ *  `hint: 'chart'` — charts are drawn from the numbers with createChart, because an
+ *  image model invents the bars. `decorative: true` with style 'illustration' is the
+ *  one way through, for a purely decorative picture with no real data in it.
+ *
+ *  `aspectRatio` ("4:5", "16:9") is the exact frame of the box the picture is for
+ *  (imageFrame.boxAspectRatio); the server snaps it to the nearest ratio the model
+ *  supports, so the picture comes back in the box's own shape instead of a generic
+ *  landscape that gets cropped. Failures
+ *  carry `reason` on the ApiError body ('refused' | 'no-credit' | 'rate-limited' |
+ *  'timeout' | 'unavailable' | 'failed') with a message written for the person. */
+export const generateMediaImage = (
+  id: string,
+  prompt: string,
+  orientation?: 'portrait' | 'landscape' | 'square',
+  opts?: { style?: ImageStyle; decorative?: boolean; aspectRatio?: string },
+) =>
   authFetch(`${BASE}/issues/${id}/media/generate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt, ...(orientation ? { orientation } : {}) }),
+    body: JSON.stringify({
+      prompt,
+      ...(orientation ? { orientation } : {}),
+      ...(opts?.style ? { style: opts.style } : {}),
+      ...(opts?.decorative ? { decorative: true } : {}),
+      ...(opts?.aspectRatio ? { aspectRatio: opts.aspectRatio } : {}),
+    }),
   }).then(parse<{ asset: MediaAsset }>).then((r) => r.asset);
+
+/** True when a generate call was refused because the prompt asked for a chart (see
+ *  generateMediaImage) — the caller should offer the chart tool instead. */
+export const isChartRefusal = (e: unknown): boolean => e instanceof ApiError && e.status === 400 && e.body?.hint === 'chart';
 
 // ── Reference layouts: "take this layout" ──
 // Mirrors apps/server/src/lib/magazineV2/layoutReading.ts. Boxes are FRACTIONS of
@@ -750,6 +1058,16 @@ export interface MagazineUpload {
   size: number;
   hasText: boolean;
   createdAt?: string;
+  /** The source document registered over the same stored file (a PDF attached in the
+   *  Design Helper is read page by page through one), when the server says so — the
+   *  PDF pickers list the two as one file. */
+  sourceDocId?: string;
+  /** Can pages be written from it: its own browser text OR its finished page-by-page
+   *  read (a SCANNED PDF attached in chat has no browser text but is read through its
+   *  linked source). Absent from older servers — fall back to `hasText`. */
+  readable?: boolean;
+  /** True while that page-by-page read is still running. */
+  reading?: true;
 }
 
 /**
@@ -769,7 +1087,11 @@ export const copyDocumentPage = (id: string, pageId: string, body: { docId: stri
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  }).then(parse<{ ok: true; from: { name: string; sourcePage: number; pageCount: number } }>);
+  }).then(
+    // `rev`: the page's rev while the copy is pending (the server moves it when it marks
+    // the page, and the worker moves it again when the copy lands). Absent from older servers.
+    parse<{ ok: true; from: { name: string; sourcePage: number; pageCount: number }; rev?: number }>,
+  );
 
 /** The magazine's uploaded documents (PDF/Word/text), newest first. */
 export const listUploads = (id: string) =>
@@ -782,7 +1104,7 @@ export async function uploadMediaDoc(
   id: string,
   file: File,
   extra?: { digest?: string; sourceText?: string },
-): Promise<MagazineUpload> {
+): Promise<MagazineUpload & { extractingPictures?: boolean }> {
   const { uploadUrl, key } = await authFetch(`${BASE}/issues/${id}/uploads/upload-url`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -793,7 +1115,11 @@ export async function uploadMediaDoc(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ key, originalName: file.name, digest: extra?.digest ?? '', sourceText: extra?.sourceText ?? '' }),
-  }).then(parse<{ upload: MagazineUpload }>).then((r) => r.upload);
+  })
+    .then(parse<{ upload: MagazineUpload; extractingPictures?: boolean }>)
+    // `extractingPictures`: a PDF's own pictures are being taken out in the background
+    // and will land in the media library (source 'extracted') in a minute or so.
+    .then((r) => (r.extractingPictures ? { ...r.upload, extractingPictures: true } : r.upload));
 }
 
 /** Fetch one uploaded document's stored text (for preview / fill-from-this). */
