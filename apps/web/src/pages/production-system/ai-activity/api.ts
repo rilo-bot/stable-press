@@ -204,6 +204,85 @@ export function useSurfaceDetail(surface: string, scope: Scope, days: string, en
   return { data, sessions, nextBefore, state, loadMore, loadingMore };
 }
 
+// ── Magazine Builder: per magazine ──────────────────────────────────────────
+
+export interface MagazineUsage extends UsageSums {
+  /** The magazine's id, or 'none' for calls tied to no magazine. */
+  magazineId: string;
+  /** '' when the magazine no longer exists. */
+  title: string;
+  firstUsedAt: string | null;
+  sessions: number;
+}
+
+/** GET /api/ai-activity/surfaces/magazine-builder/magazines — spend per magazine. */
+export function useMagazineUsage(scope: Scope, days: string, enabled = true) {
+  const [magazines, setMagazines] = useState<MagazineUsage[]>([]);
+  const [truncated, setTruncated] = useState(false);
+  const [state, setState] = useState<LoadState>('loading');
+
+  useEffect(() => {
+    if (!enabled) return;
+    let active = true;
+    setState('loading');
+    getJson<{ magazines: MagazineUsage[]; truncated: boolean }>(`/api/ai-activity/surfaces/magazine-builder/magazines?scope=${scope}&days=${days}`)
+      .then((d) => {
+        if (!active) return;
+        setMagazines(d.magazines);
+        setTruncated(d.truncated);
+        setState('ready');
+      })
+      .catch((err) => active && setState(failState(scope)(err)));
+    return () => {
+      active = false;
+    };
+  }, [scope, days, enabled]);
+
+  return { magazines, truncated, state };
+}
+
+/** GET …/magazines/:magazineId/sessions — one magazine's sessions, newest first. */
+export function useMagazineSessions(magazineId: string | null, scope: Scope, days: string) {
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [nextBefore, setNextBefore] = useState<string | null>(null);
+  const [state, setState] = useState<LoadState>('loading');
+  const [loadingMore, setLoadingMore] = useState(false);
+  const generation = useRef(0);
+  const base = magazineId ? `/api/ai-activity/surfaces/magazine-builder/magazines/${encodeURIComponent(magazineId)}/sessions` : '';
+
+  useEffect(() => {
+    const gen = ++generation.current;
+    if (!base) return;
+    setState('loading');
+    setSessions([]);
+    getJson<{ sessions: SessionSummary[]; nextBefore: string | null }>(`${base}?scope=${scope}&days=${days}&limit=50`)
+      .then((d) => {
+        if (gen !== generation.current) return;
+        setSessions(d.sessions);
+        setNextBefore(d.nextBefore);
+        setState('ready');
+      })
+      .catch((err) => gen === generation.current && setState(failState(scope)(err)));
+  }, [base, scope, days]);
+
+  const loadMore = useCallback(() => {
+    if (!base || !nextBefore || loadingMore) return;
+    const gen = generation.current;
+    setLoadingMore(true);
+    const qs = new URLSearchParams({ scope, days, limit: '50', before: nextBefore });
+    getJson<{ sessions: SessionSummary[]; nextBefore: string | null }>(`${base}?${qs.toString()}`)
+      .then((page) => {
+        if (gen !== generation.current) return;
+        setSessions((cur) => [...cur, ...page.sessions]);
+        setNextBefore(page.nextBefore);
+      })
+      .catch(() => undefined)
+      .finally(() => setLoadingMore(false));
+  }, [base, scope, days, nextBefore, loadingMore]);
+
+  return { sessions, nextBefore, state, loadMore, loadingMore };
+}
+
 /** GET /api/ai-activity/sessions/:sessionId — every call of one session. */
 export function useSession(summary: SessionSummary | null) {
   const [session, setSession] = useState<SessionDetail | null>(null);

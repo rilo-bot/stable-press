@@ -49,6 +49,7 @@ import commentsRouter from './comments/index.js'
 import analyticsRouter from './analytics/index.js'
 // ── Infrastructure ──
 import uploadsRouter from './uploads/index.js'
+import sortdRouter from './sortd/index.js'
 // ── AI ──
 import agentRouter from './agent/index.js'
 import agentEditorRouter from './agentEditor/index.js'
@@ -206,5 +207,8 @@ router.use('/ai-activity', aiActivityRouter)
 
 // ── Infrastructure ──
 router.use('/uploads', uploadsRouter)           // presigned S3 PUT URLs (auth inside)
+// Sortd support widget: embed sessions for the signed-in user (auth inside;
+// revoke is signature-gated instead, see the router). The API key stays server-side.
+router.use('/sortd', sortdRouter)
 
 export default router

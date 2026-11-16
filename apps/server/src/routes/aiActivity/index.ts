@@ -9,6 +9,8 @@
 //                                                      and the first page of sessions
 //   GET /surfaces/:surface/sessions?scope&days&before&limit   older sessions (paging)
 //   GET /sessions/:sessionId?userId=&surface=          every call of one session
+//   GET /surfaces/magazine-builder/magazines?scope&days           spend per magazine
+//   GET /surfaces/magazine-builder/magazines/:id/sessions?scope&days&before   its sessions
 //
 // Same gate as Stable Hand Activity (routes/agentOperator): staff and invited
 // team members see their OWN usage; everyone's needs `analytics.view` — AI
@@ -22,8 +24,8 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import { attachAccount } from '../../lib/auth.js'
 import { isAdmin } from '../../lib/rbac.js'
 import { accountCan, type AccountUser } from '../../lib/effectiveAccess.js'
-import { sessionDetail, surfaceDetail, surfaceSessions, surfacesReport } from '../../lib/agent/aiActivity.js'
-import { clampInt, isSessionId, isUserId, isoTimestamp, parseSurface } from '../../lib/agent/aiActivityQuery.js'
+import { magazineSessions, sessionDetail, surfaceDetail, surfaceMagazines, surfaceSessions, surfacesReport } from '../../lib/agent/aiActivity.js'
+import { clampInt, isMagazineKey, isSessionId, isUserId, isoTimestamp, parseSurface } from '../../lib/agent/aiActivityQuery.js'
 
 const router = Router()
 
@@ -109,6 +111,45 @@ router.get(
       before: isoTimestamp(req.query.before),
     })
     res.json({ scope, canSeeAll: canSeeAll(req.account), windowDays: days, surface, ...page })
+  }),
+)
+
+// Magazine Builder, per magazine: the list replaces its session list on the page,
+// and a magazine opens to its own sessions. Same scope rule as everything above.
+router.get(
+  '/surfaces/magazine-builder/magazines',
+  read(async (req, res) => {
+    const scope = scopeOf(req, res)
+    if (!scope) return
+    const days = daysOf(req)
+    const out = await surfaceMagazines({
+      userId: scope === 'mine' ? req.account!.id : undefined,
+      days,
+      limit: clampInt(req.query.limit, 100, 1, 200),
+    })
+    res.json({ scope, canSeeAll: canSeeAll(req.account), windowDays: days, ...out })
+  }),
+)
+
+router.get(
+  '/surfaces/magazine-builder/magazines/:magazineId/sessions',
+  read(async (req, res) => {
+    const { magazineId } = req.params
+    if (!isMagazineKey(magazineId)) {
+      res.status(400).json({ error: 'That is not a magazine id.' })
+      return
+    }
+    const scope = scopeOf(req, res)
+    if (!scope) return
+    const days = daysOf(req)
+    const page = await magazineSessions({
+      userId: scope === 'mine' ? req.account!.id : undefined,
+      magazineId,
+      days,
+      limit: clampInt(req.query.limit, 50, 1, 100),
+      before: isoTimestamp(req.query.before),
+    })
+    res.json({ scope, windowDays: days, magazineId, ...page })
   }),
 )
 

@@ -7,6 +7,7 @@ import { Toaster } from 'sonner';
 
 import { NavBar } from '@/components/NavBar';
 import { AgentWidget } from '@/components/AgentWidget';
+import { SortdSupport } from '@/components/SortdSupport';
 import { OperatorPresence } from '@/agent/operator/presence/OperatorPresence';
 import { PublicSection } from '@/components/PublicSection';
 import { RequireAuth, RequireAdmin, RequirePermission } from '@/rbac/guards';
@@ -452,6 +453,10 @@ export default function App() {
           and OperatorPresence draws what it is doing (gold frame, pill, cursor). */}
       <AgentWidget />
       <OperatorPresence />
+
+      {/* Sortd help desk (support chat + tickets) for signed-in accounts — a
+          bubble bottom-left, opposite the Stable Hand. Renders nothing itself. */}
+      <SortdSupport />
 
       <DockAwareToaster />
     </>

@@ -44,11 +44,23 @@ function authHeaders(): HeadersInit {
     : { 'content-type': 'application/json' };
 }
 
+/**
+ * The last brief each reader saw this session. Coming back to the Overview shows it
+ * at once instead of a loading state; the request that follows is cheap, because
+ * the server reuses the brief while the numbers are unchanged
+ * (server lib/newsroomBriefCache.ts) and writes a new one only when they changed.
+ */
+const lastBrief = new Map<string, string>();
+
+function readerId(): string {
+  return useAuthStore.getState().currentUser?.id ?? '';
+}
+
 export function useOverviewSummary() {
   const [summary, setSummary] = useState<OverviewSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
-  const [brief, setBrief] = useState<string | null>(null);
+  const [brief, setBrief] = useState<string | null>(() => lastBrief.get(readerId()) ?? null);
   const [briefLoading, setBriefLoading] = useState(false);
 
   const reload = useCallback(async () => {
@@ -66,18 +78,27 @@ export function useOverviewSummary() {
     }
   }, []);
 
-  const reloadBrief = useCallback(async () => {
-    setBriefLoading(true);
+  /** `refresh` (the Regenerate button) asks for a new brief even when the numbers
+   *  have not changed; otherwise the server returns the one it already wrote. */
+  const reloadBrief = useCallback(async (refresh = false) => {
+    const who = readerId();
+    const shown = lastBrief.get(who);
+    // A brief already on screen stays put while it is checked; only a first load
+    // (or an explicit Regenerate) shows the loading state.
+    if (refresh || !shown) setBriefLoading(true);
     try {
       const res = await fetch(apiUrl('/api/newsroom/brief'), {
         method: 'POST',
         headers: authHeaders(),
-        body: '{}',
+        body: JSON.stringify(refresh ? { refresh: true } : {}),
       });
       const data = await res.json();
-      setBrief(typeof data.brief === 'string' ? data.brief : null);
+      const text = typeof data.brief === 'string' ? data.brief : null;
+      if (text) lastBrief.set(who, text);
+      else lastBrief.delete(who);
+      setBrief(text);
     } catch {
-      setBrief(null);
+      setBrief(shown ?? null);
     } finally {
       setBriefLoading(false);
     }

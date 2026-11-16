@@ -352,3 +352,45 @@ test('recordAiUsage: a caller-supplied estimate is labelled estimate, not provid
   assert.equal(records[0]!.feature, 'read-aloud')
   assert.equal(records[0]!.userId, 'u1')
 })
+
+// ── Magazine Builder: spend per magazine ────────────────────────────────────
+import {
+  isMagazineKey,
+  magazineMatch,
+  magazinesPipeline,
+  shapeMagazine,
+} from '../src/lib/agent/aiActivityQuery.js'
+
+test('magazine spend is grouped by the magazine each call was for; calls tied to none share one row', () => {
+  const p = magazinesPipeline({ surface: 'magazine-builder' }, 101)
+  const group = (p[1] as { $group: Record<string, unknown> }).$group
+  assert.deepEqual(group._id, { $cond: [{ $eq: ['$entityType', 'magazine'] }, { $ifNull: ['$entityId', ''] }, ''] })
+  assert.ok('costUsd' in group && 'inputTokens' in group && 'cachedInputTokens' in group && 'durationMs' in group)
+  assert.deepEqual(p[p.length - 2], { $sort: { lastUsedAt: -1 } })
+  assert.deepEqual(p[p.length - 1], { $limit: 101 })
+})
+
+test('a magazine row carries its title, totals and session count — and no person', () => {
+  const titles = new Map([['magazine:6af56cd5cf73c46893ebf3ca', 'The New Zealand Racing Scene']])
+  const row = shapeMagazine(
+    { _id: '6af56cd5cf73c46893ebf3ca', calls: 40, costUsd: 1.25, inputTokens: 900_000, outputTokens: 40_000, cachedInputTokens: 300_000, durationMs: 600_000, sessions: 7, lastUsedAt: '2026-11-16T10:00:00Z', firstUsedAt: '2026-11-12T08:00:00Z', userId: 'u1', userName: 'Someone' },
+    titles,
+  )
+  assert.equal(row.magazineId, '6af56cd5cf73c46893ebf3ca')
+  assert.equal(row.title, 'The New Zealand Racing Scene')
+  assert.equal(row.costUsd, 1.25)
+  assert.equal(row.sessions, 7)
+  assert.equal(row.firstUsedAt, '2026-11-12T08:00:00Z')
+  assert.ok(!('userName' in row) && !('userId' in row))
+  // calls tied to no magazine, and a magazine that no longer exists
+  assert.equal(shapeMagazine({ _id: '' }, titles).magazineId, 'none')
+  assert.equal(shapeMagazine({ _id: 'deadbeefdeadbeefdeadbeef' }, titles).title, '')
+})
+
+test('one magazine is matched by its id; "none" matches calls tied to no magazine', () => {
+  assert.deepEqual(magazineMatch('6af56cd5cf73c46893ebf3ca'), { entityType: 'magazine', entityId: '6af56cd5cf73c46893ebf3ca' })
+  assert.deepEqual(magazineMatch('none'), { $or: [{ entityType: { $ne: 'magazine' } }, { entityId: { $in: [null, ''] } }] })
+  assert.equal(isMagazineKey('6af56cd5cf73c46893ebf3ca'), true)
+  assert.equal(isMagazineKey('none'), true)
+  for (const bad of ['', '{"$ne":1}', 'a b', 'x'.repeat(65), 42, null]) assert.equal(isMagazineKey(bad), false)
+})

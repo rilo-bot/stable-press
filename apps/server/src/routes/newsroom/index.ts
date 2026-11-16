@@ -20,6 +20,10 @@ import { getCapabilities } from '../../lib/agent/capabilities.js'
 import { getAgentModel, isAgentConfigured } from '../../lib/agent/provider.js'
 import type { AccountUser } from '../../lib/identity.js'
 import { aiSurface } from '../../lib/agent/aiUsageRoute.js'
+import { BriefCache, briefFingerprint } from '../../lib/newsroomBriefCache.js'
+
+/** Each reader's last Overview brief (lib/newsroomBriefCache.ts). */
+const overviewBriefs = new BriefCache()
 
 const router = Router()
 router.use(attachAccount)
@@ -206,25 +210,35 @@ router.post('/brief', async (req, res) => {
   }
   try {
     const summary = await buildNewsroomSummary(account)
-    const { text } = await generateText({
-      model: getAgentModel(),
-      system:
-        'You are the editor-in-chief of Stable Press writing a short daily Production System brief for a colleague. ' +
-        'Open by greeting them by first name. In 2–4 warm, specific sentences, tell them what most needs their attention ' +
-        'today and the single best next action, using the real numbers provided. Refer to pages by the names they ' +
-        'actually carry: All Stories, Workflow Board, Pipeline Map, Editor Hub, Blogs, Instant Capture, Magazine Builder, ' +
-        'Podcast, Horses, People, Media Records, Racing Records, Comments. If nothing needs attention, say so cheerfully. ' +
-        'Plain prose only — no markdown, no lists, no headings.\n\n' +
-        // The summary has ALREADY been filtered to what this reader may open, so
-        // the rule the model needs is simply: nothing beyond it. Mentioning a
-        // queue that is absent would tell them it exists, which is the leak the
-        // scoping exists to prevent.
-        'THE SUMMARY IS THE WHOLE WORLD. It contains only what this colleague is allowed to see. Never invent a number, ' +
-        'never mention a screen or a queue that does not appear in it, and never imply there is more you are not showing. ' +
-        'If a section is missing or empty, that part of the newsroom is simply not theirs.',
-      prompt: `Here is today's live summary for ${summary.generatedFor.name} (roles: ${summary.generatedFor.roles.join(', ')}):\n${JSON.stringify(summary)}\n\nWrite the brief.`,
-    })
-    res.json({ brief: text.trim() })
+    // Reuse this reader's brief while the numbers it narrates are unchanged (same
+    // day, under 6 hours) — every visit to the Overview used to be a paid AI call.
+    // The Overview's refresh button sends { refresh: true } for a new one.
+    // Requests that arrive together (two tabs, a double-click) share one write.
+    const fingerprint = briefFingerprint(summary)
+    const refresh = (req.body as { refresh?: unknown } | undefined)?.refresh === true
+    const write = async () => {
+      const { text } = await generateText({
+        model: getAgentModel(),
+        system:
+          'You are the editor-in-chief of Stable Press writing a short daily Production System brief for a colleague. ' +
+          'Open by greeting them by first name. In 2–4 warm, specific sentences, tell them what most needs their attention ' +
+          'today and the single best next action, using the real numbers provided. Refer to pages by the names they ' +
+          'actually carry: All Stories, Workflow Board, Pipeline Map, Editor Hub, Blogs, Instant Capture, Magazine Builder, ' +
+          'Podcast, Horses, People, Media Records, Racing Records, Comments. If nothing needs attention, say so cheerfully. ' +
+          'Plain prose only — no markdown, no lists, no headings.\n\n' +
+          // The summary has ALREADY been filtered to what this reader may open, so
+          // the rule the model needs is simply: nothing beyond it. Mentioning a
+          // queue that is absent would tell them it exists, which is the leak the
+          // scoping exists to prevent.
+          'THE SUMMARY IS THE WHOLE WORLD. It contains only what this colleague is allowed to see. Never invent a number, ' +
+          'never mention a screen or a queue that does not appear in it, and never imply there is more you are not showing. ' +
+          'If a section is missing or empty, that part of the newsroom is simply not theirs.',
+        prompt: `Here is today's live summary for ${summary.generatedFor.name} (roles: ${summary.generatedFor.roles.join(', ')}):\n${JSON.stringify(summary)}\n\nWrite the brief.`,
+      })
+      return text
+    }
+    const { brief, cached } = await overviewBriefs.getOrWrite(account.id, fingerprint, write, refresh)
+    res.json(cached ? { brief, cached: true } : { brief: brief || null })
   } catch (err) {
     console.error('[newsroom] brief error:', err)
     res.json({ brief: null }) // dashboard falls back to the structured cards

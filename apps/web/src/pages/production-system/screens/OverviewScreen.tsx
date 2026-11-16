@@ -162,7 +162,7 @@ export default function OverviewScreen() {
         isContributor={s.isContributor}
         brief={brief}
         briefLoading={briefLoading}
-        onRefreshBrief={() => void reloadBrief()}
+        onRefreshBrief={() => void reloadBrief(true)}
         onAskAgent={() =>
           askAgent(
             'I’m on the Campaign Engine overview. Tell me what needs my attention today and offer to help with the first thing.',

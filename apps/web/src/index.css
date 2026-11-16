@@ -207,6 +207,18 @@
 #root {
   padding-right: var(--stablehand-w);
 }
+/* Sortd's support bubble (lib/sortd.ts) sits bottom-left at z-index ~2^31,
+   above everything. Below 1024px the open Stable Hand is a full-width bottom
+   sheet, so the bubble would land on its composer: it steps aside while the
+   sheet is up. visibility, not display, so Sortd's iframe (and any conversation
+   in it) stays alive underneath; !important beats embed.js's own stylesheet. */
+@media screen and (max-width: 1023.98px) {
+  :root[data-stablehand-dock='panel'] #sortd-support-root,
+  :root[data-stablehand-dock='panel'] #sortd-support-root * {
+    visibility: hidden !important;
+    pointer-events: none !important;
+  }
+}
 
 @layer utilities {
   /* Fixed layouts that must stop at The Stable Hand dock (see the block above). */

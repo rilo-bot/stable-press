@@ -12,7 +12,18 @@ import { AlertTriangle, Bot, Loader2, X } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
 import { Empty, Panel, StatTile } from '../emoji-analytics/parts';
-import { useSession, useSurfaceDetail, type BreakdownRow, type DetailResponse, type Scope, type SessionCall, type SessionSummary } from './api';
+import {
+  useMagazineSessions,
+  useMagazineUsage,
+  useSession,
+  useSurfaceDetail,
+  type BreakdownRow,
+  type DetailResponse,
+  type MagazineUsage,
+  type Scope,
+  type SessionCall,
+  type SessionSummary,
+} from './api';
 import { DailyChart, Fact, ShareBar, TableSkeleton } from './charts';
 import { TIME, cacheLine, count, duration, shortModel, tokens, usd, when } from './format';
 import { featureLabel, kindLabel, surfaceMeta } from './surfaces';
@@ -24,6 +35,7 @@ export default function SurfaceDetail({ surface, scope, days }: { surface: strin
   const detail = useSurfaceDetail(surface, scope, days);
   const [open, setOpen] = useState<SessionSummary | null>(null);
   const everyone = scope === 'all';
+  const isMagazine = surface === 'magazine-builder';
   const d = detail.data;
 
   if (detail.state === 'error') {
@@ -49,8 +61,14 @@ export default function SurfaceDetail({ surface, scope, days }: { surface: strin
         )}
       </Panel>
 
-      {/* Same order as the Stable Hand's run log: figures, daily spend, the log;
-          then what the spend was made of. */}
+      {/* Magazine Builder lists MAGAZINES with their totals (a busy magazine was
+          dozens of session rows, and its spend could not be read anywhere); a
+          magazine opens to its sessions, a session to its calls. */}
+      {isMagazine ? (
+        <MagazinesPanel scope={scope} days={days} everyone={everyone} onOpenSession={setOpen} />
+      ) : (
+      /* Same order as the Stable Hand's run log: figures, daily spend, the log;
+          then what the spend was made of. */
       <Panel
         title="Recent sessions"
         subtitle={
@@ -86,10 +104,11 @@ export default function SurfaceDetail({ surface, scope, days }: { surface: strin
           </div>
         )}
       </Panel>
+      )}
 
       <Breakdowns data={d} surface={surface} everyone={everyone} />
 
-      {open && <SessionDrawer summary={open} onClose={() => setOpen(null)} />}
+      {open && <SessionDrawer summary={open} hideWho={isMagazine} onClose={() => setOpen(null)} />}
     </div>
   );
 }
@@ -356,6 +375,246 @@ function SessionsList({
   );
 }
 
+// ── Magazine Builder: spend per magazine ────────────────────────────────────
+
+/** A magazine's name as listed — the calls tied to no magazine, and a magazine that
+ *  has since been deleted, are named for what they are. */
+function magazineName(m: MagazineUsage): string {
+  if (m.magazineId === 'none') return 'Not tied to a magazine';
+  return m.title || 'Deleted magazine';
+}
+
+/** "16 Nov", or "12 – 16 Nov" when the magazine was worked on over several days. */
+function magazineDates(m: MagazineUsage): string {
+  const last = when(m.lastUsedAt);
+  if (!m.firstUsedAt || !m.lastUsedAt) return last;
+  const sameDay = m.firstUsedAt.slice(0, 10) === m.lastUsedAt.slice(0, 10);
+  return sameDay ? last : `${when(m.firstUsedAt)} – ${last}`;
+}
+
+function MagazinesPanel({
+  scope, days, everyone, onOpenSession,
+}: {
+  scope: Scope;
+  days: string;
+  everyone: boolean;
+  onOpenSession: (s: SessionSummary) => void;
+}) {
+  const usage = useMagazineUsage(scope, days);
+  const [openMag, setOpenMag] = useState<MagazineUsage | null>(null);
+  const th = 'px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground';
+  const activate = (m: MagazineUsage) => (e: ReactKeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      setOpenMag(m);
+    }
+  };
+
+  return (
+    <Panel
+      title="Magazines"
+      subtitle={
+        everyone
+          ? 'Every magazine’s AI spend in this window, most recent first. Open one to see its sessions and what each cost.'
+          : 'Your magazines’ AI spend in this window, most recent first. Open one to see its sessions and what each cost.'
+      }
+    >
+      {usage.state === 'loading' ? (
+        <TableSkeleton />
+      ) : usage.state !== 'ready' ? (
+        <Empty>The magazines did not load. Reload the page to try again.</Empty>
+      ) : usage.magazines.length === 0 ? (
+        <div className="flex flex-col items-center gap-2 py-12 text-center">
+          <Bot size={22} className="text-muted-foreground" aria-hidden="true" />
+          <p className="text-[13px] font-semibold text-foreground">No Magazine Builder use in the last {days} days</p>
+        </div>
+      ) : (
+        <>
+          {/* Phones: one card per magazine. */}
+          <ul className="space-y-2 md:hidden">
+            {usage.magazines.map((m) => (
+              <li key={m.magazineId}>
+                <button
+                  type="button"
+                  onClick={() => setOpenMag(m)}
+                  className="w-full rounded-sm border border-border/60 bg-background p-3 text-left transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <div className="flex items-baseline justify-between gap-3">
+                    <span className="min-w-0 truncate text-[13px] font-medium text-foreground">{magazineName(m)}</span>
+                    <span className="text-[13px] font-semibold tabular-nums text-foreground">{usd(m.costUsd)}</span>
+                  </div>
+                  <p className="mt-1 text-[11.5px] text-muted-foreground">
+                    {magazineDates(m)} · {count(m.sessions, 'session')} · {tokens(m.inputTokens)} in · {tokens(m.outputTokens)} out ·{' '}
+                    {tokens(m.cachedInputTokens)} cached · {duration(m.durationMs)}
+                  </p>
+                </button>
+              </li>
+            ))}
+          </ul>
+
+          {/* Tablet and up. */}
+          <div className="-mx-5 hidden overflow-x-auto md:-mx-6 md:block">
+            <table className="w-full min-w-[760px] border-collapse text-[12.5px]">
+              <thead className="bg-muted">
+                <tr>
+                  <th className={cn(th, 'pl-5 md:pl-6')}>Magazine</th>
+                  <th className={th}>Date</th>
+                  <th className={cn(th, 'text-right')}>Sessions</th>
+                  <th className={cn(th, 'text-right')} title="Input / output / cached input tokens">Tokens in · out · cached</th>
+                  <th className={cn(th, 'text-right')}>Cost</th>
+                  <th className={cn(th, 'pr-5 text-right md:pr-6')} title="Total time the AI spent working on this magazine">AI time</th>
+                </tr>
+              </thead>
+              <tbody>
+                {usage.magazines.map((m) => (
+                  <tr
+                    key={m.magazineId}
+                    tabIndex={0}
+                    onClick={() => setOpenMag(m)}
+                    onKeyDown={activate(m)}
+                    className="cursor-pointer border-b border-border/50 transition-colors hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-none"
+                  >
+                    <td className="max-w-[340px] py-2.5 pl-5 pr-3 align-top md:pl-6">
+                      <span className="line-clamp-1 font-medium text-foreground">{magazineName(m)}</span>
+                      {m.errors > 0 && (
+                        <span className="mt-0.5 flex items-center gap-1 text-[11.5px] text-[hsl(var(--warning))]">
+                          <AlertTriangle size={11} aria-hidden="true" /> {count(m.errors, 'call')} failed
+                        </span>
+                      )}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2.5 align-top text-muted-foreground">{magazineDates(m)}</td>
+                    <td className="px-3 py-2.5 text-right align-top tabular-nums text-foreground">{m.sessions}</td>
+                    <td className="whitespace-nowrap px-3 py-2.5 text-right align-top tabular-nums text-muted-foreground">
+                      <span className="text-foreground">{tokens(m.inputTokens)}</span> · {tokens(m.outputTokens)} · {tokens(m.cachedInputTokens)}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2.5 text-right align-top font-semibold tabular-nums text-foreground">{usd(m.costUsd)}</td>
+                    <td className="whitespace-nowrap py-2.5 pl-3 pr-5 text-right align-top tabular-nums text-muted-foreground md:pr-6">
+                      {duration(m.durationMs)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {usage.truncated && (
+            <p className="mt-3 text-center text-[11.5px] text-muted-foreground">Showing the {usage.magazines.length} most recently used magazines.</p>
+          )}
+        </>
+      )}
+
+      {openMag && (
+        <MagazineDrawer
+          magazine={openMag}
+          scope={scope}
+          days={days}
+          onOpenSession={onOpenSession}
+          onClose={() => setOpenMag(null)}
+        />
+      )}
+    </Panel>
+  );
+}
+
+/** One magazine: its totals, then its sessions (newest first); a session opens to
+ *  every call (SessionDrawer, stacked on top). No names — this is about magazines. */
+function MagazineDrawer({
+  magazine: m, scope, days, onOpenSession, onClose,
+}: {
+  magazine: MagazineUsage;
+  scope: Scope;
+  days: string;
+  onOpenSession: (s: SessionSummary) => void;
+  onClose: () => void;
+}) {
+  const list = useMagazineSessions(m.magazineId, scope, days);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // A session drawer on top closes first.
+      if (e.key === 'Escape' && !document.querySelector('[aria-label="Session details"]')) onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return createPortal(
+    <div className="fixed inset-stablehand z-[60] flex justify-end">
+      <button type="button" aria-label="Close magazine details" className="absolute inset-0 bg-black/30" onClick={onClose} />
+      <aside
+        role="dialog"
+        aria-modal="true"
+        aria-label="Magazine AI spend"
+        className="relative flex h-full w-full max-w-3xl flex-col border-l border-border bg-background shadow-2xl"
+      >
+        <header className="border-b border-border bg-card px-5 py-4">
+          <div className="flex items-start gap-3">
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-[hsl(var(--brand-accent-ink))]">
+                Magazine Builder · {magazineDates(m)}
+              </p>
+              <h2 className="mt-1 font-[family-name:var(--font-display)] text-[16px] font-bold leading-snug text-foreground">
+                {magazineName(m)}
+              </h2>
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-sm p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+              aria-label="Close"
+            >
+              <X size={16} />
+            </button>
+          </div>
+          <dl className="mt-3 grid grid-cols-2 gap-3 border-t border-[hsl(var(--brand-accent))]/35 pt-3 text-[11.5px] sm:grid-cols-5">
+            <Fact label="Cost" value={usd(m.costUsd)} />
+            <Fact label="Sessions" value={String(m.sessions)} />
+            <Fact label="Tokens in" value={tokens(m.inputTokens)} />
+            <Fact label="Out · cached" value={`${tokens(m.outputTokens)} · ${tokens(m.cachedInputTokens)}`} />
+            <Fact label="AI time" value={duration(m.durationMs)} />
+          </dl>
+        </header>
+
+        <div className="flex-1 overflow-y-auto px-5 py-4">
+          {list.state === 'loading' ? (
+            <p className="flex items-center gap-2 py-8 text-[12px] text-muted-foreground">
+              <Loader2 size={13} className="animate-spin" /> Loading sessions
+            </p>
+          ) : list.state !== 'ready' ? (
+            <Empty>The sessions for this magazine did not load.</Empty>
+          ) : list.sessions.length === 0 ? (
+            <Empty>No sessions were recorded for this magazine in this window.</Empty>
+          ) : (
+            <>
+              {/* Inside one magazine, every session would be titled with its name:
+                  title each by what it did instead (the steps it took). */}
+              <SessionsList
+                sessions={list.sessions.map((s) => ({ ...s, entityTitle: '' }))}
+                surface="magazine-builder"
+                showWho={false}
+                onOpen={onOpenSession}
+              />
+              {list.nextBefore && (
+                <div className="mt-4 flex justify-center">
+                  <button
+                    type="button"
+                    onClick={list.loadMore}
+                    disabled={list.loadingMore}
+                    className="inline-flex items-center gap-2 rounded-sm border border-border px-4 py-1.5 text-xs font-semibold text-foreground hover:bg-muted disabled:opacity-60"
+                  >
+                    {list.loadingMore && <Loader2 size={12} className="animate-spin" />}
+                    Load older sessions
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </aside>
+    </div>,
+    document.body,
+  );
+}
+
 // ── Drawer ──────────────────────────────────────────────────────────────────
 
 /** A lone call (no session) is shown from its summary row — there is nothing more to fetch. */
@@ -379,7 +638,7 @@ function loneCall(s: SessionSummary): SessionCall {
   };
 }
 
-function SessionDrawer({ summary, onClose }: { summary: SessionSummary; onClose: () => void }) {
+function SessionDrawer({ summary, onClose, hideWho = false }: { summary: SessionSummary; onClose: () => void; hideWho?: boolean }) {
   const fetched = useSession(summary.sessionId ? summary : null);
   const calls = summary.sessionId ? fetched.session?.calls ?? null : [loneCall(summary)];
   const state = summary.sessionId ? fetched.state : 'ready';
@@ -408,7 +667,7 @@ function SessionDrawer({ summary, onClose }: { summary: SessionSummary; onClose:
           <div className="flex items-start gap-3">
             <div className="min-w-0 flex-1">
               <p className="text-[11px] font-semibold uppercase tracking-wide text-[hsl(var(--brand-accent-ink))]">
-                {meta.label} · {summary.userName} · {when(summary.startedAt || summary.lastUsedAt)}
+                {meta.label} · {!hideWho && summary.userName ? <>{summary.userName} · </> : null}{when(summary.startedAt || summary.lastUsedAt)}
               </p>
               <h2 className="mt-1 font-[family-name:var(--font-display)] text-[16px] font-bold leading-snug text-foreground">
                 {sessionTitle(summary, summary.surface)}

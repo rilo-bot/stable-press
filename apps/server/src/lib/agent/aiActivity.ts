@@ -17,15 +17,19 @@ import {
   SESSION_CALL_CAP,
   anonymousName,
   detailPipeline,
+  magazineMatch,
+  magazinesPipeline,
   sessionCallsPipeline,
   sessionsPipeline,
   shapeCall,
   shapeDetail,
+  shapeMagazine,
   shapeSession,
   shapeSurfaces,
   surfacesPipeline,
   usageMatch,
   windowStart,
+  type MagazineUsage,
   type SessionCall,
   type SessionSummary,
   type SurfaceDetail,
@@ -136,6 +140,38 @@ export async function surfaceDetail(
   const byUser = ((facets[0] as { byUser?: { _id?: unknown }[] } | undefined)?.byUser ?? []).map((r) => str(r._id))
   const names = await namesFor(byUser)
   return { surface: q.surface, ...shapeDetail(facets[0], from, today(), names, anonymousName(q.surface)), ...page }
+}
+
+// ── Magazine Builder: per magazine ──────────────────────────────────────────
+
+/** Magazine Builder spend per magazine in the window, most recently used first. */
+export async function surfaceMagazines(q: { userId?: string; days: number; limit: number }): Promise<{ magazines: MagazineUsage[]; truncated: boolean }> {
+  const match = usageMatch({ userId: q.userId, surface: 'magazine-builder', from: windowStart(q.days) })
+  const rows = await db.collection(AI_USAGE).aggregate(magazinesPipeline(match, q.limit + 1))
+  const titles = await titlesFor(rows.map((r) => ({ entityType: 'magazine', entityId: str(r._id) })))
+  return { magazines: rows.slice(0, q.limit).map((r) => shapeMagazine(r, titles)), truncated: rows.length > q.limit }
+}
+
+/**
+ * One magazine's sessions, newest first, with their cost. No names: the page lists
+ * magazines, not people. `magazineId` 'none' = the calls tied to no magazine.
+ */
+export async function magazineSessions(q: {
+  userId?: string
+  magazineId: string
+  days: number
+  limit: number
+  before?: string | null
+}): Promise<SessionsPage> {
+  const match = {
+    ...usageMatch({ userId: q.userId, surface: 'magazine-builder', from: windowStart(q.days) }),
+    ...magazineMatch(q.magazineId),
+  }
+  const rows = await db.collection(AI_USAGE).aggregate(sessionsPipeline(match, { before: q.before, limit: q.limit }))
+  const titles = await titlesFor(rows.map((r) => ({ entityType: str(r.entityType), entityId: str(r.entityId) })))
+  const sessions = rows.map((r) => ({ ...shapeSession(r, new Map(), titles, () => ''), userName: '' }))
+  const last = sessions[sessions.length - 1]
+  return { sessions, nextBefore: sessions.length === q.limit && last?.lastUsedAt ? last.lastUsedAt : null }
 }
 
 // ── one session ─────────────────────────────────────────────────────────────

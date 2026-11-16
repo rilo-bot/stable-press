@@ -174,6 +174,69 @@ export function sessionsPipeline(
   ]
 }
 
+// ── Magazine Builder: spend per magazine ────────────────────────────────────
+//
+// Magazine Builder's session list showed every conversation, run and job on its
+// own, so a busy magazine was dozens of rows and its total spend could not be read
+// anywhere. The meter already records which magazine each call was for
+// ({ entityType: 'magazine', entityId }), from the editor's routes and the worker's
+// jobs alike, so the page lists MAGAZINES with their totals, and a magazine opens to
+// its sessions.
+
+/** The magazine key in a route: a recorded entity id, or 'none' for calls tied to no
+ *  magazine (e.g. starting one before it exists). */
+export const isMagazineKey = (v: unknown): v is string =>
+  typeof v === 'string' && (v === 'none' || /^[A-Za-z0-9_-]{1,64}$/.test(v))
+
+/** The extra $match for one magazine's calls ('none' = calls tied to no magazine). */
+export function magazineMatch(magazineKey: string): Record<string, unknown> {
+  return magazineKey === 'none'
+    ? { $or: [{ entityType: { $ne: 'magazine' } }, { entityId: { $in: [null, ''] } }] }
+    : { entityType: 'magazine', entityId: magazineKey }
+}
+
+/** One row per magazine (calls tied to no magazine share one row, key ''), most
+ *  recently used first. */
+export function magazinesPipeline(match: Record<string, unknown>, limit: number): Record<string, unknown>[] {
+  return [
+    { $match: match },
+    {
+      $group: {
+        _id: { $cond: [{ $eq: ['$entityType', 'magazine'] }, { $ifNull: ['$entityId', ''] }, ''] },
+        ...SUMS,
+        firstUsedAt: { $min: '$createdAt' },
+        sessionKeys: { $addToSet: SESSION_KEY },
+      },
+    },
+    { $addFields: { sessions: { $size: '$sessionKeys' } } },
+    { $project: { sessionKeys: 0 } },
+    { $sort: { lastUsedAt: -1 } },
+    { $limit: limit },
+  ]
+}
+
+export interface MagazineUsage extends UsageSums {
+  /** The magazine's id, or 'none' for calls tied to no magazine. */
+  magazineId: string
+  /** Its title; '' when it no longer exists (or has none). */
+  title: string
+  firstUsedAt: string | null
+  sessions: number
+}
+
+/** A magazines row → its wire shape. No person: the list is about magazines. */
+export function shapeMagazine(raw: unknown, titles: Map<string, string>): MagazineUsage {
+  const r = (raw ?? {}) as Record<string, unknown>
+  const id = str(r._id)
+  return {
+    ...sumsOf(r),
+    magazineId: id || 'none',
+    title: id ? titles.get(`magazine:${id}`) ?? '' : '',
+    firstUsedAt: str(r.firstUsedAt) || null,
+    sessions: num(r.sessions),
+  }
+}
+
 /** Calls kept per session drill-down (a big magazine build makes a few hundred). */
 export const SESSION_CALL_CAP = 500
 

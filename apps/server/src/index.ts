@@ -5,6 +5,7 @@ import { db } from './lib/db.js'
 import { storage } from './lib/storage.js'
 import { seedRoles } from './lib/seedRoles.js'
 import { installAiUsageStore } from './lib/agent/aiUsageStore.js'
+import { sortdConfigLabel } from './lib/sortd.js'
 // Every route mount — and every body-parser limit and RBAC gate that goes with
 // it — lives in routes/index.ts. This file is app setup only.
 import apiRouter from './routes/index.js'
@@ -23,6 +24,7 @@ console.log('  MONGODB_URI:', hasMongoUri ? '✓ configured' : '✗ not set (ser
 console.log('  JWT_SECRET:', hasJwtSecret ? '✓ configured' : '✗ not set (insecure dev secret)')
 console.log('  EMAIL:', hasEmail ? `✓ ${emailLabel}` : '✗ not set (dev: OTP via console + UI preview)')
 console.log('  S3 UPLOADS:', storage.isConfigured() ? '✓ configured (presigned PUT)' : '✗ not set (uploads fall back to inline data URLs)')
+console.log('  SORTD:', sortdConfigLabel())
 if (isProd && !hasEmail) {
   console.warn('[server] ⚠ PROD=true but no email provider (Resend/SMTP) is configured — OTP codes will be exposed in API responses')
 }
