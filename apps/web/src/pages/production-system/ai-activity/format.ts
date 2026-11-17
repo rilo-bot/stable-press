@@ -25,9 +25,13 @@ export function duration(ms: number): string {
   if (!ms || ms < 0) return '—';
   if (ms < 1000) return `${Math.round(ms)}ms`;
   const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
-  const m = Math.floor(s / 60);
-  const rest = Math.round(s % 60);
+  if (s < 10) return `${s.toFixed(1)}s`;
+  // Round to whole seconds BEFORE splitting into minutes: rounding the remainder
+  // alone turned 1,619.6s into "26m 60s".
+  const total = Math.round(s);
+  if (total < 60) return `${total}s`;
+  const m = Math.floor(total / 60);
+  const rest = total % 60;
   return rest ? `${m}m ${rest}s` : `${m}m`;
 }
 

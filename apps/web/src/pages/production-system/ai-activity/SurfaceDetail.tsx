@@ -444,6 +444,7 @@ function MagazinesPanel({
                     <span className="text-[13px] font-semibold tabular-nums text-foreground">{usd(m.costUsd)}</span>
                   </div>
                   <p className="mt-1 text-[11.5px] text-muted-foreground">
+                    {m.createdBy && <>By {m.createdBy} · </>}
                     {magazineDates(m)} · {count(m.sessions, 'session')} · {tokens(m.inputTokens)} in · {tokens(m.outputTokens)} out ·{' '}
                     {tokens(m.cachedInputTokens)} cached · {duration(m.durationMs)}
                   </p>
@@ -458,6 +459,7 @@ function MagazinesPanel({
               <thead className="bg-muted">
                 <tr>
                   <th className={cn(th, 'pl-5 md:pl-6')}>Magazine</th>
+                  <th className={th}>Created by</th>
                   <th className={th}>Date</th>
                   <th className={cn(th, 'text-right')}>Sessions</th>
                   <th className={cn(th, 'text-right')} title="Input / output / cached input tokens">Tokens in · out · cached</th>
@@ -481,6 +483,9 @@ function MagazinesPanel({
                           <AlertTriangle size={11} aria-hidden="true" /> {count(m.errors, 'call')} failed
                         </span>
                       )}
+                    </td>
+                    <td className="max-w-[180px] truncate whitespace-nowrap px-3 py-2.5 align-top text-foreground" title={m.createdBy || undefined}>
+                      {m.createdBy || <span className="text-muted-foreground">—</span>}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2.5 align-top text-muted-foreground">{magazineDates(m)}</td>
                     <td className="px-3 py-2.5 text-right align-top tabular-nums text-foreground">{m.sessions}</td>
@@ -550,7 +555,7 @@ function MagazineDrawer({
           <div className="flex items-start gap-3">
             <div className="min-w-0 flex-1">
               <p className="text-[11px] font-semibold uppercase tracking-wide text-[hsl(var(--brand-accent-ink))]">
-                Magazine Builder · {magazineDates(m)}
+                Magazine Builder · {m.createdBy ? <>Created by {m.createdBy} · </> : null}{magazineDates(m)}
               </p>
               <h2 className="mt-1 font-[family-name:var(--font-display)] text-[16px] font-bold leading-snug text-foreground">
                 {magazineName(m)}

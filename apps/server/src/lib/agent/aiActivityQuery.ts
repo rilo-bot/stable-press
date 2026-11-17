@@ -222,10 +222,13 @@ export interface MagazineUsage extends UsageSums {
   title: string
   firstUsedAt: string | null
   sessions: number
+  /** Who created the magazine (its owner); '' when unknown or the magazine is gone. */
+  createdBy: string
 }
 
-/** A magazines row → its wire shape. No person: the list is about magazines. */
-export function shapeMagazine(raw: unknown, titles: Map<string, string>): MagazineUsage {
+/** A magazines row → its wire shape: the magazine, its creator, its totals. The
+ *  people who ran each session are not listed. */
+export function shapeMagazine(raw: unknown, titles: Map<string, string>, creators?: Map<string, string>): MagazineUsage {
   const r = (raw ?? {}) as Record<string, unknown>
   const id = str(r._id)
   return {
@@ -234,6 +237,7 @@ export function shapeMagazine(raw: unknown, titles: Map<string, string>): Magazi
     title: id ? titles.get(`magazine:${id}`) ?? '' : '',
     firstUsedAt: str(r.firstUsedAt) || null,
     sessions: num(r.sessions),
+    createdBy: id ? creators?.get(id) ?? '' : '',
   }
 }
 

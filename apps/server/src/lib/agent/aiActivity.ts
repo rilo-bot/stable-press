@@ -148,8 +148,36 @@ export async function surfaceDetail(
 export async function surfaceMagazines(q: { userId?: string; days: number; limit: number }): Promise<{ magazines: MagazineUsage[]; truncated: boolean }> {
   const match = usageMatch({ userId: q.userId, surface: 'magazine-builder', from: windowStart(q.days) })
   const rows = await db.collection(AI_USAGE).aggregate(magazinesPipeline(match, q.limit + 1))
-  const titles = await titlesFor(rows.map((r) => ({ entityType: 'magazine', entityId: str(r._id) })))
-  return { magazines: rows.slice(0, q.limit).map((r) => shapeMagazine(r, titles)), truncated: rows.length > q.limit }
+  const { titles, creators } = await magazineFacts(rows.map((r) => str(r._id)))
+  return { magazines: rows.slice(0, q.limit).map((r) => shapeMagazine(r, titles, creators)), truncated: rows.length > q.limit }
+}
+
+/** Each magazine's title and its creator's name (the owner), in two queries. A
+ *  magazine that no longer exists has neither. Fails soft. */
+async function magazineFacts(ids: string[]): Promise<{ titles: Map<string, string>; creators: Map<string, string> }> {
+  const titles = new Map<string, string>()
+  const creators = new Map<string, string>()
+  const unique = [...new Set(ids.filter(Boolean))]
+  if (unique.length === 0) return { titles, creators }
+  const ownerOf = new Map<string, string>()
+  try {
+    for (const doc of await db.collection(COL.magazines).findByIds(unique)) {
+      const id = String(doc._id)
+      const title = str(doc.title).trim() || str(doc.name).trim()
+      if (title) titles.set(`magazine:${id}`, title)
+      const owner = str(doc.ownerId)
+      if (owner) ownerOf.set(id, owner)
+    }
+  } catch (err) {
+    console.warn('[ai-activity] magazine lookup failed:', err instanceof Error ? err.message : err)
+    return { titles, creators }
+  }
+  const names = await namesFor([...ownerOf.values()])
+  for (const [id, owner] of ownerOf) {
+    const name = names.get(owner)
+    if (name) creators.set(id, name)
+  }
+  return { titles, creators }
 }
 
 /**

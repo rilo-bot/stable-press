@@ -213,6 +213,8 @@ export interface MagazineUsage extends UsageSums {
   title: string;
   firstUsedAt: string | null;
   sessions: number;
+  /** Who created the magazine; '' when unknown or the magazine is gone. */
+  createdBy: string;
 }
 
 /** GET /api/ai-activity/surfaces/magazine-builder/magazines — spend per magazine. */

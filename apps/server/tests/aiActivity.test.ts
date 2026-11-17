@@ -381,7 +381,13 @@ test('a magazine row carries its title, totals and session count — and no pers
   assert.equal(row.costUsd, 1.25)
   assert.equal(row.sessions, 7)
   assert.equal(row.firstUsedAt, '2026-11-12T08:00:00Z')
+  // The people who ran sessions are not listed...
   assert.ok(!('userName' in row) && !('userId' in row))
+  // ...but the magazine's creator is, when known.
+  assert.equal(row.createdBy, '')
+  const creators = new Map([['6af56cd5cf73c46893ebf3ca', 'Berri Schroder']])
+  assert.equal(shapeMagazine({ _id: '6af56cd5cf73c46893ebf3ca' }, titles, creators).createdBy, 'Berri Schroder')
+  assert.equal(shapeMagazine({ _id: '' }, titles, creators).createdBy, '')
   // calls tied to no magazine, and a magazine that no longer exists
   assert.equal(shapeMagazine({ _id: '' }, titles).magazineId, 'none')
   assert.equal(shapeMagazine({ _id: 'deadbeefdeadbeefdeadbeef' }, titles).title, '')
