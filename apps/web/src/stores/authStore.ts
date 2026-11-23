@@ -81,6 +81,8 @@ export interface AuthUser {
   /** Holds an admin role. Server-derived — never sent up, never stored. */
   isAdmin: boolean;
   lastLogin: string | null;
+  /** The first-run tour is waiting (set when they joined by invite link). */
+  tourPending: boolean;
   /** Racing roles, derived from the register rows below. Display only. */
   roles: PartyRole[];
   parties: PartyRow[];
@@ -117,6 +119,7 @@ function hydrateUser(raw: any, previous?: AuthUser | null): AuthUser {
     createdAt: String(raw?.createdAt ?? ''),
     isAdmin: raw?.isAdmin === true,
     lastLogin: typeof raw?.lastLogin === 'string' ? raw.lastLogin : null,
+    tourPending: raw?.tourPending === true,
     roles: Array.isArray(raw?.roles) ? raw.roles : [],
     parties: Array.isArray(raw?.parties) ? raw.parties : [],
     orgMembers: Array.isArray(raw?.orgMembers) ? raw.orgMembers : [],
@@ -169,6 +172,10 @@ interface AuthState {
   acceptInvite: (token: string, name?: string) => Promise<AcceptInviteResult>;
   /** Validate a persisted token against the server; clears session on 401. */
   verifySession: () => Promise<void>;
+  /** The first-run tour was finished or skipped — never show it again on this
+   *  account. Optimistic: hidden at once, then saved (a failed save just means it
+   *  may come back once on the next visit). */
+  completeTour: () => Promise<void>;
   logout: () => void;
 }
 
@@ -247,6 +254,22 @@ export const useAuthStore = create<AuthState>()(
           if (data?.user) set({ currentUser: hydrateUser(data.user, get().currentUser) });
         } catch {
           /* offline — keep the persisted session optimistically */
+        }
+      },
+
+      completeTour: async () => {
+        const user = get().currentUser;
+        const token = get().token;
+        if (!user) return;
+        set({ currentUser: { ...user, tourPending: false } });
+        if (!token) return;
+        try {
+          await fetch(apiUrl('/api/auth/tour-complete'), {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}` },
+          });
+        } catch {
+          /* offline — it may show once more next visit, which is harmless */
         }
       },
 

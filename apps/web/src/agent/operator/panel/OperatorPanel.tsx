@@ -21,7 +21,10 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { useReducedMotion } from 'framer-motion';
-import { Send, Square, Mic, Volume2, VolumeX, Loader2, Paperclip, SquarePen } from 'lucide-react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { Send, Square, Mic, Volume2, VolumeX, Loader2, Paperclip, SquarePen, Compass } from 'lucide-react';
+import { useTourStore } from '@/stores/tourStore';
+import { tourVariantFor } from '@/components/tour/tourSteps';
 
 import { useOperator } from '@/agent/operator/operatorStore';
 import { installNativeDialogs, syncOperatorAttachments } from '@/agent/operator/runtime';
@@ -69,6 +72,16 @@ export function OperatorPanel({ userId }: { userId: string }) {
 
   const isDesktop = useStablehandDockLayout();
   const reduce = useReducedMotion();
+  const navigate = useNavigate();
+  const { pathname } = useLocation();
+
+  /** Replay the first-run tour. It runs on a staff screen, so from the public
+   *  site go to the Campaign Engine first; ProductTour starts it once it's there. */
+  const takeTour = () => {
+    useTourStore.getState().requestReplay();
+    useAgentUi.getState().setOpen(false);
+    if (!tourVariantFor(pathname)) navigate('/production-system');
+  };
   const [input, setInput] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -198,6 +211,13 @@ export function OperatorPanel({ userId }: { userId: string }) {
                 </button>
               ))}
             </div>
+            {/* Not a prompt for the model: replays the first-run tour locally. */}
+            <button
+              onClick={takeTour}
+              className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            >
+              <Compass className="h-3.5 w-3.5" /> New here? Take the tour
+            </button>
           </div>
         )}
 

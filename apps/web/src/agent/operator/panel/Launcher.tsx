@@ -57,6 +57,8 @@ export function StablehandLauncher({
         {...uiAttr}
       >
         <motion.button
+          // The first-run tour points here (components/tour/tourSteps.ts).
+          data-tour="stablehand"
           aria-label={open ? 'Close The Stable Hand' : 'Ask The Stable Hand'}
           onClick={onClick}
           whileHover={{ scale: 1.05 }}
@@ -87,6 +89,8 @@ export function StablehandLauncher({
 
   return (
     <motion.button
+      // The first-run tour points here (components/tour/tourSteps.ts).
+      data-tour="stablehand"
       aria-label={open ? 'Close The Stable Hand' : 'Ask The Stable Hand'}
       onClick={onClick}
       whileHover={{ scale: 1.08 }}

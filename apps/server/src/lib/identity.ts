@@ -75,6 +75,12 @@ export interface IdentityUser {
   createdAt: string
   isAdmin: boolean
   lastLogin: string | null
+  /**
+   * The first-run product tour is waiting for them. Set ONLY when someone joins
+   * the team by redeeming an invite link (routes/invites), cleared for good by
+   * POST /api/auth/tour-complete. UI state, not access: nothing authorizes on it.
+   */
+  tourPending: boolean
 }
 
 export function withIdentityDefaults(raw: Record<string, any>): IdentityUser {
@@ -87,6 +93,8 @@ export function withIdentityDefaults(raw: Record<string, any>): IdentityUser {
     // value must never read as staff.
     isAdmin: raw.isAdmin === true,
     lastLogin: typeof raw.lastLogin === 'string' && raw.lastLogin ? raw.lastLogin : null,
+    // Strict, like isAdmin: only an explicit `true` shows the tour.
+    tourPending: raw.tourPending === true,
   }
 }
 

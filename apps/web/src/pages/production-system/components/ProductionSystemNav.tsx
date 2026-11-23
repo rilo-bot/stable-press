@@ -267,7 +267,7 @@ function NavAccount({
   return (
     // px-3 to sit on the same left edge as the nav rows above it, rather than
     // 4px inboard of them.
-    <div ref={ref} className="relative border-t border-primary-foreground/10 px-3 py-2.5">
+    <div ref={ref} data-tour="ce-account" className="relative border-t border-primary-foreground/10 px-3 py-2.5">
       {open && (
         <div className="absolute bottom-full left-3 right-3 mb-1 overflow-hidden rounded-sm border border-border bg-popover shadow-lg">
           <Link
@@ -338,6 +338,7 @@ export function ProductionSystemSidebar({
 }: SidebarProps) {
   return (
     <aside
+      data-tour="ce-sidebar"
       className={cn(
         // sticky + h-screen: the rail owns its own scroll, so the nav never
         // scrolls away with the page body.

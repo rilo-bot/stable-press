@@ -32,7 +32,7 @@ import { sendOtpEmail, isEmailConfigured } from '../../lib/email.js';
 import { toClientUser } from '../../lib/effectiveAccess.js';
 import { findOrCreateUser, issueSession, markSignedIn, revokeAllSessions } from '../../lib/session.js';
 import { rateLimit } from '../../lib/rateLimit.js';
-import { OTPS } from '../../lib/collections.js';
+import { OTPS, USERS } from '../../lib/collections.js';
 
 const OTP_TTL_MS = (Number(process.env.OTP_TTL_MINUTES) || 10) * 60 * 1000;
 const RESEND_COOLDOWN_MS = 30 * 1000;
@@ -190,6 +190,16 @@ router.post(['/verify', '/verify-otp'], verifyLimit, async (req, res) => {
 // ── Session check — validate a persisted token, return the live account ───────
 router.get('/me', attachAccount, (req, res) => {
   res.json({ user: toClientUser(req.account!) });
+});
+
+/**
+ * The first-run tour is done — finished OR skipped; either way it must not come
+ * back. Per ACCOUNT, so it doesn't reappear on another device. Replaying it from
+ * The Stable Hand is purely client-side and never touches this.
+ */
+router.post('/tour-complete', attachAccount, async (req, res) => {
+  await db.collection(USERS).updateOne(req.account!.id, { tourPending: false, tourCompletedAt: new Date().toISOString() });
+  res.json({ ok: true });
 });
 
 /**

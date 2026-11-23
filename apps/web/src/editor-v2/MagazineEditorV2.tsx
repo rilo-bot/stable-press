@@ -907,7 +907,7 @@ export default function MagazineEditorV2() {
       <div className="relative flex min-h-0 flex-1" onPointerMove={onBodyMove} onPointerUp={endDivider}>
         {asstOpen && canEdit && !isPhone && (
           <>
-            <div style={{ width: panes.leftW }} className="flex-shrink-0 overflow-hidden border-r border-studio-hair">
+            <div style={{ width: panes.leftW }} data-tour="mag-ai-panel" className="flex-shrink-0 overflow-hidden border-r border-studio-hair">
               <AiPanel />
             </div>
             <div className={divider} onPointerDown={startDivider('left')} title="Drag to resize" />
@@ -963,7 +963,7 @@ export default function MagazineEditorV2() {
           <WaitingChangesBar where="editor" />
 
           {/* Canvas */}
-          <div ref={canvasRef} className="min-h-0 flex-1 overflow-auto bg-studio-bg">
+          <div ref={canvasRef} data-tour="mag-canvas" className="min-h-0 flex-1 overflow-auto bg-studio-bg">
             {s.hasPage ? (
               <EditorCanvas />
             ) : building ? (

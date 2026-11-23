@@ -79,6 +79,10 @@ router.post('/:token/accept', rateLimit('invite-accept', 20, 5 * 60_000), async 
   // is no acting admin here to report a refusal to, so the invite is simply
   // applied as a no-op and they are signed in.
   const held = await roleOfUser(userDoc)
+  // JOINING, not a role change: they were not staff before this link. Only they
+  // get the first-run tour — existing staff redeeming a second invite don't, and
+  // nor does anyone who has already finished or skipped it once.
+  const joiningTeam = userDoc.isAdmin !== true && !held && !userDoc.tourCompletedAt
   if (held?.isSuper !== true) {
     await assignRole(String(userDoc._id), role.id)
   }
@@ -92,6 +96,10 @@ router.post('/:token/accept', rateLimit('invite-accept', 20, 5 * 60_000), async 
   // this the owner had to share a second time once the person had joined. Only
   // after the role is applied: a collaborator must be staff. Never throws.
   await claimPendingShares({ id: String(userDoc._id), email, name: typeof userDoc.name === 'string' ? userDoc.name : sent })
+
+  // Show them round on arrival (web: components/tour). Before the re-read below so
+  // the session they get back already carries it.
+  if (joiningTeam) await db.collection(USERS).updateOne(String(userDoc._id), { tourPending: true })
 
   // Re-read so the session reflects the role just applied.
   //

@@ -246,6 +246,7 @@ export function toClientUser(account: AccountUser): Record<string, unknown> {
     createdAt: account.createdAt,
     isAdmin: account.isAdmin,
     lastLogin: account.lastLogin,
+    tourPending: account.tourPending,
     roles: derivedRoles(account),
     parties: account.parties,
     orgMembers: account.orgMembers,

@@ -7,6 +7,7 @@ import { Toaster } from 'sonner';
 
 import { NavBar } from '@/components/NavBar';
 import { AgentWidget } from '@/components/AgentWidget';
+import { ProductTour } from '@/components/tour/ProductTour';
 import { SortdSupport } from '@/components/SortdSupport';
 import { OperatorPresence } from '@/agent/operator/presence/OperatorPresence';
 import { PublicSection } from '@/components/PublicSection';
@@ -453,6 +454,10 @@ export default function App() {
           and OperatorPresence draws what it is doing (gold frame, pill, cursor). */}
       <AgentWidget />
       <OperatorPresence />
+
+      {/* First-run tour for people who just joined by invite (replayable from
+          The Stable Hand). Renders nothing unless a tour is due. */}
+      <ProductTour />
 
       {/* Sortd help desk (support chat + tickets) for signed-in accounts — a
           bubble bottom-left, opposite the Stable Hand. Renders nothing itself. */}
