@@ -110,6 +110,9 @@ export interface IssueMeta {
   publishedIssueId?: string | null;
   /** Staff shared into this magazine (owner manages via the Share dialog). */
   collaborators?: V2Collaborator[];
+  /** Shares waiting for someone who isn't on the team yet (owner only). They
+   *  become `collaborators` automatically when the person joins. */
+  pendingCollaborators?: PendingCollaborator[];
   /**
    * The draft has changed since the live edition was frozen, so a republish would
    * change what readers see. Derived server-side from timestamps; only meaningful on
@@ -271,6 +274,14 @@ export interface V2Collaborator {
    *  only ever rendered a capability the holder didn't have. */
   pageIds: string[] | 'all';
 }
+/** A share to an address with no staff account yet. Grants nothing by itself:
+ *  the server turns it into a V2Collaborator when the invite is accepted. */
+export interface PendingCollaborator {
+  email: string;
+  pageIds: string[] | 'all';
+  invitedByName?: string;
+  createdAt?: string;
+}
 /** A row of /api/staff/directory. The field is `name` — NOT `displayName`, which
  *  is what V2Collaborator above carries. Reading the wrong one silently renders
  *  every candidate as their raw email address. */
@@ -283,10 +294,44 @@ export const staffDirectory = () => authFetchRetry('/api/staff/directory').then(
 /** `emailed` reports whether the deep-link share email actually went out;
  *  `emailError` carries the concrete reason when it didn't. `warning` is set when the
  *  person's staff ROLE cannot use the share (no Magazine Builder view/edit). */
-export const addCollaborator = (id: string, body: { email: string; pageIds: string[] | 'all' }) =>
+export interface AddCollaboratorResult {
+  issue: IssueMeta;
+  emailed?: boolean;
+  emailError?: string;
+  warning?: string;
+  /** The address isn't on the team yet: the share was saved as pending and they
+   *  were invited (`invited`) to join with `roleLabel`. `updated` = an existing
+   *  pending share's pages were changed (no new email). */
+  pending?: boolean;
+  invited?: boolean;
+  roleLabel?: string;
+  /** They already had an invitation, so its role stands (not the one chosen now). */
+  keptExistingRole?: boolean;
+  updated?: boolean;
+}
+
+/** A role the owner may invite someone new with. */
+export interface InviteRoleOption {
+  name: string;
+  label: string;
+  description?: string;
+  color?: string;
+  /** Holds Magazine Builder › View and Edit — without them they can't work on the pages. */
+  canUseMagazines: boolean;
+}
+/** `canInvite` false: the owner can't send team invites; a share is still saved
+ *  and applies once a team admin invites the person. */
+export const inviteRoles = (id: string) =>
+  authFetchRetry(`${BASE}/issues/${id}/invite-roles`).then(parse<{ canInvite: boolean; roles: InviteRoleOption[] }>);
+/** Any address works: an existing staff member is added straight away; anyone
+ *  else gets a pending share plus an invite (see AddCollaboratorResult.pending),
+ *  which needs `role` — the role they join with, chosen by the owner. */
+export const addCollaborator = (id: string, body: { email: string; pageIds: string[] | 'all'; role?: string }) =>
   authFetch(`${BASE}/issues/${id}/collaborators`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(
-    parse<{ issue: IssueMeta; emailed?: boolean; emailError?: string; warning?: string }>,
+    parse<AddCollaboratorResult>,
   );
+export const removePendingCollaborator = (id: string, email: string) =>
+  authFetch(`${BASE}/issues/${id}/pending-collaborators/${encodeURIComponent(email)}`, { method: 'DELETE' }).then(parse<{ issue: IssueMeta }>);
 export const removeCollaborator = (id: string, userId: string) =>
   authFetch(`${BASE}/issues/${id}/collaborators/${userId}`, { method: 'DELETE' }).then(parse<{ issue: IssueMeta }>);
 

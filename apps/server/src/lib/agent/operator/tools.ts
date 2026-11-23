@@ -267,6 +267,12 @@ export function buildOperatorTools(account: AccountUser, authHeader?: string): T
             email: str(c.email),
             pages: toNumbers(c.pageIds),
           })),
+          // Shared by email with someone not on the team yet. They get these pages
+          // automatically when they accept the invite — nothing left to do.
+          pendingInvites: (Array.isArray(issue.pendingCollaborators) ? (issue.pendingCollaborators as Json[]) : []).map((p) => ({
+            email: str(p.email),
+            pages: toNumbers(p.pageIds),
+          })),
         }
       },
     }),

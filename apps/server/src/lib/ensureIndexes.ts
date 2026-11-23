@@ -72,6 +72,9 @@ const INDEX_SPECS: IndexSpec[] = [
   { collection: COL.magazines, keys: { ownerId: 1, deletedAt: 1, updatedAt: -1 } },
   // Multikey: `collaborators` is an array, so this indexes each member's userId.
   { collection: COL.magazines, keys: { 'collaborators.userId': 1, deletedAt: 1, updatedAt: -1 } },
+  // Shares waiting for someone to join (lib/magazineV2/claimPendingShares.ts).
+  // Looked up by address on invite redeem, role grant and every library load.
+  { collection: COL.magazines, keys: { 'pendingCollaborators.email': 1 } },
   // Blogs: public index (published, newest first) and the staff list.
   { collection: 'blogs', keys: { deletedAt: 1, status: 1, publishedAt: -1 } },
   { collection: 'blogs', keys: { deletedAt: 1, updatedAt: -1 } },

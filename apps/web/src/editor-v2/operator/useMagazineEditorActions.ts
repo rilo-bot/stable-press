@@ -77,12 +77,14 @@ import {
   ApiError,
   createChart,
   getPage,
+  inviteRoles,
   listMedia,
   listSources,
   listUploads,
   lookAtPage as requestPageLook,
   replaceText as requestReplaceText,
   type ChartResult,
+  type InviteRoleOption,
   type PageSummary,
   type V2Collaborator,
 } from '../api';
@@ -116,6 +118,8 @@ import {
   assertEnabled,
   clickIfPresent,
   collaboratorsOut,
+  pendingSharesOut,
+  isEmailAddress,
   ensureRail,
   errorToasts,
   firstError,
@@ -244,7 +248,49 @@ function findCollaborator(person: string, cs: V2Collaborator[] | undefined): V2C
 const collabName = (c: V2Collaborator) => personDisplay({ name: c.displayName, email: c.email });
 
 /** Does this collaborator already have exactly these pages (null = all pages)? */
-function hasScope(c: V2Collaborator, wantIds: string[] | null): boolean {
+/** The pending share (someone invited through a share, not joined yet) for an address. */
+function findPending(person: string, issue: { pendingCollaborators?: { email: string; pageIds: string[] | 'all' }[] } | null | undefined) {
+  const q = person.trim().toLowerCase();
+  return (issue?.pendingCollaborators ?? []).find((p) => p.email.toLowerCase() === q);
+}
+
+/** Someone NOT on the team: an email address the staff directory doesn't know.
+ *  Null when `person` is staff (or not an email at all — then resolvePerson's
+ *  error asks for an address). */
+async function newPersonEmail(person: string): Promise<string | null> {
+  if (!isEmailAddress(person)) return null;
+  const list = await loadDirectory().catch(() => null);
+  if (list && matchPeople(list, person).length > 0) return null;
+  return person.trim().toLowerCase();
+}
+
+/** "Editor" · "Editor (can't edit magazines)" — how the model lists choices to the user. */
+const roleChoice = (r: InviteRoleOption) => (r.canUseMagazines ? r.label : `${r.label} (can't edit magazines)`);
+
+/**
+ * The role a NEW person joins the team with — always the USER's choice, never a
+ * guess. Returns the matched role, or null when no role applies (the owner can't
+ * send invites, or they are already pending — their invite has its role). With
+ * no `role` arg it throws an error that asks the user, listing the choices.
+ */
+async function inviteRoleFor(issueId: string, email: string, role: string | undefined, alreadyPending: boolean): Promise<InviteRoleOption | null> {
+  const opts = await inviteRoles(issueId);
+  if (!opts.canInvite) return null;
+  if (opts.roles.length === 0) throw new Error(`${email} isn't on the team yet, and there's no role you're allowed to give — ask someone who manages the team to invite them.`);
+  if (!role) {
+    if (alreadyPending) return null;
+    throw actionError(
+      `${email} isn't on the team yet, so they'll be invited. Ask the user which role they should join with: ${opts.roles.map(roleChoice).join(', ')}. Then call again with role.`,
+      { roles: opts.roles.map((r) => ({ role: r.name, label: r.label, canEditMagazines: r.canUseMagazines })) },
+    );
+  }
+  const q = role.trim().toLowerCase();
+  const hit = opts.roles.find((r) => r.name.toLowerCase() === q || r.label.toLowerCase() === q);
+  if (!hit) throw new Error(`"${role}" isn't a role you can give. The choices are: ${opts.roles.map(roleChoice).join(', ')}.`);
+  return hit;
+}
+
+function hasScope(c: Pick<V2Collaborator, 'pageIds'>, wantIds: string[] | null): boolean {
   if (!wantIds) return c.pageIds === 'all';
   if (c.pageIds === 'all') return false;
   const have = c.pageIds.map(String);
@@ -1133,6 +1179,8 @@ export function useMagazineEditorActions(input: EditorPerms): void {
           selectedForPublish: p.selectedForPublish,
         })),
         collaborators: collaboratorsOut(issue.collaborators, s.pages),
+        // Invited by email, not joined yet — they get these pages automatically on joining.
+        pendingInvites: pendingSharesOut(issue.pendingCollaborators, s.pages),
         coverImage: issue.coverImage || null,
         zoomPercent: zoomPercent(),
         history: { nextUndo: top(s.undoStack)?.label ?? null, nextRedo: top(s.redoStack)?.label ?? null },
@@ -1423,13 +1471,84 @@ export function useMagazineEditorActions(input: EditorPerms): void {
   );
 
   // ── Sharing ──────────────────────────────────────────────────────────────
+
+  /**
+   * Share with someone who is NOT on the team yet, through the dialog's "invite by
+   * email" field. The server saves a pending share and emails them an invite; the
+   * pages become theirs automatically when they accept it. The model must not plan
+   * a second share for after they sign up — the result says so.
+   */
+  async function shareWithNewPerson(ui: UiDriver, email: string, nums: number[] | null, wantIds: string[] | null, roleArg: string | undefined) {
+    const pend = () => findPending(email, get().issue);
+    const result = () => {
+      const after = get();
+      return {
+        invited: email,
+        pages: pend() ? scopeNumbers(pend()!, after.pages) : nums ?? 'all',
+        status: 'Pending: they are not on the team yet. They get these pages AUTOMATICALLY when they accept the invite — no need to share again.',
+        pendingInvites: pendingSharesOut(after.issue?.pendingCollaborators, after.pages),
+      };
+    };
+    const already = pend();
+    if (already && hasScope(already, wantIds)) return { unchanged: true, ...result() };
+    // Before touching the screen: no role chosen yet → this asks the user.
+    const role = await inviteRoleFor(get().issueId!, email, roleArg, !!already);
+
+    await openShareDialog(ui);
+    await waitUntil(() => !!anchor('mag.share-invite-email'), { signal: ui.signal, timeoutMs: 15_000, what: 'the Share dialog to load' });
+    ui.step(`Inviting ${email}`);
+    await ui.type('mag.share-invite-email', email, { clear: true });
+    if (role) {
+      await waitUntil(() => !!anchor('mag.share-invite-role'), { signal: ui.signal, timeoutMs: 15_000, what: 'the role list to load' });
+      await ui.select('mag.share-invite-role', role.name);
+    }
+    if (!nums) {
+      await ui.click('mag.share-scope-all', 'All pages');
+    } else {
+      await ui.click('mag.share-scope-pick', 'Specific pages');
+      await ui.waitFor('mag.share-pages-clear', 3000);
+      await ui.click('mag.share-pages-clear', 'Clear');
+      for (const n of nums) await ui.click(`mag.share-page-${n}`, `Page ${n}`);
+    }
+    assertEnabled('mag.share-submit', 'The Share button is not available.');
+    const matches = () => {
+      const p = pend();
+      return !!p && hasScope(p, wantIds);
+    };
+    const toasts = watchToasts();
+    let seen: SeenToast[] = [];
+    try {
+      await ui.click('mag.share-submit', 'Invite & share');
+      await settle(ui, 'mag.share-submit', () => matches() || !!firstError(toasts.peek()), 'the invite to save');
+      if (!matches() && !firstError(toasts.peek())) await get().refreshIssue();
+    } finally {
+      seen = toasts.stop();
+    }
+    const landed = matches() || (!firstError(seen) && seen.some((t) => /^invited|when they join|invitation waiting/i.test(t.text)));
+    if (!landed) throw new Error(firstError(seen) || 'The invite did not go through — see the message on screen.');
+    // Two different warnings can appear: the email/invite didn't go out, or the
+    // chosen role can't edit magazines. Report each as what it is.
+    const emailTrouble = seen.find((t) => t.type === 'warning' && /didn.t send|^saved —/i.test(t.text));
+    const roleWarning = seen.find((t) => t.type === 'warning' && t !== emailTrouble);
+    ui.flash(`mag.share-pending-${email}`);
+    await sleep(900, ui.signal);
+    await closeShareDialog(ui);
+    return {
+      ...result(),
+      ...(role ? { role: role.label } : {}),
+      ...(roleWarning ? { warning: roleWarning.text } : {}),
+      emailed: emailTrouble ? `NO — ${emailTrouble.text}` : already ? 'no (pages changed only — the invite went out the first time)' : 'yes (or an invitation was already waiting for them)',
+      messages: toastLines(seen),
+    };
+  }
+
   useAgentAction(
     {
       name: 'magazine.sharePages',
       description:
-        "Share pages with a staff member (person = userId, email or name) through the Share dialog. New people are emailed a link; for someone who already has access this changes which pages they can edit.",
-      args: z.object({ person: z.string().min(1), pages: pagesArg }),
-      confirm: async ({ person, pages }) => {
+        "Share pages (person = userId, email or name) through the Share dialog. A staff member is added straight away and emailed a link; for someone who already has access this changes which pages they can edit. Someone NOT on the team yet must be given by EMAIL plus the ROLE they join the team with — ask the user for the role, never pick one (without it this returns the choices). They're emailed an invite, the share waits for them, and they get the pages automatically when they join — never ask the user to share again after they sign up.",
+      args: z.object({ person: z.string().min(1), pages: pagesArg, role: z.string().min(1).optional() }),
+      confirm: async ({ person, pages, role }) => {
         const s = get();
         // No card for page numbers that don't exist (run() refuses them before
         // touching anything) or for someone who already has exactly these pages
@@ -1441,6 +1560,23 @@ export function useMagazineEditorActions(input: EditorPerms): void {
           return null;
         }
         let existing = findCollaborator(person, s.issue?.collaborators);
+        const title0 = s.issue?.title || 'this magazine';
+        const what0 = pages === 'all' ? 'all pages' : pageListLabel(pages);
+        const invitee = existing ? null : await newPersonEmail(person);
+        if (invitee) {
+          const pend = findPending(invitee, s.issue);
+          if (pend) return hasScope(pend, wantIds) ? null : `Change the pages waiting for ${invitee} on “${title0}” to ${what0}?`;
+          // No card until a role is chosen: run() stops first and asks the user.
+          let r: InviteRoleOption | null;
+          try {
+            r = await inviteRoleFor(s.issueId!, invitee, role, false);
+          } catch {
+            return null;
+          }
+          return r
+            ? `${invitee} isn't on the team yet. Invite them as ${r.label} and share ${what0} of “${title0}”? They'll be emailed an invitation and get the pages as soon as they join.`
+            : `${invitee} isn't on the team yet. Save ${what0} of “${title0}” for them? You can't send team invites, so they'll get the pages once a team admin invites them.`;
+        }
         if (!existing) {
           // Resolve the way run() will (staff directory). No card when run() is
           // going to refuse anyway: nobody / several people match, or it is the
@@ -1463,7 +1599,7 @@ export function useMagazineEditorActions(input: EditorPerms): void {
         const who = await personLabelAsync(person, s.issue?.collaborators);
         return `Share ${what} of “${title}” with ${who}? They'll be emailed a link.`;
       },
-      run: async ({ person, pages }, ui) => {
+      run: async ({ person, pages, role }, ui) => {
         const s = await ready(ui);
         const issue = s.issue!;
         const nums = pages === 'all' ? null : Array.from(new Set(pages)).sort((a, b) => a - b);
@@ -1471,6 +1607,8 @@ export function useMagazineEditorActions(input: EditorPerms): void {
 
         let existing = findCollaborator(person, issue.collaborators);
         let newPerson: { userId: string; email: string; name: string } | null = null;
+        const invitee = existing ? null : await newPersonEmail(person);
+        if (invitee) return shareWithNewPerson(ui, invitee, nums, wantIds, role);
         if (!existing) {
           const p = resolvePerson(await loadDirectory(), person);
           if (p.userId === issue.ownerId) throw new Error(`${personDisplay(p)} owns this magazine already.`);
@@ -1576,18 +1714,38 @@ export function useMagazineEditorActions(input: EditorPerms): void {
   useAgentAction(
     {
       name: 'magazine.unshare',
-      description: "Remove a collaborator's access to this magazine (person = userId, email or name).",
+      description: "Remove a collaborator's access to this magazine (person = userId, email or name). Also cancels a pending share with someone invited by email who hasn't joined yet.",
       args: z.object({ person: z.string().min(1) }),
       confirm: ({ person }) => {
         const s = get();
         // Not a collaborator → run() refuses before touching anything; no card.
         const c = findCollaborator(person, s.issue?.collaborators);
-        if (!c) return null;
+        if (!c) {
+          const p = findPending(person, s.issue);
+          return p ? `Cancel the share with ${p.email} on “${s.issue?.title || 'this magazine'}”? They haven't joined yet.` : null;
+        }
         return `Remove ${collabName(c)}'s access to “${s.issue?.title || 'this magazine'}”?`;
       },
       run: async ({ person }, ui) => {
         const s = await ready(ui);
         const c = findCollaborator(person, s.issue?.collaborators);
+        const pending = c ? undefined : findPending(person, s.issue);
+        if (pending) {
+          await openShareDialog(ui);
+          const gone = () => !findPending(pending.email, get().issue);
+          const toasts = watchToasts();
+          try {
+            await ui.click(`mag.share-pending-remove-${pending.email}`, `Cancel ${pending.email}`);
+            await waitUntil(() => gone() || !!firstError(toasts.peek()), { signal: ui.signal, timeoutMs: 20_000, what: 'the pending share to be cancelled' });
+          } finally {
+            toasts.stop();
+          }
+          if (!gone()) throw new Error(firstError(toasts.peek()) || `The share with ${pending.email} was not cancelled — see the message on screen.`);
+          await sleep(500, ui.signal);
+          await closeShareDialog(ui);
+          const after = get();
+          return { cancelledInvite: pending.email, pendingInvites: pendingSharesOut(after.issue?.pendingCollaborators, after.pages) };
+        }
         // Named (staff directory), never the raw userId the model passed.
         if (!c) throw new Error(`${await personLabelAsync(person, s.issue?.collaborators)} is not a collaborator on this magazine.`);
         await openShareDialog(ui);

@@ -25,7 +25,7 @@ import {
 } from '@/agent/operator/runtime/people';
 import { useAuthStore } from '@/stores/authStore';
 import { useEditorStore } from '../store';
-import type { StaffEntry, V2Collaborator, PageSummary } from '../api';
+import type { StaffEntry, V2Collaborator, PageSummary, PendingCollaborator } from '../api';
 
 /**
  * Staff permission `magazine.edit` (fails open when the access payload is
@@ -275,7 +275,7 @@ export async function openPageN(ui: UiDriver, n: number): Promise<PageSummary> {
 }
 
 /** A collaborator's scope as real page numbers (or 'all'), for results. */
-export function scopeNumbers(c: V2Collaborator, pages: PageSummary[]): number[] | 'all' {
+export function scopeNumbers(c: Pick<V2Collaborator, 'pageIds'>, pages: PageSummary[]): number[] | 'all' {
   if (c.pageIds === 'all') return 'all';
   const num = new Map(pages.map((p) => [p.id, pageNo(p)]));
   return c.pageIds
@@ -291,6 +291,16 @@ export function collaboratorsOut(cs: V2Collaborator[] | undefined, pages: PageSu
     email: c.email,
     pages: scopeNumbers(c, pages),
   }));
+}
+
+/** Shares waiting for someone who isn't on the team yet, as page numbers. */
+export function pendingSharesOut(ps: PendingCollaborator[] | undefined, pages: PageSummary[]) {
+  return (ps ?? []).map((p) => ({ email: p.email, pages: scopeNumbers(p, pages), status: 'invited — gets these pages automatically when they join' }));
+}
+
+/** A plain email address (the only way to name someone not on the team yet). */
+export function isEmailAddress(v: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v.trim());
 }
 
 // ── Staff directory (same GET as the Share dialog) ──────────────────────────
@@ -320,7 +330,11 @@ export function matchPeople(list: StaffEntry[], person: string): StaffEntry[] {
 export function resolvePerson(list: StaffEntry[], person: string): StaffEntry {
   const hits = matchPeople(list, person);
   if (hits.length === 1) return hits[0]!;
-  if (hits.length === 0) throw new Error(`No staff member matches ${quoteRef(person)}. Call magazine.listStaff to see who can be invited.`);
+  if (hits.length === 0) {
+    throw new Error(
+      `No staff member matches ${quoteRef(person)}. If they aren't on the team yet, ask for their email address and share with that — they'll be emailed an invite and get the pages as soon as they join.`,
+    );
+  }
   const shown = hits.slice(0, 8);
   throw actionError(
     `${quoteRef(person, 'That reference')} matches ${hits.length} people: ${shown.map((h) => personDisplayWithEmail(h)).join('; ')}. Ask which one, then pass their userId (see detail).`,

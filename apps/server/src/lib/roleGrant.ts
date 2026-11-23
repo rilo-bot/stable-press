@@ -13,6 +13,7 @@
 
 import { db } from './db.js'
 import { USERS } from './collections.js'
+import { claimPendingShares } from './magazineV2/claimPendingShares.js'
 import type { AccountUser } from './effectiveAccess.js'
 import type { UserDoc } from './session.js'
 import type { PermissionAction } from './permissionCatalogue.js'
@@ -115,6 +116,11 @@ export async function grantRoleTo(
   // Writes the `adminRoles` link AND `users.isAdmin`, in the order that fails
   // closed. `assignedBy` is the audit trail for who put them on the team.
   await assignRole(targetId, role.id, actor.id)
+
+  // They are staff now, so any magazine shared with their address while they
+  // weren't can finally be theirs. Here rather than in each route so the two
+  // doors can't disagree about it. Never throws.
+  await claimPendingShares({ id: targetId, email: String(target.email ?? ''), name: typeof target.name === 'string' ? target.name : undefined })
   return { ok: true }
 }
 

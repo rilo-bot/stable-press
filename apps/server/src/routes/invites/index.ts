@@ -14,6 +14,7 @@ import { rateLimit } from '../../lib/rateLimit.js'
 import { findInviteByToken, sanitizeRedirect } from '../../lib/invites.js'
 import { INVITES, USERS } from '../../lib/collections.js'
 import { assignRole, getRoles, roleOfUser } from '../../lib/roleRegistry.js'
+import { claimPendingShares } from '../../lib/magazineV2/claimPendingShares.js'
 
 const router = Router()
 
@@ -85,6 +86,12 @@ router.post('/:token/accept', rateLimit('invite-accept', 20, 5 * 60_000), async 
   // EVERY invite for this address: a sibling row would make the role a coin flip.
   const siblings = await db.collection(INVITES).find({ email })
   await Promise.all(siblings.map((row) => db.collection(INVITES).deleteOne(row._id)))
+
+  // Magazines shared with this address before they had a staff account become
+  // theirs NOW — before the redirect below lands them on one of them. Without
+  // this the owner had to share a second time once the person had joined. Only
+  // after the role is applied: a collaborator must be staff. Never throws.
+  await claimPendingShares({ id: String(userDoc._id), email, name: typeof userDoc.name === 'string' ? userDoc.name : sent })
 
   // Re-read so the session reflects the role just applied.
   //

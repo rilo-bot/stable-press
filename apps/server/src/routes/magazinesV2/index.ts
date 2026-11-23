@@ -20,7 +20,7 @@ import crypto from 'crypto';
 import { Router, type RequestHandler, type Request, type Response } from 'express';
 import { db, rawCollection } from '../../lib/db.js';
 import { attachAccount } from '../../lib/auth.js';
-import { can, isAdmin } from '../../lib/rbac.js';
+import { can, isAdmin, canManageTeam } from '../../lib/rbac.js';
 import { MAGAZINE_V2_ENABLED, PAGE_W, PAGE_H, MAX_PAGES_PER_ISSUE, MAX_SOURCE_BYTES, ALLOWED_SOURCE_MIME, sourceExtForMime, MAX_IMAGE_BYTES, ALLOWED_IMAGE_MIME, imageExtFor } from '../../lib/magazineV2/config.js';
 import { COL } from '../../lib/magazineV2/collections.js';
 import { rateLimit } from '../../lib/rateLimit.js';
@@ -30,6 +30,10 @@ import { reviewOf, reviewRoundOf, isApprovalStale, needsRepublish, pageEditedSin
 import { publishApprovalBlock } from '../../lib/magazineV2/publishGate.js';
 import { canReadThread, canWriteThread, threadSummary, legacyThreadSummary, titleFromMessage, cleanTitle, LEGACY_THREAD_ID } from '../../lib/magazineV2/threads.js';
 import { notifyShared } from '../../lib/notifyShare.js';
+import { scopeLabel } from '../../lib/notifyShare.js';
+import { inviteForShare, hasLiveInvite, inviteRoleOptions, resolveInviteRole } from '../../lib/shareInvite.js';
+import { pendingSharesOf, upsertPendingShare, withoutPendingShare, prunePendingPageId, normalizeEmail as normalizeShareEmail } from '../../lib/magazineV2/pendingShares.js';
+import { claimPendingShares } from '../../lib/magazineV2/claimPendingShares.js';
 import { notifySubmitted, notifyReviewed, notifyPageRemoved } from '../../lib/notifyReview.js';
 import { pageNumbersLabel } from '../../lib/pageLabels.js';
 import { magazinePath } from '../../lib/invites.js';
@@ -347,9 +351,14 @@ async function uniqueSlug(title: string): Promise<string> {
  * immediately rather than waiting for a refetch.
  */
 function withViewer(doc: Doc, uid: string, pages?: Doc[]) {
+  const role = roleOnMagazine(doc, uid);
+  const out = project(doc) as Record<string, unknown>;
+  // Pending shares are the owner's business (addresses of people not on the team
+  // yet); a collaborator has no use for them and no right to the list.
+  if (!isOwner(role)) delete out.pendingCollaborators;
   return {
-    ...project(doc),
-    myRole: roleOnMagazine(doc, uid),
+    ...out,
+    myRole: role,
     myEditablePageIds: editablePageIds(doc, uid),
     needsRepublish: pages ? needsRepublish(doc, pages) : false,
   };
@@ -472,6 +481,11 @@ function maxIso(a: string, b: string): string {
 // collaborator's assignment; `myRole` + `ownerName` tell the client its rights.
 router.get('/issues', async (req, res) => {
   const uid = req.account!.id;
+  // Safety net for shares made before this person was on the team. The eager
+  // claim runs when an invite is redeemed or a role is granted; this catches any
+  // other way someone became staff (a script, a role granted before this code
+  // shipped). One indexed lookup on their own address; never throws.
+  await claimPendingShares({ id: uid, email: req.account!.email, name: req.account!.name });
   // THE ACCESS RULE IS THE QUERY, not a filter after the fact.
   //
   // This used to be a bare `find()` — every magazine ever created, loaded into the
@@ -2307,26 +2321,108 @@ router.post('/issues/:id/collaborators', async (req, res) => {
     res.status(400).json({ error: 'A valid email is required.' });
     return;
   }
+  const rawPageIds = req.body?.pageIds;
+  const pageIds: string[] | 'all' =
+    rawPageIds === 'all' || rawPageIds == null ? 'all' : Array.isArray(rawPageIds) ? rawPageIds.map(String) : 'all';
+
   const existing = (await db.collection('users').find({ email }))[0];
-  if (!existing) {
-    res.status(404).json({ error: 'No account with that email. Ask them to sign up first.' });
-    return;
-  }
   // RESOLVED, not read off the user document. `users.isAdmin` is a denormalised
   // copy of "has an `admins` row" and can be stale, so a collaborator check that
   // trusted it would add someone the newsroom itself refuses to let in.
-  const acct = await resolveAccount(withIdentityDefaults({ id: existing._id, ...existing }));
-  if (!isAdmin(acct)) {
-    res.status(400).json({ error: 'That person is not an admin, so they cannot be added.' });
+  const acct = existing ? await resolveAccount(withIdentityDefaults({ id: existing._id, ...existing })) : null;
+
+  // NOT ON THE TEAM YET — no account at all, or an account with no staff role (a
+  // reader who signed up on the public site). A collaborator must be staff, so
+  // they can't be added now; instead the share is REMEMBERED by email and an
+  // invite goes out. Redeeming it makes them staff, and claimPendingShares turns
+  // this row into a real collaborator — the owner never has to share again.
+  // This used to be a dead end: "No account with that email. Ask them to sign up
+  // first." — after which the owner had to come back and repeat the share.
+  if (!acct || !isAdmin(acct)) {
+    const priorPending = pendingSharesOf(doc);
+    const alreadyPending = priorPending.some((p) => normalizeShareEmail(p.email) === email);
+    const liveInvite = await hasLiveInvite(email);
+    // A NEW invite is needed when none is waiting for them. Its role is the
+    // sharer's decision (joining through a share is still joining the team), so
+    // it is asked for — never guessed — and checked BEFORE anything is saved: a
+    // missing or forbidden role is a plain refusal, not a half-done share.
+    const needsNewInvite = !liveInvite && canManageTeam(req.account!);
+    const requestedRole = typeof req.body?.role === 'string' ? req.body.role.trim() : '';
+    let chosenRole: Awaited<ReturnType<typeof resolveInviteRole>>['role'];
+    if (needsNewInvite) {
+      if (!requestedRole) {
+        const { roles } = await inviteRoleOptions(req.account!);
+        res.status(400).json({
+          error: `${email} isn't on the team yet. Choose the role they should join with.`,
+          needsRole: true,
+          roles,
+        });
+        return;
+      }
+      const picked = await resolveInviteRole(req.account!, requestedRole);
+      if (!picked.role) {
+        res.status(picked.status ?? 400).json({ error: picked.error, needsRole: true, roles: (await inviteRoleOptions(req.account!)).roles });
+        return;
+      }
+      chosenRole = picked.role;
+    }
+    const nextPending = upsertPendingShare(priorPending, {
+      email,
+      pageIds,
+      invitedBy: uid,
+      invitedByName: req.account!.name || req.account!.email,
+      createdAt: new Date().toISOString(),
+    });
+    await db.collection(COL.magazines).updateOne(doc._id, { pendingCollaborators: nextPending, updatedAt: new Date().toISOString() });
+
+    // Invite on the FIRST share to this address, like the share email below:
+    // changing a pending person's pages must not re-send (and re-token) the invite.
+    // Unless there is no live invite to ride on — the first attempt couldn't send
+    // one, or it expired / was cancelled — in which case sharing again is exactly
+    // how the owner retries.
+    let invite: Awaited<ReturnType<typeof inviteForShare>> = { invited: true, emailed: false };
+    if (!alreadyPending || !liveInvite) {
+      const all = await pagesFor(String(doc._id));
+      const numberOf = new Map(all.map((p, i) => [String(p._id), i + 1]));
+      const pageNumbers: number[] | 'all' =
+        pageIds === 'all' ? 'all' : pageIds.map((id) => numberOf.get(String(id))).filter((n): n is number => !!n);
+      invite = await inviteForShare({
+        actor: req.account!,
+        email,
+        magazineTitle: String(doc.title ?? 'Untitled magazine'),
+        magazinePath: magazinePath(String(doc._id), 'v2'),
+        scope: scopeLabel(pageNumbers, all.length),
+        role: chosenRole,
+      });
+    }
+    // Invited with a role that can't open magazines: the owner hears it now, not
+    // from the newcomer who clicks the link and finds nothing there.
+    const roleWarning =
+      chosenRole && !invite.keptExistingRole && !(chosenRole.permissions.includes('magazine.view') && chosenRole.permissions.includes('magazine.edit'))
+        ? collaboratorRoleWarning(email, {
+            view: chosenRole.permissions.includes('magazine.view'),
+            edit: chosenRole.permissions.includes('magazine.edit'),
+          })
+        : '';
+
+    const fresh = await loadIssue(doc._id);
+    res.status(201).json({
+      issue: withViewer(fresh ?? doc, uid),
+      pending: true,
+      invited: invite.invited,
+      emailed: invite.emailed,
+      ...(invite.roleLabel ? { roleLabel: invite.roleLabel } : {}),
+      ...(invite.keptExistingRole ? { keptExistingRole: true } : {}),
+      ...(roleWarning ? { warning: roleWarning } : {}),
+      ...(invite.error ? { emailError: invite.error } : {}),
+      ...(alreadyPending && invite.invited && !invite.emailed && !invite.error ? { updated: true } : {}),
+    });
     return;
   }
   if (acct.id === doc.ownerId) {
     res.status(409).json({ error: 'That person is the owner of this magazine.' });
     return;
   }
-  const rawPageIds = req.body?.pageIds;
-  const pageIds: string[] | 'all' =
-    rawPageIds === 'all' || rawPageIds == null ? 'all' : Array.isArray(rawPageIds) ? rawPageIds.map(String) : 'all';
   const next: V2Collaborator = {
     userId: acct.id,
     email: acct.email,
@@ -2335,7 +2431,12 @@ router.post('/issues/:id/collaborators', async (req, res) => {
   };
   const others = collaboratorsOf(doc).filter((c) => c.userId !== acct.id);
   const alreadyShared = collaboratorsOf(doc).some((c) => c.userId === acct.id);
-  await db.collection(COL.magazines).updateOne(doc._id, { collaborators: [...others, next], updatedAt: new Date().toISOString() });
+  const shareUpdate: Record<string, unknown> = { collaborators: [...others, next], updatedAt: new Date().toISOString() };
+  // A pending row for this address is now answered by a real one.
+  const pendingBefore = pendingSharesOf(doc);
+  const pendingAfter = withoutPendingShare(pendingBefore, acct.email);
+  if (pendingAfter.length !== pendingBefore.length) shareUpdate.pendingCollaborators = pendingAfter;
+  await db.collection(COL.magazines).updateOne(doc._id, shareUpdate);
 
   // Email a deep link to the magazine. Only on the FIRST share — re-saving
   // someone's page assignment shouldn't spam them. The share itself is already
@@ -2390,6 +2491,43 @@ router.delete('/issues/:id/collaborators/:userId', async (req, res) => {
   }
   const next = collaboratorsOf(doc).filter((c) => c.userId !== req.params.userId);
   await db.collection(COL.magazines).updateOne(doc._id, { collaborators: next, updatedAt: new Date().toISOString() });
+  const fresh = await loadIssue(doc._id);
+  res.json({ issue: withViewer(fresh ?? doc, uid) });
+});
+
+// The roles the owner may invite someone new with, for the Share dialog's role
+// picker and Stable Hand. `canInvite` false = no team-management permission: the
+// share can still be saved, but a team admin has to send the invite.
+router.get('/issues/:id/invite-roles', async (req, res) => {
+  const uid = req.account!.id;
+  const doc = await loadIssue(req.params.id);
+  if (!doc || !roleOnMagazine(doc, uid)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  if (!isOwner(roleOnMagazine(doc, uid))) {
+    res.status(403).json({ error: 'Only the owner can manage collaborators.' });
+    return;
+  }
+  res.json(await inviteRoleOptions(req.account!));
+});
+
+// cancel a pending share (someone invited through a share who hasn't joined yet) —
+// owner only. Leaves any team invite alone: that belongs to the Team screen, and
+// the person may have been invited for other reasons too.
+router.delete('/issues/:id/pending-collaborators/:email', async (req, res) => {
+  const uid = req.account!.id;
+  const doc = await loadIssue(req.params.id);
+  if (!doc || !roleOnMagazine(doc, uid)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+  if (!isOwner(roleOnMagazine(doc, uid))) {
+    res.status(403).json({ error: 'Only the owner can manage collaborators.' });
+    return;
+  }
+  const next = withoutPendingShare(pendingSharesOf(doc), String(req.params.email));
+  await db.collection(COL.magazines).updateOne(doc._id, { pendingCollaborators: next, updatedAt: new Date().toISOString() });
   const fresh = await loadIssue(doc._id);
   res.json({ issue: withViewer(fresh ?? doc, uid) });
 });
@@ -3035,8 +3173,10 @@ router.delete('/issues/:id/pages/:pageId', async (req, res) => {
     // narrowest window we can get.
     const latest = (await loadIssue(doc._id)) ?? current;
     const pruned = pruneDeletedPageId(latest, victim._id);
+    const prunedPending = prunePendingPageId(latest, victim._id);
     const update: Record<string, unknown> = { updatedAt: new Date().toISOString() };
     if (pruned) update.collaborators = pruned;
+    if (prunedPending) update.pendingCollaborators = prunedPending;
     await db.collection(COL.magazines).updateOne(doc._id, update);
     return {
       status: 200,

@@ -123,13 +123,13 @@ export const SURFACES: CatalogSurface[] = [
       {
         name: 'magazine.sharePages',
         description:
-          'Owner only. Share pages through the Share dialog: person is a userId, email or name (ambiguous names return the candidates). A new collaborator is emailed a link; for an existing one this changes which pages they may edit. Returns the updated collaborator list.',
-        args: "{ person: string; pages: number[] | 'all' }",
+          "Owner only. Share pages through the Share dialog: person is a userId, email or name (ambiguous names return the candidates). A new collaborator is emailed a link; for an existing one this changes which pages they may edit. Someone NOT on the team yet: pass their EMAIL (ask the user for it if you only have a name) AND the role they join the team with — always ASK the user which role, never choose one (called without role it returns the choices) — they're emailed an invite, the share is saved as pending, and they get the pages AUTOMATICALLY when they accept; never tell the user to share again once they've signed up. Returns the updated collaborator list (pendingInvites for people not joined yet).",
+        args: "{ person: string; pages: number[] | 'all'; role?: string }",
         confirms: true,
       },
       {
         name: 'magazine.unshare',
-        description: "Owner only. Remove a collaborator's access (person = userId, email or name).",
+        description: "Owner only. Remove a collaborator's access (person = userId, email or name), or cancel a pending share with someone invited by email who hasn't joined.",
         args: '{ person: string }',
         confirms: true,
       },
@@ -354,6 +354,10 @@ export const SURFACES: CatalogSurface[] = [
       'mag.share-page-<n>',
       'mag.share-submit',
       'mag.share-collab-<userId>',
+      'mag.share-invite-email',
+      'mag.share-invite-role',
+      'mag.share-pending-<email>',
+      'mag.share-pending-remove-<email>',
       'mag.share-close',
       'mag.publish-dialog',
       'mag.publish-page-<n>',

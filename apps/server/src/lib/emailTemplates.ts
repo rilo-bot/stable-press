@@ -445,6 +445,54 @@ export function magazineShareEmail(opts: {
   }
 }
 
+// ── Magazine share to someone NOT on the team yet ───────────────────────────
+//
+// ONE email, not two. The share email alone would link to a magazine they cannot
+// open (no account, no role); the plain team invite alone would say "join the
+// newsroom" without the reason they should. So this is the invite — same one-time
+// link, same expiry — told from the magazine's side. Redeeming it creates the
+// account, applies the role, adds them to the magazine and lands them on it.
+
+export function magazineInviteEmail(opts: {
+  magazineTitle: string
+  sharedBy: string
+  /** Absolute accept URL carrying the one-time invite token. */
+  acceptUrl: string
+  /** Which pages, already phrased for a human. */
+  scope: string
+  roleLabel: string
+  expiresIn: string
+}): RenderedEmail {
+  const { magazineTitle, sharedBy, acceptUrl, scope, roleLabel, expiresIn } = opts
+  return {
+    subject: `${sharedBy} shared "${magazineTitle}" with you on Stable Press`,
+    text:
+      `${sharedBy} has shared the magazine "${magazineTitle}" with you on Stable Press.\n\n` +
+      `${scope}\n\n` +
+      `Open this link to join and go straight to the magazine — no password, no code to type: ${acceptUrl}\n\n` +
+      `You'll join as ${roleLabel}. This link expires in ${expiresIn} and can only be used once.`,
+    html: layout({
+      kicker: 'Shared with you',
+      heading: 'A magazine is waiting for you',
+      preheader: `${sharedBy} shared “${magazineTitle}” with you on Stable Press.`,
+      body:
+        para(
+          `${strong(sharedBy)} shared ${title(magazineTitle)} with you on Stable Press. Open the link below to join &mdash; no password to set and no code to type &mdash; and you&rsquo;ll land right on it.`,
+        ) +
+        ledger([
+          ['Magazine', magazineTitle],
+          ['Shared by', sharedBy],
+          ['You join as', roleLabel],
+          ['Link expires', `in ${expiresIn}`],
+        ]) +
+        para(esc(scope), { size: 14 }) +
+        button(acceptUrl, 'Join and open the magazine') +
+        linkFallback(acceptUrl),
+      footer: `This link can only be used once. If you weren&rsquo;t expecting it, you can safely ignore this email.`,
+    }),
+  }
+}
+
 // ── Magazine submissions & review ───────────────────────────────────────────
 //
 // Three notifications around the per-page review flow. The state change is

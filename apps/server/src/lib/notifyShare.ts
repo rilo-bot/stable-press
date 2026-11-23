@@ -24,7 +24,7 @@ const WEB_PUBLIC_URL = (process.env.WEB_PUBLIC_URL ?? 'http://localhost:5173').r
  * `pageNumbersLabel` so this email and the submission/review emails phrase the
  * same set of pages identically.
  */
-function scopeLabel(pages: number[] | 'all', total: number): string {
+export function scopeLabel(pages: number[] | 'all', total: number): string {
   if (pages === 'all') {
     return total > 0
       ? `You can edit every page (${total} in total).`

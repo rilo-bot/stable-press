@@ -31,6 +31,7 @@ import {
   inviteEmail,
   roleGrantedEmail,
   magazineShareEmail,
+  magazineInviteEmail,
   magazineSubmittedEmail,
   magazineReviewedEmail,
   magazinePageRemovedEmail,
@@ -194,6 +195,22 @@ export async function sendMagazineShareEmail(opts: {
   scope: string
 }): Promise<{ delivered: boolean }> {
   return send({ to: opts.to, kind: 'magazine share', ...magazineShareEmail(opts) })
+}
+
+/**
+ * The share, for someone with no staff account yet: an invite link that also
+ * names the magazine and the pages. See `magazineInviteEmail`.
+ */
+export async function sendMagazineInviteEmail(opts: {
+  to: string
+  magazineTitle: string
+  sharedBy: string
+  acceptUrl: string
+  scope: string
+  roleLabel: string
+  expiresIn: string
+}): Promise<{ delivered: boolean }> {
+  return send({ to: opts.to, kind: 'magazine invite', ...magazineInviteEmail(opts) })
 }
 
 // ── Magazine submissions & review ───────────────────────────────────────────
