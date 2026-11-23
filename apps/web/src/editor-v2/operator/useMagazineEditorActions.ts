@@ -338,7 +338,7 @@ function publishRefusal(pages?: number[]): string {
 
 // ── Seeing the page ──────────────────────────────────────────────────────────
 
-const stopped = () => new DOMException('The Stable Hand was stopped.', 'AbortError');
+const stopped = () => new DOMException('The AI Assistant was stopped.', 'AbortError');
 
 /**
  * `work`, unless it takes longer than `ms` or the run is stopped. measurePage waits

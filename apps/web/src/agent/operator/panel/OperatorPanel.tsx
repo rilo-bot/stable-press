@@ -149,7 +149,7 @@ export function OperatorPanel({ userId }: { userId: string }) {
       yieldPanel={panelYield}
       sheetLow={sheetLow}
       inStudio={inStudio}
-      closeTitle={working ? 'Hide — The Stable Hand keeps working' : 'Close'}
+      closeTitle={working ? 'Hide — the AI Assistant keeps working' : 'Close'}
       whenHidden={<JobChips variant="floating" />}
       subtitle={
         <>
@@ -194,7 +194,7 @@ export function OperatorPanel({ userId }: { userId: string }) {
       <div ref={scrollRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
         {messages.length === 0 && (
           <div className="space-y-3">
-            <p className="text-sm font-medium text-foreground">Hi, I’m The Stable Hand. What can I do for you?</p>
+            <p className="text-sm font-medium text-foreground">Hi, I’m your AI Assistant. What can I do for you?</p>
             <p className="text-sm text-muted-foreground">
               I can work in Stable Press for you — open screens, fill in forms and run actions while you
               watch. I’ll always ask before anything that publishes, shares or sends.
@@ -325,7 +325,7 @@ export function OperatorPanel({ userId }: { userId: string }) {
               }
             }}
             placeholder={
-              recording ? 'Listening…' : transcribing ? 'Transcribing…' : working ? 'The Stable Hand is working…' : 'Tell me what to do…'
+              recording ? 'Listening…' : transcribing ? 'Transcribing…' : working ? 'The AI Assistant is working…' : 'Tell me what to do…'
             }
             disabled={recording || transcribing}
             // iOS Safari zooms the page into any field under 16px on focus
@@ -338,7 +338,7 @@ export function OperatorPanel({ userId }: { userId: string }) {
               type="button"
               onClick={() => void toggleMic()}
               disabled={transcribing}
-              aria-label={recording ? 'Stop recording' : 'Speak to The Stable Hand'}
+              aria-label={recording ? 'Stop recording' : 'Speak to the AI Assistant'}
               title={recording ? 'Stop & send' : 'Speak'}
               className={
                 'flex h-9 w-9 items-center justify-center rounded-full border transition-colors disabled:opacity-50 ' +
@@ -352,7 +352,7 @@ export function OperatorPanel({ userId }: { userId: string }) {
             <button
               type="button"
               onClick={stopAll}
-              aria-label="Stop The Stable Hand"
+              aria-label="Stop the AI Assistant"
               title="Stop"
               className="flex h-9 flex-shrink-0 items-center gap-1.5 rounded-full border px-3 text-xs font-semibold text-foreground transition-colors hover:bg-muted"
               style={{ borderColor: 'var(--gold-mid)' }}

@@ -93,7 +93,7 @@ export const magazineBuildJobId = (magazineId: string) => `${MAGAZINE_BUILD_JOB}
 export async function settlePreviousBuildJob(magazineId: string, signal?: AbortSignal, timeoutMs = 9000): Promise<void> {
   const end = Date.now() + timeoutMs;
   while (getJobById(magazineBuildJobId(magazineId))?.status === 'running' && Date.now() < end) {
-    if (signal?.aborted) throw new DOMException('The Stable Hand was stopped.', 'AbortError');
+    if (signal?.aborted) throw new DOMException('The AI Assistant was stopped.', 'AbortError');
     await new Promise((r) => setTimeout(r, 250));
   }
 }

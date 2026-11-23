@@ -55,7 +55,7 @@ export function AddHorseChoice({ open, onClose, onGuided, onQuick }: {
               <div style={badgeRow}><span style={recTag}>Recommended</span></div>
               <div style={iconCircle}><Sparkles size={20} style={{ color: 'var(--gold-dark)' }} /></div>
               <div style={cardTitle}>Guided studio</div>
-              <p style={cardDesc}>Photo-first — The Stable Hand walks you through each step with tips, AI &amp; voice.</p>
+              <p style={cardDesc}>Photo-first — the AI Assistant walks you through each step with tips, AI &amp; voice.</p>
               <span style={cta}>Start guided <ArrowRight size={12} /></span>
             </button>
             {/* Quick */}

@@ -169,7 +169,7 @@ export function OnboardingFocus({ open, stepKey, stepIndex, total, title, tips, 
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingTop: 2, flexWrap: 'wrap' }}>
                 {onAsk && (
                   <button type="button" onClick={onAsk} data-agent-id="onboarding.ask" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '6px 12px', fontSize: '0.58rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', borderRadius: 3, border: '1px solid var(--gold-mid)', background: 'rgba(180,140,30,0.12)', color: 'var(--forest-deep)', cursor: 'pointer', ...serifStyle }}>
-                    <Sparkles size={12} style={{ color: 'var(--gold-dark)' }} /> Ask The Stable Hand
+                    <Sparkles size={12} style={{ color: 'var(--gold-dark)' }} /> Ask the AI Assistant
                   </button>
                 )}
                 {skippable && onSkip && (

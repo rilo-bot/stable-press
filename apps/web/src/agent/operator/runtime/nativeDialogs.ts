@@ -289,7 +289,7 @@ export function describeDialogs(records: NativeDialogRecord[]): Array<Record<str
       };
     }
     if (r.type === 'prompt') {
-      return { type: 'prompt', message: r.message.slice(0, 600), answered: 'Cancel — The Stable Hand cannot type into a browser prompt; ask the user to do this step themselves.' };
+      return { type: 'prompt', message: r.message.slice(0, 600), answered: 'Cancel — the AI Assistant cannot type into a browser prompt; ask the user to do this step themselves.' };
     }
     return { type: 'alert', message: r.message.slice(0, 600) };
   });

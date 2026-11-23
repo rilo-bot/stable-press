@@ -38,7 +38,7 @@ export interface SurfaceMeta {
 
 /** Page order: the three the newsroom asks about most first, then the studios. */
 export const SURFACES: SurfaceMeta[] = [
-  { id: 'stable-hand', label: 'The Stable Hand', blurb: 'The in-app assistant that acts for staff', icon: <Bot size={16} />, core: true },
+  { id: 'stable-hand', label: 'AI Assistant', blurb: 'The in-app assistant that acts for staff', icon: <Bot size={16} />, core: true },
   { id: 'magazine-builder', label: 'Magazine Builder', blurb: 'Issue generation, studio chat, Fill / Adjust and imports', icon: <Layers size={16} />, core: true },
   { id: 'story-ai', label: 'Story AI', blurb: 'Story Studio — drafts and files stories', icon: <Newspaper size={16} />, core: true },
   { id: 'article-ai', label: 'Article AI', blurb: 'Article Studio — edits the open article', icon: <SquarePen size={16} />, core: true },

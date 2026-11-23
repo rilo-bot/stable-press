@@ -1368,7 +1368,7 @@ function ImageGenerator({
         >
           <p>
             Charts are drawn from your numbers, not generated — an image model would invent the bars and the labels.
-            Ask the Design Helper or The Stable Hand to “add a bar chart of …” with your exact figures, and it is drawn to scale in this magazine's colours.
+            Ask the Design Helper or the AI Assistant to “add a bar chart of …” with your exact figures, and it is drawn to scale in this magazine's colours.
           </p>
           {style === 'illustration' ? (
             <button

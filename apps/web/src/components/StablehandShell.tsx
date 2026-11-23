@@ -241,7 +241,7 @@ export function StablehandShell({
           <motion.aside
             key="stablehand-rail"
             {...panelAttrs}
-            aria-label="The Stable Hand (collapsed)"
+            aria-label="AI Assistant (collapsed)"
             initial={reduce ? { opacity: 0 } : { x: '100%' }}
             animate={{ x: 0, opacity: 1 }}
             exit={reduce ? { opacity: 0 } : { x: '100%' }}
@@ -255,8 +255,8 @@ export function StablehandShell({
             <button
               type="button"
               onClick={expand}
-              aria-label="Expand The Stable Hand"
-              title="Expand The Stable Hand"
+              aria-label="Expand the AI Assistant"
+              title="Expand the AI Assistant"
               className="flex w-full flex-1 flex-col items-center gap-3 pb-3 pt-3 transition-colors hover:bg-white/5 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-[color:var(--gold-bright)]"
             >
               <span
@@ -282,14 +282,14 @@ export function StablehandShell({
                 className="whitespace-nowrap font-[family-name:var(--font-display)] text-xs font-bold tracking-wide [writing-mode:vertical-rl]"
                 style={{ color: 'var(--parchment)' }}
               >
-                The Stable Hand
+                AI Assistant
                 {working && <span style={{ color: 'var(--gold-bright)' }}> · working…</span>}
               </span>
             </button>
             <button
               type="button"
               onClick={() => setOpen(false)}
-              aria-label="Close The Stable Hand"
+              aria-label="Close the AI Assistant"
               title={closeTitle}
               className={stablehandHeaderBtn + ' mb-3 h-8 w-8 flex-shrink-0'}
               style={{ color: 'var(--gold-bright)' }}
@@ -306,7 +306,7 @@ export function StablehandShell({
           <motion.aside
             key={dock ? 'stablehand-dock' : 'stablehand-sheet'}
             {...panelAttrs}
-            aria-label="The Stable Hand"
+            aria-label="AI Assistant"
             initial={hidden}
             animate={{ opacity: yieldPanel ? 0 : 1, x: 0, y: 0 }}
             exit={hidden}
@@ -331,7 +331,7 @@ export function StablehandShell({
               <div
                 role="separator"
                 aria-orientation="vertical"
-                aria-label="Resize The Stable Hand"
+                aria-label="Resize the AI Assistant"
                 tabIndex={0}
                 title="Drag to resize · double-click to reset"
                 data-resizing={resizing ? 'true' : undefined}
@@ -368,7 +368,7 @@ export function StablehandShell({
                   className="font-[family-name:var(--font-display)] text-sm font-bold"
                   style={{ color: 'var(--parchment)' }}
                 >
-                  The Stable Hand
+                  AI Assistant
                 </div>
                 <div className="flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--gold-mid)' }}>
                   {subtitle}
@@ -392,7 +392,7 @@ export function StablehandShell({
                   <button
                     type="button"
                     onClick={collapse}
-                    aria-label="Collapse The Stable Hand to the side"
+                    aria-label="Collapse the AI Assistant to the side"
                     title="Collapse to the side"
                     className={stablehandHeaderBtn}
                     style={{ color: 'var(--gold-bright)' }}
@@ -403,7 +403,7 @@ export function StablehandShell({
                 <button
                   type="button"
                   onClick={() => setOpen(false)}
-                  aria-label="Close The Stable Hand"
+                  aria-label="Close the AI Assistant"
                   title={closeTitle}
                   className={stablehandHeaderBtn}
                   style={{ color: 'var(--gold-bright)' }}

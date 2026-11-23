@@ -22,7 +22,7 @@ interface AskAgentButtonProps {
 
 export function AskAgentButton({
   prompt,
-  label = 'Ask The Stable Hand',
+  label = 'Ask the AI Assistant',
   variant = 'pill',
   className,
 }: AskAgentButtonProps) {

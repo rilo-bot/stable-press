@@ -205,10 +205,10 @@ export default function StablehandActivityScreen({
       <div className="flex flex-wrap items-start gap-x-4 gap-y-3">
         <div className="min-w-0 flex-1">
           <h1 className="font-[family-name:var(--font-display)] text-[19px] font-bold leading-tight text-foreground">
-            Stable Hand activity
+            AI Assistant activity
           </h1>
           <p className="mt-1 max-w-2xl text-[13px] leading-relaxed text-muted-foreground">
-            Every run of The Stable Hand — what it was asked, the steps it took, the tokens it used and what that
+            Every run of the AI Assistant — what it was asked, the steps it took, the tokens it used and what that
             cost, as billed by OpenRouter.
           </p>
         </div>
@@ -274,7 +274,7 @@ export default function StablehandActivityScreen({
         >
           {usage.data ? (
             <DailyChart
-              subject="The Stable Hand"
+              subject="AI Assistant"
               unit="run"
               days={usage.data.days.map((d) => ({ ...d, count: d.runs }))}
             />
@@ -300,8 +300,8 @@ export default function StablehandActivityScreen({
               <p className="text-[13px] font-semibold text-foreground">No runs in the last {windowId} days</p>
               <p className="max-w-sm text-[12px] text-muted-foreground">
                 {everyone
-                  ? 'Nobody has asked The Stable Hand to do anything in this window.'
-                  : 'Open The Stable Hand from the bottom-right corner and ask it to do something — each run lands here.'}
+                  ? 'Nobody has asked the AI Assistant to do anything in this window.'
+                  : 'Open the AI Assistant from the bottom-right corner and ask it to do something — each run lands here.'}
               </p>
             </div>
           ) : (
@@ -366,7 +366,7 @@ function BudgetCard({ today }: { today?: UsageReport['today'] }) {
       <div
         className="mt-3 h-2.5 overflow-hidden rounded-full border border-border bg-muted"
         role="meter"
-        aria-label="Today's The Stable Hand spend against your daily limit"
+        aria-label="Today's AI Assistant spend against your daily limit"
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={pct}
@@ -381,7 +381,7 @@ function BudgetCard({ today }: { today?: UsageReport['today'] }) {
         {!today
           ? ' '
           : ratio >= 1
-            ? 'Daily limit reached — The Stable Hand pauses until tomorrow.'
+            ? 'Daily limit reached — the AI Assistant pauses until tomorrow.'
             : near
               ? `${pct}% used — close to today's limit.`
               : `${pct}% of your daily limit used.`}

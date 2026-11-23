@@ -297,7 +297,7 @@ function ConciergeWidget() {
             {/* The greeting, set as The Stable Hand's first message (static — no model call). */}
             <div className="flex justify-start">
               <div className="max-w-[85%] rounded-2xl rounded-bl-sm bg-muted px-3 py-2 text-sm text-foreground">
-                <p className="font-medium">Hi, I’m The Stable Hand. What can I do for you?</p>
+                <p className="font-medium">Hi, I’m your AI Assistant. What can I do for you?</p>
                 <p className="mt-1 text-muted-foreground">
                   I can find horses, people and bulletins, explain tipping, and help with your own stable.
                 </p>
@@ -443,7 +443,7 @@ function ConciergeWidget() {
             type="button"
             onClick={() => void toggleMic()}
             disabled={transcribing}
-            aria-label={recording ? 'Stop recording' : 'Speak to The Stable Hand'}
+            aria-label={recording ? 'Stop recording' : 'Speak to the AI Assistant'}
             title={recording ? 'Stop & send' : 'Speak'}
             className={
               'flex h-9 w-9 items-center justify-center rounded-full border transition-colors disabled:opacity-50 ' +

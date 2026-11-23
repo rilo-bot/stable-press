@@ -163,7 +163,7 @@ const INLINE_COPY_WAIT_MS = 30_000;
 /** `p`'s value if it settles within `ms`, else null; an AbortError on Stop. */
 function within<T>(p: Promise<T>, ms: number, signal: AbortSignal): Promise<T | null> {
   return new Promise<T | null>((resolve, reject) => {
-    if (signal.aborted) return reject(new DOMException('The Stable Hand was stopped.', 'AbortError'));
+    if (signal.aborted) return reject(new DOMException('The AI Assistant was stopped.', 'AbortError'));
     const done = () => {
       clearTimeout(t);
       signal.removeEventListener('abort', onAbort);
@@ -174,7 +174,7 @@ function within<T>(p: Promise<T>, ms: number, signal: AbortSignal): Promise<T | 
     }, ms);
     const onAbort = () => {
       done();
-      reject(new DOMException('The Stable Hand was stopped.', 'AbortError'));
+      reject(new DOMException('The AI Assistant was stopped.', 'AbortError'));
     };
     signal.addEventListener('abort', onAbort, { once: true });
     p.then(

@@ -53,7 +53,7 @@ export function isEnabled(agentId: string): boolean {
   return !!el && !(el as HTMLButtonElement).disabled;
 }
 
-const abortError = () => new DOMException('The Stable Hand was stopped.', 'AbortError');
+const abortError = () => new DOMException('The AI Assistant was stopped.', 'AbortError');
 
 /**
  * Poll `pred` until it returns a truthy value, the timeout passes (throws with

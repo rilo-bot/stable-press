@@ -42,7 +42,7 @@ export function ConfirmCard() {
       initial={reduce ? false : { opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       role="alertdialog"
-      aria-label="The Stable Hand needs your OK"
+      aria-label="The AI Assistant needs your OK"
       className="rounded-xl border-2 p-3 shadow-md"
       style={{ borderColor: 'var(--gold-bright)', background: 'linear-gradient(180deg, rgba(212,168,67,0.12), rgba(212,168,67,0.04))' }}
     >
@@ -90,7 +90,7 @@ export function PausedBanner({ onStop }: { onStop: () => void }) {
         <Pause className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--gold-dark)' }} />
       )}
       <span className="min-w-0 flex-1 leading-snug text-foreground">
-        {reason === 'takeover' ? 'You took over — The Stable Hand paused.' : 'The Stable Hand is paused.'}
+        {reason === 'takeover' ? 'You took over — the AI Assistant paused.' : 'The AI Assistant is paused.'}
       </span>
       <button
         type="button"

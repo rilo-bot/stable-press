@@ -36,9 +36,9 @@ export interface TourStep {
 
 const STABLE_HAND: TourStep = {
   id: 'stablehand',
-  title: 'Meet The Stable Hand, your co-pilot',
+  title: 'Meet your AI Assistant',
   body:
-    'The Stable Hand can help you with any task on this platform. Ask in plain words — "share page 2 with Sam", "tighten the copy on this page", "find a photo of a winning finish", "file a story" — and it does the work while you watch, step by step. It always checks with you before anything is published, shared or sent.',
+    'Your AI Assistant can help you with any task on this platform. Ask in plain words — "share page 2 with Sam", "tighten the copy on this page", "find a photo of a winning finish", "file a story" — and it does the work while you watch, step by step. It always checks with you before anything is published, shared or sent.',
   target: '[data-tour="stablehand"]',
   copilot: true,
 };

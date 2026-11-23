@@ -33,7 +33,7 @@ const CLICK_MS = 220;
 const TOP_PAD = 64;
 const EDGE_PAD = 8;
 
-const abortError = () => new DOMException('The Stable Hand was stopped.', 'AbortError');
+const abortError = () => new DOMException('The AI Assistant was stopped.', 'AbortError');
 
 function throwIfAborted(signal?: AbortSignal) {
   if (signal?.aborted) throw abortError();

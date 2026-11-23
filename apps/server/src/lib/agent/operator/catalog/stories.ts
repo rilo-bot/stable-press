@@ -35,7 +35,7 @@ const STORY_ACTIONS: CatalogAction[] = [
   {
     name: 'stories.createDraft',
     description:
-      "THE way to file / write a story. You (The Stable Hand) write the text yourself — headline and the full story copy — and this types it visibly into File a Story → Write it yourself, picks the category pill, fills the byline and presses Save Draft. body is the full copy (paragraphs separated by a blank line; plain text, no markdown); summary is an optional teaser that becomes the opening paragraph (the card/news-index teaser) unless body already starts with it. category is one of: Race Reports, Industry News, Morning Edition, Form Guide, Track Notes, Bloodstock, Trainer Profiles, Jockey Desk, Owner Stories (label or slug). author defaults to the signed-in user (contributors are always their own byline). Never invent facts — ask the user for what you do not know. Returns { created: true, storyId, title, story }.",
+      "THE way to file / write a story. You (the AI Assistant) write the text yourself — headline and the full story copy — and this types it visibly into File a Story → Write it yourself, picks the category pill, fills the byline and presses Save Draft. body is the full copy (paragraphs separated by a blank line; plain text, no markdown); summary is an optional teaser that becomes the opening paragraph (the card/news-index teaser) unless body already starts with it. category is one of: Race Reports, Industry News, Morning Edition, Form Guide, Track Notes, Bloodstock, Trainer Profiles, Jockey Desk, Owner Stories (label or slug). author defaults to the signed-in user (contributors are always their own byline). Never invent facts — ask the user for what you do not know. Returns { created: true, storyId, title, story }.",
     args: '{ title: string /* 1-300 chars */; summary?: string; body?: string; category?: string; author?: string }',
   },
   {
@@ -60,14 +60,14 @@ const STORY_ACTIONS: CatalogAction[] = [
   {
     name: 'stories.edit',
     description:
-      "Revise a story through the Revise the Story form, then Save Revision: headline, copy and/or category. You (The Stable Hand) write any new text yourself. body REPLACES the whole story copy (summary, if given, becomes its opening paragraph; summary alone replaces the copy too — pass the full text). Asks to confirm when the story is already published (live).",
+      "Revise a story through the Revise the Story form, then Save Revision: headline, copy and/or category. You (the AI Assistant) write any new text yourself. body REPLACES the whole story copy (summary, if given, becomes its opening paragraph; summary alone replaces the copy too — pass the full text). Asks to confirm when the story is already published (live).",
     args: '{ storyId: string; title?: string; summary?: string; body?: string; category?: string }',
     confirms: true,
   },
   {
     name: 'stories.editBody',
     description:
-      "Replace a story's full copy with new text you (The Stable Hand) wrote, typed into the Revise the Story form, then Save Revision. Same as stories.edit with only body. Asks to confirm when the story is live.",
+      "Replace a story's full copy with new text you (the AI Assistant) wrote, typed into the Revise the Story form, then Save Revision. Same as stories.edit with only body. Asks to confirm when the story is live.",
     args: '{ storyId: string; body: string }',
     confirms: true,
   },

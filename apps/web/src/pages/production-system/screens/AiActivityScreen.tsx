@@ -107,7 +107,7 @@ export default function AiActivityScreen() {
                 AI activity
               </h1>
               <p className="mt-1 max-w-2xl text-[13px] leading-relaxed text-muted-foreground">
-                What every AI in Stable Press has done and what it cost — The Stable Hand, the Magazine Builder, Story AI
+                What every AI in Stable Press has done and what it cost — the AI Assistant, the Magazine Builder, Story AI
                 and the other studios. Open one to see its usage in detail.
               </p>
             </>

@@ -132,8 +132,8 @@ export function OverviewMasthead({
             )}
           </p>
           <div className="flex flex-shrink-0 items-center gap-2">
-            <BandButton agentId="overview.ask" onClick={onAskAgent} title="Ask The Stable Hand about your desk">
-              <Wand2 size={12} /> Ask The Stable Hand
+            <BandButton agentId="overview.ask" onClick={onAskAgent} title="Ask the AI Assistant about your desk">
+              <Wand2 size={12} /> Ask the AI Assistant
             </BandButton>
             <BandButton agentId="overview.refresh-brief" onClick={onRefreshBrief} disabled={briefLoading} title="Regenerate the brief">
               <RefreshCw size={12} className={briefLoading ? 'animate-spin' : ''} />

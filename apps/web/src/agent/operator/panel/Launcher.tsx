@@ -59,7 +59,7 @@ export function StablehandLauncher({
         <motion.button
           // The first-run tour points here (components/tour/tourSteps.ts).
           data-tour="stablehand"
-          aria-label={open ? 'Close The Stable Hand' : 'Ask The Stable Hand'}
+          aria-label={open ? 'Close the AI Assistant' : 'Ask the AI Assistant'}
           onClick={onClick}
           whileHover={{ scale: 1.05 }}
           whileTap={{ scale: 0.95 }}
@@ -81,7 +81,7 @@ export function StablehandLauncher({
             )}
             <img src="/images/favicon-gold.png" alt="" className="h-5 w-5 object-contain" />
           </span>
-          <span className="max-md:sr-only">{working ? 'The Stable Hand is working…' : 'The Stable Hand'}</span>
+          <span className="max-md:sr-only">{working ? 'AI Assistant is working…' : 'AI Assistant'}</span>
         </motion.button>
       </div>
     );
@@ -91,7 +91,7 @@ export function StablehandLauncher({
     <motion.button
       // The first-run tour points here (components/tour/tourSteps.ts).
       data-tour="stablehand"
-      aria-label={open ? 'Close The Stable Hand' : 'Ask The Stable Hand'}
+      aria-label={open ? 'Close the AI Assistant' : 'Ask the AI Assistant'}
       onClick={onClick}
       whileHover={{ scale: 1.08 }}
       whileTap={{ scale: 0.9 }}

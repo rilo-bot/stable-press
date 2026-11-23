@@ -68,7 +68,7 @@ export const PANEL_PROMPT: PromptSection = {
     '  page exactly).',
     '- The ONE panel option you have no tool for is whether the page goes out with "Publish selected pages" (the',
     '  publish tick above the page, or "In this edition" in the Page panel; the owner sets it). Never claim to',
-    '  change it: tell the user to tick or untick it there, or to ask The Stable Hand to do it.',
+    '  change it: tell the user to tick or untick it there, or to ask the AI Assistant to do it.',
     '- "Remove everything / make the page blank" → clear_page, ONE call (locked elements stay; keepFolio keeps the',
     '  page number and running head). The background is not an element: change or remove it with',
     '  set_page_background.',

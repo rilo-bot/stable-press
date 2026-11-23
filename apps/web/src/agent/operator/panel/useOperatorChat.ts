@@ -340,8 +340,8 @@ export function useOperatorChat(userId: string) {
     } catch {
       /* not JSON */
     }
-    if (code === 403) errorText = 'The Stable Hand acts in the app for staff and invited team members.';
-    else if (code === 429) errorText = serverMsg ?? 'The Stable Hand has reached today’s limit. Please try again tomorrow.';
+    if (code === 403) errorText = 'The AI Assistant acts in the app for staff and invited team members.';
+    else if (code === 429) errorText = serverMsg ?? 'The AI Assistant has reached today’s limit. Please try again tomorrow.';
     // Too many messages (route cap) or too many bytes (every request re-sends
     // the thread's inline attachments). Retrying can never succeed, and the
     // generic "try again" line left the user retrying a dead thread.

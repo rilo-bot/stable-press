@@ -428,7 +428,7 @@ function TourOverlay({
                   Finish
                 </Button>
                 <Button ref={primaryRef} size="sm" onClick={() => onFinish(true)}>
-                  Try The Stable Hand
+                  Try the AI Assistant
                 </Button>
               </>
             ) : (

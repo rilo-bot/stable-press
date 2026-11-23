@@ -111,11 +111,11 @@ export function OperatorPresence() {
     ? ''
     : paused
       ? pauseReason === 'takeover'
-        ? 'The Stable Hand paused — you took over.'
-        : 'The Stable Hand paused.'
+        ? 'The AI Assistant paused — you took over.'
+        : 'The AI Assistant paused.'
       : stepLabel
-        ? `The Stable Hand: ${stepLabel}`
-        : 'The Stable Hand is working.';
+        ? `AI Assistant: ${stepLabel}`
+        : 'The AI Assistant is working.';
 
   return createPortal(
     // `contents` = no box of its own: zero layout impact on <body>, and no
@@ -283,8 +283,8 @@ function WorkingPill({ paused, pauseReason, stepLabel, progress }: PillProps) {
                 )
               ) : (
                 <>
-                  <span className="sm:hidden">The Stable Hand</span>
-                  <span className="hidden sm:inline">The Stable Hand is working here</span>
+                  <span className="sm:hidden">AI Assistant</span>
+                  <span className="hidden sm:inline">AI Assistant is working here</span>
                 </>
               )}
             </span>
@@ -308,11 +308,11 @@ function WorkingPill({ paused, pauseReason, stepLabel, progress }: PillProps) {
 
           <div className="ml-1 flex flex-shrink-0 items-center gap-1">
             {paused && (
-              <PillButton onClick={resume} label="Resume" ariaLabel="Resume The Stable Hand" primary>
+              <PillButton onClick={resume} label="Resume" ariaLabel="Resume the AI Assistant" primary>
                 <Play className="h-3 w-3" fill="currentColor" />
               </PillButton>
             )}
-            <PillButton onClick={stop} label="Stop" ariaLabel="Stop The Stable Hand">
+            <PillButton onClick={stop} label="Stop" ariaLabel="Stop the AI Assistant">
               <Square className="h-2.5 w-2.5" fill="currentColor" />
             </PillButton>
           </div>

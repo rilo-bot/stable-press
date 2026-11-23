@@ -84,7 +84,7 @@ let resumeWaiters: Array<{ resolve: () => void; reject: (e: unknown) => void }> 
 let seq = 0;
 const nextId = () => `op-${Date.now().toString(36)}-${(seq++).toString(36)}`;
 
-const abortError = () => new DOMException('The Stable Hand was stopped.', 'AbortError');
+const abortError = () => new DOMException('The AI Assistant was stopped.', 'AbortError');
 
 function flushWaiters(ok: boolean) {
   const w = resumeWaiters;

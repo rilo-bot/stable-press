@@ -12,7 +12,7 @@ import { looksLikeId, nameFromAgentId } from './humanRef';
 
 export const OPERATOR_UI_SEL = `[${OPERATOR_UI_ATTR}]`;
 
-export const abortError = () => new DOMException('The Stablehand was stopped.', 'AbortError');
+export const abortError = () => new DOMException('The AI Assistant was stopped.', 'AbortError');
 
 export function isAbortError(e: unknown): boolean {
   return (

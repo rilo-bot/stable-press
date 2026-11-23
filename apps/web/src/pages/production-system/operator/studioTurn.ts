@@ -16,7 +16,7 @@ import { agentSel } from '@/agent/operator/contracts';
 import type { UiDriver } from '@/agent/operator/contracts';
 import type { StudioChatMirror } from '@/stores/storyStudioUiStore';
 
-const abortError = () => new DOMException('The Stable Hand was stopped.', 'AbortError');
+const abortError = () => new DOMException('The AI Assistant was stopped.', 'AbortError');
 
 /** Resolve after `ms`, or reject with an AbortError when the run is stopped. */
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {

@@ -24,7 +24,7 @@ const ASK_STUDIO: CatalogAction = {
 const CREATE: CatalogAction = {
   name: 'blog.create',
   description:
-    "THE way to write a new blog post. Creates a DRAFT through the New post form (title + optional standfirst, byline, category, summary = card summary), then the editor opens on it. You (The Stable Hand) write the text yourself: pass the whole body as markdown here (## headings, - lists, > quotes, blank-line paragraphs; open with a paragraph, not a heading — a leading heading is dropped, the title is already the headline) and it is written into the editor straight after creating — or call blog.writeBody once the editor is open. Returns { created, blogId, path, bodyWritten? }.",
+    "THE way to write a new blog post. Creates a DRAFT through the New post form (title + optional standfirst, byline, category, summary = card summary), then the editor opens on it. You (the AI Assistant) write the text yourself: pass the whole body as markdown here (## headings, - lists, > quotes, blank-line paragraphs; open with a paragraph, not a heading — a leading heading is dropped, the title is already the headline) and it is written into the editor straight after creating — or call blog.writeBody once the editor is open. Returns { created, blogId, path, bodyWritten? }.",
   args: '{ title: string /* 1-300 chars */; standfirst?: string; byline?: string; category?: string; summary?: string; markdown?: string }',
 }
 
@@ -137,7 +137,7 @@ export const SURFACES: CatalogSurface[] = [
       {
         name: 'blog.writeBody',
         description:
-          "Write the open post's body. You (The Stable Hand) write the text yourself — pass it as markdown (## / ### headings, - or 1. lists, **Lead:** list points, > quotes with a final '— Name' line, blank-line paragraphs; a leading heading is dropped; inline bold/links are flattened to plain text) or as paragraphs[]. mode 'replace' (default) rewrites the main body's writing but keeps photos/galleries/embeds; 'append' adds after the last block. Applied through the editor's own undoable path (Ctrl+Z works) and autosaved. Asks to confirm when the post is live.",
+          "Write the open post's body. You (the AI Assistant) write the text yourself — pass it as markdown (## / ### headings, - or 1. lists, **Lead:** list points, > quotes with a final '— Name' line, blank-line paragraphs; a leading heading is dropped; inline bold/links are flattened to plain text) or as paragraphs[]. mode 'replace' (default) rewrites the main body's writing but keeps photos/galleries/embeds; 'append' adds after the last block. Applied through the editor's own undoable path (Ctrl+Z works) and autosaved. Asks to confirm when the post is live.",
         args: "{ markdown?: string; paragraphs?: string[]; mode?: 'replace' | 'append' }",
         confirms: true,
       },

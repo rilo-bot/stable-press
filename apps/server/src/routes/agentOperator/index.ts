@@ -114,7 +114,7 @@ router.post(
   attachAccount,
   (req, res, next) => {
     if (!isAdmin(req.account)) {
-      res.status(403).json({ error: 'The Stable Hand acts in the app for staff and invited team members.' })
+      res.status(403).json({ error: 'The AI Assistant acts in the app for staff and invited team members.' })
       return
     }
     next()
@@ -131,7 +131,7 @@ router.post(
   (req, res) => {
     operatorTurn(req, res).catch((err: unknown) => {
       console.error('[agent-operator] error:', err)
-      if (!res.headersSent) res.status(500).json({ error: 'The Stable Hand hit a snag. Please try again.' })
+      if (!res.headersSent) res.status(500).json({ error: 'The AI Assistant hit a snag. Please try again.' })
     })
   },
 )
@@ -140,7 +140,7 @@ async function operatorTurn(req: Request, res: Response): Promise<void> {
   if (!isAgentConfigured()) {
     res
       .status(503)
-      .json({ error: 'The Stable Hand is resting — OPENROUTER_API_KEY is not configured on the server.' })
+      .json({ error: 'The AI Assistant is resting — OPENROUTER_API_KEY is not configured on the server.' })
     return
   }
 
@@ -158,7 +158,7 @@ async function operatorTurn(req: Request, res: Response): Promise<void> {
   // Only when a cap is configured (off by default) — and then without a DB read otherwise.
   const cap = dailyBudgetUsd()
   if (cap !== null && (await spentTodayUsd(account.id)) >= cap) {
-    res.status(429).json({ error: "You've reached today's Stable Hand limit — it resets tomorrow." })
+    res.status(429).json({ error: "You've reached today's AI Assistant limit — it resets tomorrow." })
     return
   }
 
@@ -230,7 +230,7 @@ async function operatorTurn(req: Request, res: Response): Promise<void> {
   } catch (err) {
     console.error('[agent-operator] error:', err)
     if (!res.headersSent) {
-      res.status(500).json({ error: 'The Stable Hand hit a snag. Please try again.' })
+      res.status(500).json({ error: 'The AI Assistant hit a snag. Please try again.' })
     }
   }
 }
@@ -249,7 +249,7 @@ async function operatorTurn(req: Request, res: Response): Promise<void> {
 
 function staffOnly(req: Request, res: Response, next: NextFunction): void {
   if (!isAdmin(req.account)) {
-    res.status(403).json({ error: 'Stable Hand activity is for staff and invited team members.' })
+    res.status(403).json({ error: 'AI Assistant activity is for staff and invited team members.' })
     return
   }
   next()
@@ -262,7 +262,7 @@ function read(fn: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response): void => {
     fn(req, res).catch((err: unknown) => {
       console.error('[agent-operator] activity read failed:', err instanceof Error ? err.message : err)
-      if (!res.headersSent) res.status(500).json({ error: 'Could not load Stable Hand activity.' })
+      if (!res.headersSent) res.status(500).json({ error: 'Could not load AI Assistant activity.' })
     })
   }
 }
@@ -271,7 +271,7 @@ function read(fn: (req: Request, res: Response) => Promise<void>) {
 function scopeOf(req: Request, res: Response): 'mine' | 'all' | null {
   if (req.query.scope !== 'all') return 'mine'
   if (canSeeAllRuns(req.account)) return 'all'
-  res.status(403).json({ error: "Seeing everyone's Stable Hand runs needs the Analytics permission." })
+  res.status(403).json({ error: "Seeing everyone's AI Assistant runs needs the Analytics permission." })
   return null
 }
 
