@@ -8,8 +8,13 @@
 //               points at the real controls in front of them.
 //   campaign  — anywhere else in the Campaign Engine (a Team-screen invite lands on
 //               its home), pointing at the sidebar.
-// Both are three steps (welcome, where the work is, the AI Assistant) and END
-// ON THE AI ASSISTANT: the one thing every newcomer should leave knowing about.
+// Both are four steps (welcome, where the work is, the AI Assistant's button,
+// then the panel it opens — talk or attach a PDF) and END ON THE AI ASSISTANT:
+// the one thing every newcomer should leave knowing about.
+//
+// PANEL: the launcher only shows while the assistant is closed, and the composer
+// only while it is open — so a step says which it needs (`panel`) and the tour
+// opens / closes it on arrival, Back included.
 //
 // TARGETS are comma-separated CSS selectors, tried in order (first one showing
 // wins) — so list the preferred target first. Most reuse the Stable Hand's own `data-agent-id`
@@ -23,10 +28,40 @@
 
 export type TourVariant = 'magazine' | 'campaign';
 
+/**
+ * A control inside the AI Assistant's composer, explained on the composer step
+ * (with the same icon as the real button, which shows in the cut-out above).
+ *   voice   — the microphone. Only listed where it will actually be there (the
+ *             server has voice on and this browser can record), as the panel does.
+ *   attach  — the paperclip: a PDF or a photo.
+ */
+export type TourHighlight = 'voice' | 'attach';
+
+export const TOUR_HIGHLIGHT_COPY: Record<TourHighlight, { title: string; body: string }> = {
+  voice: {
+    title: 'Talk instead of typing',
+    body: 'Press the microphone, say what you need, then press it again to send.',
+  },
+  attach: {
+    title: 'Share a PDF or photo',
+    body: 'Press the paperclip to add a PDF or picture, then ask about it.',
+  },
+};
+
 export interface TourStep {
   id: string;
   title: string;
   body: string;
+  /** Composer controls to show on the card (see TourHighlight). */
+  highlights?: TourHighlight[];
+  /** Title/body to use when there is no microphone (voice off, or the browser
+   *  can't record) — so the step never promises a button that isn't there. */
+  withoutVoice?: { title: string; body: string };
+  /** The AI Assistant panel this step needs: opened or closed on arrival. */
+  panel?: 'open' | 'closed';
+  /** A soft gold pulse round the target. Meant for a small button: on a wide
+   *  target the expanding ring would swamp the screen. */
+  pulse?: boolean;
   /** Selector list — the first match that is actually visible wins. */
   target?: string;
   optional?: boolean;
@@ -41,6 +76,24 @@ const STABLE_HAND: TourStep = {
     'Click this gold button whenever you need anything. Just type what you want in your own words, for example "share this page with Sam", and your AI Assistant will do it for you. It always asks you before sending or sharing anything.',
   target: '[data-tour="stablehand"]',
   copilot: true,
+  panel: 'closed',
+  pulse: true,
+};
+
+// The panel that button opens, pointing at the real composer row: the paperclip
+// on the left, the microphone beside Send.
+const ASSISTANT_COMPOSER: TourStep = {
+  id: 'assistant-composer',
+  title: 'Talk to it, or share a file',
+  body: 'This is where you tell your AI Assistant what to do. Type here, or use these buttons:',
+  withoutVoice: {
+    title: 'Share a PDF or photo',
+    body: 'This is where you tell your AI Assistant what to do. Type here, or use this button:',
+  },
+  target: '[data-tour="assistant-composer"]',
+  copilot: true,
+  panel: 'open',
+  highlights: ['voice', 'attach'],
 };
 
 // Kept deliberately short: the people joining are often new to tools like this,
@@ -59,6 +112,7 @@ const STEPS: Record<TourVariant, TourStep[]> = {
       target: '[data-tour="mag-canvas"]',
     },
     STABLE_HAND,
+    ASSISTANT_COMPOSER,
   ],
   campaign: [
     {
@@ -74,6 +128,7 @@ const STEPS: Record<TourVariant, TourStep[]> = {
       optional: true,
     },
     STABLE_HAND,
+    ASSISTANT_COMPOSER,
   ],
 };
 

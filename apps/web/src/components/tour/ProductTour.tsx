@@ -25,13 +25,16 @@ import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type 
 import { createPortal } from 'react-dom';
 import { useLocation } from 'react-router-dom';
 import { useReducedMotion } from 'framer-motion';
-import { ArrowLeft, ArrowRight, X } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Mic, Paperclip, X } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { useAuthStore } from '@/stores/authStore';
 import { useAgentUi } from '@/stores/agentUiStore';
 import { useTourStore } from '@/stores/tourStore';
-import { tourSteps, tourVariantFor, type TourStep, type TourVariant } from './tourSteps';
+import { isRecordingSupported, isVoiceEnabled } from '@/agent/voice/voiceClient';
+import { TOUR_HIGHLIGHT_COPY, tourSteps, tourVariantFor, type TourStep, type TourVariant } from './tourSteps';
+
+const HIGHLIGHT_ICON = { voice: Mic, attach: Paperclip } as const;
 
 /** What must be on screen before the tour starts pointing at things. */
 const READY_SELECTOR: Record<TourVariant, string> = {
@@ -160,14 +163,27 @@ export function ProductTour() {
     if (!tourPending && !replayRequested) return;
     const signal = { cancelled: false };
     void (async () => {
+      // Asked alongside the wait, not after it: the answer is cached per session,
+      // and the panel itself uses it to decide whether its mic button shows.
+      const voice = isRecordingSupported() ? isVoiceEnabled() : Promise.resolve(false);
       await whenOnScreen(READY_SELECTOR[variantHere], READY_TIMEOUT_MS, signal);
       await new Promise((r) => setTimeout(r, SETTLE_MS));
+      const voiceReady = await voice;
       if (signal.cancelled) return;
       // The Stable Hand step points at its launcher, which only shows while the
       // panel is closed. The last card offers to open it again.
       useAgentUi.getState().setOpen(false);
       const all = tourSteps(variantHere);
-      setSteps(all.filter((s) => !s.optional || !!findTarget(s)));
+      setSteps(
+        all
+          .filter((s) => !s.optional || !!findTarget(s))
+          // Never describe a microphone this person won't find in the panel.
+          .map((s) =>
+            s.highlights && !voiceReady
+              ? { ...s, ...s.withoutVoice, highlights: s.highlights.filter((h) => h !== 'voice') }
+              : s,
+          ),
+      );
       useTourStore.getState().start(variantHere, !tourPending);
     })();
     return () => {
@@ -190,7 +206,9 @@ export function ProductTour() {
       const replay = useTourStore.getState().isReplay;
       useTourStore.getState().stop();
       if (!replay) void completeTour();
-      if (openCopilot) useAgentUi.getState().setOpen(true);
+      // The tour closed the panel when it started and opened it for the composer
+      // step; it ends the way the person chose: open on "Try", closed otherwise.
+      useAgentUi.getState().setOpen(openCopilot);
     },
     [completeTour],
   );
@@ -234,6 +252,13 @@ function TourOverlay({
   const [target, setTarget] = useState<Rect | null>(null);
   const [cardStyle, setCardStyle] = useState<CSSProperties>({ visibility: 'hidden' });
   const isLast = index === total - 1;
+
+  // Open / close the AI Assistant for the steps that need it — on Back too, so
+  // stepping back from the composer brings the launcher back. The target is
+  // re-measured every frame, so the cut-out settles once the panel has slid in.
+  useEffect(() => {
+    if (step.panel) useAgentUi.getState().setOpen(step.panel === 'open');
+  }, [step]);
 
   // Bring the target into view when the step changes (the review button can be
   // off to the side on a narrow window).
@@ -340,9 +365,9 @@ function TourOverlay({
               boxShadow: '0 0 0 2px var(--gold-bright), 0 0 0 9999px rgba(8, 14, 11, 0.62)',
             }}
           />
-          {/* The co-pilot step is the one to remember: a soft gold pulse draws
-              the eye to it (none with reduced motion). */}
-          {step.copilot && !reduce && (
+          {/* The launcher is the one to remember: a soft gold pulse draws the
+              eye to it (none with reduced motion). */}
+          {step.pulse && !reduce && (
             <div
               aria-hidden
               className={`pointer-events-none absolute animate-ping ${target.round ? 'rounded-full' : 'rounded-lg'}`}
@@ -398,6 +423,31 @@ function TourOverlay({
         <p id={bodyId} className="text-base leading-relaxed text-foreground/85 sm:text-lg">
           {step.body}
         </p>
+
+        {/* Composer controls, drawn like the real buttons showing in the cut-out
+            so they're easy to match up. Not buttons here — nothing to press yet. */}
+        {step.highlights && step.highlights.length > 0 && (
+          <ul className="mt-4 space-y-3">
+            {step.highlights.map((h) => {
+              const Icon = HIGHLIGHT_ICON[h];
+              const copy = TOUR_HIGHLIGHT_COPY[h];
+              return (
+                <li key={h} className="flex items-start gap-3">
+                  <span
+                    aria-hidden
+                    className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-full border border-border text-muted-foreground"
+                  >
+                    <Icon className="h-4 w-4" />
+                  </span>
+                  <span className="text-sm leading-snug text-foreground/85 sm:text-base">
+                    <span className="block font-semibold text-foreground">{copy.title}</span>
+                    {copy.body}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
 
         {/* Progress — one segment per step. */}
         <div className="mt-5 flex gap-1.5" aria-hidden>

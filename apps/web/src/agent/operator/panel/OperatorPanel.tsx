@@ -43,15 +43,49 @@ import { isJobUpdateMessage } from './jobUpdates';
 import { choiceCardState, messageChoices } from '@/agent/choices/choices';
 import { ConfirmCard, PausedBanner } from './ConfirmCard';
 import { StablehandShell, stablehandHeaderBtn } from '@/components/StablehandShell';
+import { useCan } from '@/lib/permissions';
+import { useEditorStore } from '@/editor-v2/store';
+import { describePage } from './pageContext';
 
 const GOLD = 'hsl(var(--brand-accent))';
 
-const OPERATOR_STARTERS = [
-  'Create a new magazine',
-  'Share a magazine page with a teammate',
-  'File a story with AI',
-  'What can you do on this screen?',
-];
+/**
+ * The empty-state starter pills — only the ones this person can actually do.
+ * A pill is a promise: offering "Create a new magazine" to a role the server
+ * refuses (`magazine.create`) only leads to a run that ends in a 403. Every
+ * answer comes from the server-resolved access (useCan), like the rest of the UI.
+ *
+ * Sharing is owner-only on the server (POST /issues/:id/collaborators). Inside a
+ * magazine that means owning THIS one — a "Shared with you" collaborator can't.
+ * Anywhere else it means being able to make magazines of your own.
+ */
+function useOperatorStarters(pathname: string): string[] {
+  const mayCreateMagazine = useCan('magazine.create');
+  const mayFileStory = useCan('stories.create');
+  const mayEditMagazines = useCan('magazine.edit');
+  const ctx = describePage(pathname);
+  const openMagazineId = ctx.entity?.type === 'magazine' ? ctx.entity.id : null;
+  // The editor store only describes the magazine on screen once it has loaded
+  // THAT one — a stale issue from the last magazine must not answer for this one.
+  const openMagazineRole = useEditorStore((s) =>
+    openMagazineId && s.issueId === openMagazineId ? (s.issue?.myRole ?? null) : undefined,
+  );
+  const mayShare = openMagazineId
+    ? openMagazineRole === 'owner' || (openMagazineRole === undefined && mayCreateMagazine)
+    : mayCreateMagazine;
+  // A collaborator inside a magazine they can edit: the useful thing to offer is
+  // help with the pages they were given.
+  // (`magazine.edit` gates every write server-side; without it they're view-only.)
+  const mayEditHere = mayEditMagazines && !!openMagazineRole && openMagazineRole !== 'owner';
+
+  return [
+    mayCreateMagazine && 'Create a new magazine',
+    mayShare && 'Share a magazine page with a teammate',
+    mayEditHere && 'Help me edit this page',
+    mayFileStory && 'File a story with AI',
+    'What can you do on this screen?',
+  ].filter((s): s is string => !!s);
+}
 
 function messageText(m: { parts?: Array<{ type: string; text?: string }> }): string {
   return (m.parts ?? [])
@@ -74,6 +108,7 @@ export function OperatorPanel({ userId }: { userId: string }) {
   const reduce = useReducedMotion();
   const navigate = useNavigate();
   const { pathname } = useLocation();
+  const starters = useOperatorStarters(pathname);
 
   /** Replay the first-run tour. It runs on a staff screen, so from the public
    *  site go to the Campaign Engine first; ProductTour starts it once it's there. */
@@ -200,7 +235,7 @@ export function OperatorPanel({ userId }: { userId: string }) {
               watch. I’ll always ask before anything that publishes, shares or sends.
             </p>
             <div className="flex flex-wrap gap-2">
-              {OPERATOR_STARTERS.map((s) => (
+              {starters.map((s) => (
                 <button
                   key={s}
                   onClick={() => send(s)}
@@ -287,7 +322,9 @@ export function OperatorPanel({ userId }: { userId: string }) {
       {/* Composer */}
       <div className="flex-shrink-0 border-t border-border bg-card pb-[env(safe-area-inset-bottom)]">
         <AttachmentBar attachments={attach.attachments} onRemove={attach.remove} busy={attach.busy} tone="light" />
+        {/* data-tour: the tour's last step points here (paperclip + mic). */}
         <form
+          data-tour="assistant-composer"
           onSubmit={(e) => {
             e.preventDefault();
             send(input);
