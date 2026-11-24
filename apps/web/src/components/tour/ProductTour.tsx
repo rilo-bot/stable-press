@@ -48,7 +48,7 @@ const SETTLE_MS = 600;
 const MARGIN = 16; // from the window edge
 const GAP = 12; // between the target and the card
 const PAD = 6; // round the target, inside the cut-out
-const CARD_W = 360;
+const CARD_W = 420;
 const NARROW = 640; // below this the card docks to the top / bottom edge
 
 interface Rect {
@@ -367,7 +367,7 @@ function TourOverlay({
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={bodyId}
-        className={`absolute rounded-xl border border-border bg-card p-5 text-card-foreground shadow-2xl ${moving}`}
+        className={`absolute rounded-xl border border-border bg-card p-6 text-card-foreground shadow-2xl ${moving}`}
         style={cardStyle}
       >
         <div className="mb-3 flex items-center gap-2">
@@ -379,8 +379,8 @@ function TourOverlay({
               <img src="/images/favicon-gold.png" alt="" className="h-5 w-5 object-contain" />
             </span>
           )}
-          <span className="text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-            {step.copilot ? 'Your co-pilot' : 'Quick tour'} · {index + 1} of {total}
+          <span className="text-sm font-semibold text-muted-foreground">
+            Step {index + 1} of {total}
           </span>
           <button
             onClick={() => onFinish(false)}
@@ -392,52 +392,56 @@ function TourOverlay({
           </button>
         </div>
 
-        <h2 id={titleId} className="mb-1.5 font-[family-name:var(--font-display)] text-lg font-bold leading-snug text-foreground">
+        <h2 id={titleId} className="mb-2 font-[family-name:var(--font-display)] text-2xl font-bold leading-snug text-foreground">
           {step.title}
         </h2>
-        <p id={bodyId} className="text-sm leading-relaxed text-muted-foreground">
+        <p id={bodyId} className="text-base leading-relaxed text-foreground/85 sm:text-lg">
           {step.body}
         </p>
 
         {/* Progress — one segment per step. */}
-        <div className="mt-4 flex gap-1" aria-hidden>
+        <div className="mt-5 flex gap-1.5" aria-hidden>
           {Array.from({ length: total }, (_, i) => (
             <span
               key={i}
-              className="h-1 flex-1 rounded-full"
+              className="h-1.5 flex-1 rounded-full"
               style={{ background: i <= index ? 'var(--gold-bright)' : 'hsl(var(--muted))' }}
             />
           ))}
         </div>
 
-        <div className="mt-4 flex items-center gap-2">
-          {!isLast && (
-            <button onClick={() => onFinish(false)} className="text-sm text-muted-foreground underline-offset-2 hover:text-foreground hover:underline">
+        {isLast ? (
+          // Last step: one big, obvious next move; the quieter choices underneath.
+          <div className="mt-5 flex flex-col gap-2">
+            <Button ref={primaryRef} size="lg" className="w-full text-base" onClick={() => onFinish(true)}>
+              Try the AI Assistant
+            </Button>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="lg" onClick={onBack} className="flex-1 gap-1 px-4 text-base">
+                <ArrowLeft className="h-4 w-4" /> Back
+              </Button>
+              <Button variant="outline" size="lg" className="flex-1 px-4 text-base" onClick={() => onFinish(false)}>
+                Finish
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-5 flex items-center gap-2">
+            <button onClick={() => onFinish(false)} className="text-base text-muted-foreground underline-offset-2 hover:text-foreground hover:underline">
               Skip tour
             </button>
-          )}
-          <div className="ml-auto flex items-center gap-2">
-            {index > 0 && (
-              <Button variant="outline" size="sm" onClick={onBack} className="gap-1">
-                <ArrowLeft className="h-3.5 w-3.5" /> Back
-              </Button>
-            )}
-            {isLast ? (
-              <>
-                <Button variant="outline" size="sm" onClick={() => onFinish(false)}>
-                  Finish
+            <div className="ml-auto flex items-center gap-2">
+              {index > 0 && (
+                <Button variant="outline" size="lg" onClick={onBack} className="gap-1 px-4 text-base">
+                  <ArrowLeft className="h-4 w-4" /> Back
                 </Button>
-                <Button ref={primaryRef} size="sm" onClick={() => onFinish(true)}>
-                  Try the AI Assistant
-                </Button>
-              </>
-            ) : (
-              <Button ref={primaryRef} size="sm" onClick={onNext} className="gap-1">
-                Next <ArrowRight className="h-3.5 w-3.5" />
+              )}
+              <Button ref={primaryRef} size="lg" onClick={onNext} className="gap-1 px-5 text-base">
+                Next <ArrowRight className="h-4 w-4" />
               </Button>
-            )}
+            </div>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );

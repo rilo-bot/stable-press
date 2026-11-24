@@ -206,8 +206,9 @@ export default function MagazineEditorV2() {
     needsRepublish: () => republishNeeded,
   };
   const isPhone = useIsPhone();
-  // Open by default everywhere except a phone, where it would cover the page.
-  const [asstOpen, setAsstOpen] = useState(() => !isPhoneNow());
+  // Closed by default: the AI Assistant is the one helper a newcomer should see.
+  // The AI button opens it (and the AI Assistant opens it itself when it needs it).
+  const [asstOpen, setAsstOpen] = useState(false);
   const [pagesAiOpen, setPagesAiOpen] = useState(false);
   const [aiCount, setAiCount] = useState(2);
   const [aiTopic, setAiTopic] = useState('');

@@ -8,8 +8,8 @@
 //               points at the real controls in front of them.
 //   campaign  — anywhere else in the Campaign Engine (a Team-screen invite lands on
 //               its home), pointing at the sidebar.
-// Both END ON THE STABLE HAND: the co-pilot is the one thing every newcomer
-// should leave knowing about.
+// Both are three steps (welcome, where the work is, the AI Assistant) and END
+// ON THE AI ASSISTANT: the one thing every newcomer should leave knowing about.
 //
 // TARGETS are comma-separated CSS selectors, tried in order (first one showing
 // wins) — so list the preferred target first. Most reuse the Stable Hand's own `data-agent-id`
@@ -30,7 +30,7 @@ export interface TourStep {
   /** Selector list — the first match that is actually visible wins. */
   target?: string;
   optional?: boolean;
-  /** The Stable Hand step: gets the co-pilot treatment (and the final buttons). */
+  /** The AI Assistant step: gets the co-pilot treatment (and the final buttons). */
   copilot?: boolean;
 }
 
@@ -38,45 +38,25 @@ const STABLE_HAND: TourStep = {
   id: 'stablehand',
   title: 'Meet your AI Assistant',
   body:
-    'Your AI Assistant can help you with any task on this platform. Ask in plain words — "share page 2 with Sam", "tighten the copy on this page", "find a photo of a winning finish", "file a story" — and it does the work while you watch, step by step. It always checks with you before anything is published, shared or sent.',
+    'Click this gold button whenever you need anything. Just type what you want in your own words, for example "share this page with Sam", and your AI Assistant will do it for you. It always asks you before sending or sharing anything.',
   target: '[data-tour="stablehand"]',
   copilot: true,
 };
 
+// Kept deliberately short: the people joining are often new to tools like this,
+// so the tour shows only TWO things: where their work is, and who can help.
 const STEPS: Record<TourVariant, TourStep[]> = {
   magazine: [
     {
       id: 'welcome',
       title: 'Welcome to Stable Press',
-      body: 'A magazine has been shared with you, and you’re looking at it now. Here’s a quick look round — it takes under a minute.',
-    },
-    {
-      id: 'pages',
-      title: 'Your pages',
-      body: 'This is where your pages live. Open the list to see every page you can work on, then click one to edit it.',
-      target: '[data-agent-id="mag.pages-rail"], [data-agent-id="mag.pages-show"]',
-      optional: true,
+      body: 'A magazine has been shared with you. Here is a very short tour.',
     },
     {
       id: 'canvas',
-      title: 'Edit right on the page',
-      body: 'Click any text box or picture to change it. Your work saves as you go.',
+      title: 'This is your page',
+      body: 'Click any words or picture on the page to change them. Your changes are saved for you.',
       target: '[data-tour="mag-canvas"]',
-    },
-    {
-      id: 'ai',
-      title: 'Design Helper',
-      body: 'The Design Helper is the AI for the page you’re on. Ask it to rewrite copy, swap a photo or tidy the layout. It suggests changes and you choose which to keep. The AI button at the top shows or hides it.',
-      // The panel when it's open, its toggle when it isn't.
-      target: '[data-tour="mag-ai-panel"], [data-agent-id="mag.ai-toggle"]',
-      optional: true,
-    },
-    {
-      id: 'review',
-      title: 'Send your pages for review',
-      body: 'When your pages are ready, submit them here. The magazine’s owner approves them or sends back notes.',
-      target: '[data-agent-id="mag.review-board"]',
-      optional: true,
     },
     STABLE_HAND,
   ],
@@ -84,20 +64,13 @@ const STEPS: Record<TourVariant, TourStep[]> = {
     {
       id: 'welcome',
       title: 'Welcome to Stable Press',
-      body: 'This is the Campaign Engine, where the team creates stories, magazines, podcasts and more. Here’s a quick look round — it takes under a minute.',
+      body: 'You have joined the team. Here is a very short tour.',
     },
     {
       id: 'sidebar',
-      title: 'Everything lives here',
-      body: 'The sidebar takes you to every area your role can use. You’ll only see the sections that are open to you.',
+      title: 'Your menu',
+      body: 'Everything you can work on is listed here. Click a name to open it.',
       target: '[data-tour="ce-sidebar"]',
-      optional: true,
-    },
-    {
-      id: 'account',
-      title: 'Your account',
-      body: 'Your name and role are at the bottom of the sidebar. Click them to visit the public site or to sign out.',
-      target: '[data-tour="ce-account"]',
       optional: true,
     },
     STABLE_HAND,
