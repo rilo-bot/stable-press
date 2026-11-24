@@ -3,7 +3,7 @@ import crypto from 'crypto';
 import { db } from '../../lib/db.js';
 import { withIdentityDefaults } from '../../lib/identity.js';
 import { USERS } from '../../lib/collections.js';
-import { findOrCreateUser, findUserByEmail } from '../../lib/session.js';
+import { AccountDeactivatedError, findOrCreateUser, findUserByEmail } from '../../lib/session.js';
 import { SUPERADMIN_ROLE_NAME, assignRole, getRole, roleOfUser, superadminCount } from '../../lib/roleRegistry.js';
 import { rateLimit } from '../../lib/rateLimit.js';
 import { seedRoles } from '../../lib/seedRoles.js';
@@ -94,7 +94,16 @@ router.post('/seed', seedLimit, async (req, res) => {
     return;
   }
 
-  const { user: fresh } = await findOrCreateUser(email, name);
+  let fresh;
+  try {
+    ({ user: fresh } = await findOrCreateUser(email, name));
+  } catch (err) {
+    if (err instanceof AccountDeactivatedError) {
+      res.status(409).json({ error: 'That address belongs to a deactivated account. Use a different email.' });
+      return;
+    }
+    throw err;
+  }
   const id = String(fresh._id);
   await assignRole(id, superRole.id);
   const doc = await db.collection(USERS).findById(id);

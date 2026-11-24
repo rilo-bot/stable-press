@@ -8,7 +8,7 @@
 
 import { Router } from 'express'
 import { db } from '../../lib/db.js'
-import { findOrCreateUser, issueSession, markSignedIn } from '../../lib/session.js'
+import { AccountDeactivatedError, findOrCreateUser, issueSession, markSignedIn } from '../../lib/session.js'
 
 import { rateLimit } from '../../lib/rateLimit.js'
 import { findInviteByToken, sanitizeRedirect } from '../../lib/invites.js'
@@ -69,7 +69,16 @@ router.post('/:token/accept', rateLimit('invite-accept', 20, 5 * 60_000), async 
   // Same account creator as sign-in: a new account starts with no role, and the
   // invited role is applied deliberately, just below.
   const sent = typeof req.body?.name === 'string' ? req.body.name : undefined
-  const { user: userDoc } = await findOrCreateUser(email, sent)
+  let userDoc
+  try {
+    ;({ user: userDoc } = await findOrCreateUser(email, sent))
+  } catch (err) {
+    if (err instanceof AccountDeactivatedError) {
+      res.status(403).json({ error: err.message, code: 'account_deactivated' })
+      return
+    }
+    throw err
+  }
 
   // ONE ROLE PER PERSON, so this REPLACES rather than appends — matching
   // `POST /api/roles/:slug/assign` and the existing-account branch of

@@ -30,7 +30,7 @@ import { db } from '../../lib/db.js';
 import { genOtp, hashOtp, attachAccount } from '../../lib/auth.js';
 import { sendOtpEmail, isEmailConfigured } from '../../lib/email.js';
 import { toClientUser } from '../../lib/effectiveAccess.js';
-import { findOrCreateUser, issueSession, markSignedIn, revokeAllSessions } from '../../lib/session.js';
+import { AccountDeactivatedError, findOrCreateUser, issueSession, markSignedIn, revokeAllSessions } from '../../lib/session.js';
 import { rateLimit } from '../../lib/rateLimit.js';
 import { OTPS, USERS } from '../../lib/collections.js';
 
@@ -183,7 +183,20 @@ router.post(['/verify', '/verify-otp'], verifyLimit, async (req, res) => {
 
   // The whole of "is this a signup or a sign-in?", in one call. A new account is
   // created holding no role at all.
-  const { user } = await findOrCreateUser(email, typeof otp.name === 'string' ? otp.name : undefined);
+  //
+  // A deactivated account is refused HERE, after the code is spent, rather than at
+  // /start: only someone who has just proved they hold the mailbox learns that the
+  // address is deactivated, so /start stays free of an account-existence oracle.
+  let user;
+  try {
+    ({ user } = await findOrCreateUser(email, typeof otp.name === 'string' ? otp.name : undefined));
+  } catch (err) {
+    if (err instanceof AccountDeactivatedError) {
+      res.status(403).json({ error: err.message, code: 'account_deactivated' });
+      return;
+    }
+    throw err;
+  }
   res.json(await issueSession(await markSignedIn(user)));
 });
 

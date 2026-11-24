@@ -10,7 +10,7 @@
 //
 // Everything that mints an account or issues a session goes through here now.
 
-import { db } from './db.js'
+import { db, rawCollection } from './db.js'
 import { USERS } from './collections.js'
 import { signToken } from './auth.js'
 import { newUserFields, withIdentityDefaults } from './identity.js'
@@ -46,6 +46,31 @@ export async function findUserByEmail(email: string): Promise<UserDoc | null> {
   return (await db.collection(USERS).find({ email }))[0] ?? null
 }
 
+/** Thrown by findOrCreateUser when the address belongs to a deactivated account. */
+export class AccountDeactivatedError extends Error {
+  constructor() {
+    super('This account has been deactivated. Contact a Stable Press administrator.')
+    this.name = 'AccountDeactivatedError'
+  }
+}
+
+/**
+ * True when this address has NO live account but DOES have a deactivated
+ * (soft-deleted) one.
+ *
+ * Without this check, deactivating an account would mean nothing: sign-in creates
+ * an account for any address it doesn't find, and `findUserByEmail` skips
+ * tombstones, so the person would get a brand-new empty account on their next
+ * sign-in. A superadmin restores the account (lib/accounts.ts) to let them back in;
+ * a permanent delete removes the tombstone, after which the address is free again.
+ */
+export async function isDeactivatedEmail(email: string): Promise<boolean> {
+  if (!email) return false
+  if (await findUserByEmail(email)) return false
+  const users = await rawCollection(USERS)
+  return (await users.countDocuments({ email, deletedAt: { $ne: null } }, { limit: 1 })) > 0
+}
+
 /**
  * THE account creator. Every path that can bring an account into existence —
  * sign-in, invite redemption, the bootstrap seed, the CLI — calls this one.
@@ -66,6 +91,9 @@ export async function findOrCreateUser(
 ): Promise<{ user: UserDoc; created: boolean }> {
   const existing = await findUserByEmail(email)
   if (existing) return { user: existing, created: false }
+  // Every account-creating path comes through here, so this one check covers
+  // sign-in, invite redemption and the seed alike. Callers catch it.
+  if (await isDeactivatedEmail(email)) throw new AccountDeactivatedError()
 
   const now = new Date().toISOString()
   try {

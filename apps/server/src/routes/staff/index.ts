@@ -7,7 +7,7 @@ import { INVITES, USERS } from '../../lib/collections.js'
 import { isAdmin, canManageTeam, canViewTeam } from '../../lib/rbac.js'
 import { getRoles, linksForUsers, roleOfUser } from '../../lib/roleRegistry.js'
 import { canOfferRole, grantRoleTo, revokeRoleFrom } from '../../lib/roleGrant.js'
-import { findUserByEmail } from '../../lib/session.js'
+import { findUserByEmail, isDeactivatedEmail } from '../../lib/session.js'
 import { isEmailConfigured, sendInviteEmail, sendRoleGrantedEmail } from '../../lib/email.js'
 import {
   INVITE_RESEND_COOLDOWN_MS,
@@ -155,6 +155,14 @@ router.post('/', async (req, res) => {
       console.error('[staff] role-granted email failed:', err instanceof Error ? err.message : err)
     }
     res.status(200).json({ ok: true, applied: 'immediate', emailed: delivered })
+    return
+  }
+
+  // The invite would only fail later, when the link is redeemed. Say so now.
+  if (await isDeactivatedEmail(email)) {
+    res.status(409).json({
+      error: 'That account has been deactivated. A superadmin can restore it from All accounts first.',
+    })
     return
   }
 

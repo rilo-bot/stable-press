@@ -270,6 +270,10 @@ function collection(name: string) {
  * Do not reach for this to avoid `deletedAt`. Everything else in the app is
  * recoverable on purpose; a reaction is a single field a reader can re-enter in
  * one click, so there is nothing to recover.
+ *
+ * The other legitimate user is `lib/accounts.ts` (superadmin account management):
+ * listing deactivated accounts means reading tombstones, and a PERMANENT delete is
+ * an erasure, which has to reach rows the wrapper treats as already gone.
  */
 export async function rawCollection(name: string) {
   const database = await getMongoDb()

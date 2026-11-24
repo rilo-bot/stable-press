@@ -206,8 +206,14 @@ async function main(): Promise<void> {
   console.log('[db] connected:', uri.replace(/:([^@]+)@/, ':***@'))
 
   // ── 1. Who we are: the ids that make a key provably ours.
+  // Permanently deleted accounts (lib/accounts.ts) leave their id in
+  // `purgedAccounts` precisely so their uploads stay provably ours here.
+  const purgedUserIds = new Set<string>()
+  for await (const row of database.collection('purgedAccounts').find({}, { projection: { userId: 1 } })) {
+    if (row.userId) purgedUserIds.add(String(row.userId))
+  }
   const ids: OwnedIds = {
-    users: await idsOf(database, 'users'),
+    users: new Set([...(await idsOf(database, 'users')), ...purgedUserIds]),
     magazines: await idsOf(database, 'magazinesV2'),
     blogs: await idsOf(database, 'blogs'),
   }

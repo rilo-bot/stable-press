@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 
 import { TeamManagementView } from '../../newsroom/views/TeamManagementView';
+import { AccountsAdminPanel } from '../../newsroom/views/AccountsAdminPanel';
 import { usePS } from '../context';
 
 export default function TeamScreen() {
@@ -33,6 +34,10 @@ export default function TeamScreen() {
         onGrantStaff={s.onGrantStaff}
         onCancelInvite={s.onCancelInvite}
       />
+      {/* Superadmins only — renders nothing for anyone else. */}
+      <div className="mt-8">
+        <AccountsAdminPanel />
+      </div>
     </>
   );
 }

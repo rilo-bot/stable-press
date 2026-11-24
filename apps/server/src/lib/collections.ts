@@ -35,6 +35,13 @@ export const ORG_MEMBERS = 'orgMembers'
 export const PEOPLE = 'people'
 export const PARTIES = 'parties'
 export const INVITES = 'pendingStaffGrants'
+/**
+ * One row per account that was PERMANENTLY deleted: `{ userId, purgedAt,
+ * purgedBy }`, and nothing else — no name, no email. It exists so the orphan
+ * sweeper can still prove that `public/<kind>/<userId>/…` uploads are ours once
+ * the `users` row is gone (see lib/accounts.ts and scripts/sweep-orphan-objects.ts).
+ */
+export const PURGED_ACCOUNTS = 'purgedAccounts'
 export const OTPS = 'otps'
 /** Stablehand Operator run log + per-day spend (lib/agent/operator/runs.ts). One
  *  doc per (runId, userId); a run spans several requests, so it is upserted. */

@@ -15,6 +15,7 @@ import {
 import authRouter from './auth/index.js'
 import adminRouter from './admin/index.js'
 import staffRouter from './staff/index.js'
+import accountsRouter from './accounts/index.js'
 import invitesRouter from './invites/index.js'
 import rolesRouter from './roles/index.js'
 // ── Register & relationships ──
@@ -136,6 +137,7 @@ router.get('/health', (_req, res) => {
 router.use('/auth', authRouter)
 router.use('/admin', adminRouter)               // secret-gated first-admin seed
 router.use('/staff', staffRouter)               // admin-only staff grant/revoke
+router.use('/accounts', accountsRouter)         // SUPERADMIN-only: list, deactivate, restore, permanently delete
 router.use('/invites', invitesRouter)           // PUBLIC: invite-link lookup (no account yet)
 router.use('/roles', rolesRouter)               // admin-only custom roles + permission catalogue
 
